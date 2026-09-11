@@ -8,13 +8,13 @@ DJI Mic 3 で録音 → 帰宅 → Mac へ USB 接続 → （以降すべて自�
 
 - 文字起こし: whisper.cpp（Docker コンテナ内 / CPU）
 - 要約・タスク抽出: Docker Model Runner 上のローカル LLM（Apple Silicon Metal）
-- 出力: Obsidian Vault への Markdown
+- 出力: Obsidian Vault への Markdown（1 日 1 枚の生データ + 1 日 1 枚の整理済みノート）
 - **クラウド AI API は使用しない。音声は外部へ送信しない。**
 - Mac へインストールするのは Docker Desktop と Obsidian だけ
 
 ## ドキュメント
 
-実装時の規範は **[docs/SPEC.md](docs/SPEC.md)（詳細仕様書 v3.0）** に集約されている。
+実装時の規範は **[docs/SPEC.md](docs/SPEC.md)（詳細仕様書 v3.2）** に集約されている。
 
 前身の方針書は [docs/archive/](docs/archive/) に保存してある。両者が矛盾する場合は `docs/SPEC.md` を優先する。
 
@@ -25,10 +25,13 @@ cp .env.example .env
 cp config/config.example.yaml config/config.yaml
 # .env の OBSIDIAN_VAULT を自分の環境に合わせる
 
-./scripts/setup.sh
-./scripts/fetch-whisper-model.sh
-docker compose up -d --build
+./scripts/doctor.sh          # ホスト設定の検査（§19.2 DH-1〜DH-11）
+./scripts/fetch-models.sh
+make up                      # = docker compose up -d --build
 ```
+
+日常操作は `make` にまとめてある（`up` / `down` / `logs` / `status` / `test` / `doctor` / `models`）。
+シェルスクリプトは `doctor.sh`（セットアップ検査と環境診断を兼ねる）と `fetch-models.sh` の 2 本だけ。
 
 前提条件とホスト設定の詳細は [docs/SPEC.md §3](docs/SPEC.md) を参照。
 
@@ -37,7 +40,7 @@ docker compose up -d --build
 
 ## 安全設計
 
-元の録音は、**コピー・文字起こし・解析・Obsidian 保存の成功を機械的に確認できた場合にのみ**削除される。
+元の録音は、**文字起こし本文と整理済みノートの双方が Obsidian に保存され、実ファイルを読み直した検証に成功した場合にのみ**削除される。
 削除は「設定」と「マウント権限」の二重ロックで守られており、既定ではどちらも無効になっている。
 
 詳細は [docs/SPEC.md §14](docs/SPEC.md)。
