@@ -1,0 +1,38 @@
+# ---- ユーザー固有設定（絶対にコミットしない） ----
+.env
+config/config.yaml
+
+# ---- 作業領域 ----
+tmp/
+data/
+models/
+*.db
+*.db-wal
+*.db-shm
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# ---- macOS ----
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# ---- エディタ ----
+.idea/
+.vscode/
+*.swp
+
+# ---- テスト生成物 ----
+tests/fixtures/fake_volumes/**/*.wav
+tests/output/
