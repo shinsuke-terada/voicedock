@@ -1,11 +1,11 @@
-# VoiceDock 詳細仕様書 v4.2
+# VoiceDock 詳細仕様書 v4.3
 
 **DJI Mic 3 × ローカル文字起こし × ローカルLLM × Obsidian**
 
 | 項目 | 内容 |
 |---|---|
-| 文書版 | **v4.2（設定検証の実装整合 / Helper 報告スキーマの明文化）** |
-| 前身文書 | v4.1 / v4.0 / v3.4 / v3.3 / v3.2 / v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
+| 文書版 | **v4.3（パス封じ込め API の明文化）** |
+| 前身文書 | v4.2 / v4.1 / v4.0 / v3.4 / v3.3 / v3.2 / v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
 | 作成日 | 2026-09-11 |
 | 改訂日 | 2026-09-12 |
 | 実測記録 | `docs/POC.md`（Phase 0 の実測値と判断。本書と食い違う場合は POC.md を正とする） |
@@ -732,7 +732,7 @@ superfloppy のいずれも）は VirtioFS でも完全に動作した。
 
 | # | 失うもの | 埋め合わせ |
 |---|---|---|
-| 1 | **原本コピー工程が復活する。**v3.1 が意図して廃止した（付録 F の A-4） | inbox の原本は `NORMALIZED` の検証後に即削除する。常駐使用量は数 GB に収まる（§10.5） |
+| 1 | **原本コピー工程が復活する。**v3.1 が意図して廃止した（v3.1→v3.2 の変更 A-4） | inbox の原本は `NORMALIZED` の検証後に即削除する。常駐使用量は数 GB に収まる（§10.5） |
 | 2 | ホストの書き込みが 1 日 1.8 GB → **約 10 GB** へ増える | 同上。SSD 寿命より「工程と状態が 1 つ増える」ことのほうが本質的なコスト |
 | 3 | **削除の実行がコンテナの外へ出る。**§20.4 のテスト境界をまたぐ | §14.2 を三重ロックへ。reaper に**独立検証**を持たせ、§20.4 を 2 層に分けて ND-24〜ND-28 を追加する |
 | 4 | 「Mac へインストールするのは Docker Desktop と Obsidian だけ」が崩れる（§3.3） | Helper は base system だけで動く bash スクリプト 2 本。中身をユーザーが読める |
@@ -2116,6 +2116,9 @@ def request_part_deletion(part, session, cfg, inventory) -> DeleteRequest:
 - inbox・staging・一時ファイルの削除は `paths.py` の `safe_unlink_inbox()` /
   `safe_unlink_staging()` / `safe_unlink_tmp()` に限定する。§11.2 の型分離により、
   誤った引数は型検査と実行時の双方で弾かれる
+- 削除の直前には必ず `paths.require_under()` を通す（§14.4 N-14）。判定だけが要るときは
+  `paths.is_under()` を使う。**`assert_` で始まる名前の bool 返し関数は作らない** —
+  戻り値を捨てた呼び出しが黙って何もしないため
 - この規約は §20.1 の「パス型」テストで検証する
 
 **(1b) デバイス上の削除の一本化（§14.4 N-16）**
@@ -2159,6 +2162,26 @@ DevicePath  = NewType("DevicePath", PurePosixPath)  # デバイス上の relpath
 InboxPath   = NewType("InboxPath", Path)            # /inbox 配下。読み、変換後に消す
 StagingPath = NewType("StagingPath", Path)          # /data 配下
 VaultPath   = NewType("VaultPath", Path)            # /obsidian 配下
+
+# コンテナのマウント点（§18.2）。設定ではない。config.yaml から取らない
+INBOX_ROOT = Path("/inbox"); DATA_ROOT = Path("/data")
+VAULT_ROOT = Path("/obsidian"); QUEUE_ROOT = Path("/queue")
+
+# 封じ込め（§14.1.1 検証 4・5・9 / §14.4 N-14）
+def is_under(root: Path, target: Path) -> bool:
+    """realpath 解決後に target が root の真の配下かを返す。字句判定はしない"""
+
+def require_under(root: Path, target: Path) -> None:
+    """is_under が偽なら ValueError。削除の直前に必ず通す"""
+
+def is_safe_relpath(rel: PurePosixPath) -> bool:
+    """絶対パス・空・'.' 始まり・'..'・制御文字を含まない relpath か（N-17）"""
+
+# デバイス以外を削除できるのはこの 3 本だけ（§14.4 N-10）
+#   型違反は TypeError、場所違反は ValueError。symlink とディレクトリは拒否する
+def safe_unlink_inbox(path: InboxPath, *, missing_ok: bool = False) -> None: ...
+def safe_unlink_staging(path: StagingPath, *, missing_ok: bool = False) -> None: ...
+def safe_unlink_tmp(path: Path, *, missing_ok: bool = True) -> None: ...
 
 # device.py
 @dataclass(frozen=True)
@@ -2228,6 +2251,11 @@ class SessionTranscript:
     blocks: list[tuple[datetime, datetime]]
     excluded_part_ids: list[int]
 ```
+
+**`is_under()` は「realpath 解決後に配下か」だけを判定する。**§14.1.1 の規範実装が併せて課す
+`resolved == target`（経路上に symlink が 1 つも無い）は**デバイス上の判定（reaper）の規則**であり、
+コンテナ側には持ち込まない。Vault 内に symlink を張っている利用者の一時ファイルを片付けられなく
+なるためである。代わりに `safe_unlink_*` が**対象自身が通常ファイルであること**を個別に要求する。
 
 ### 11.3 パイプライン
 
@@ -2844,7 +2872,7 @@ def can_delete_source(part, session, cfg, device) -> bool:
 > **要求は絶対パスを持たない。**`relpath`（ボリュームルートからの相対パス）だけを載せる。
 > reaper は `device_id` と名前が一致する**現在マウント中のボリューム**に対してのみ解決する。
 > これにより **「要求がボリューム外のパスを指名すること」自体が構造的に不可能**になる。
-> v3.x は DB に絶対パスを持ち、それを信じて削除していた（付録 F の A-13）。v4.0 はその余地を消した。
+> v3.x は DB に絶対パスを持ち、それを信じて削除していた（v3.1→v3.2 の変更 A-13）。v4.0 はその余地を消した。
 
 **reaper の検証（11 項目）。1 つでも偽なら削除せず、結果に `SOURCE_IDENTITY_MISMATCH` を書く。**
 
@@ -2913,6 +2941,9 @@ def target_is_identical(volume_root: Path, rel: PurePosixPath,
 - **`realpath` 解決は必須。**`Path.parents` は字句的な比較しか行わない。`/Volumes/Macintosh HD` が
   `/` への symlink として実在する以上、字句判定だけでは「デバイス配下」と偽装されたパスを拒否できない
   （§22 R-19）。§5.4 でボリュームルートの symlink を弾き、ここで経路全体を再確認する二重防壁とする
+- **コンテナ側が事前確認に使えるのは検証 4・9（relpath の健全性）だけである。**
+  `paths.is_safe_relpath()` がそれを担う。検証 5・6・7・8・10 はデバイス上の `stat` を必要とし、
+  `DevicePath` は `PurePosixPath`（I/O 不可）なので**コンテナには書けない**。reaper が独立に行う
 - **reaper は要求に書かれたものしか削除しない。**ディレクトリの再帰削除を一切行わない（N-16）
 
 ### 14.2 三重ロック
@@ -3340,6 +3371,7 @@ test:
 	  -v "$(CURDIR)/tests:/app/tests:ro" \
 	  -v "$(CURDIR)/docs:/app/docs:ro" \
 	  -v "$(CURDIR)/config:/app/config:ro" \
+	  -v "$(CURDIR)/compose.yaml:/app/compose.yaml:ro" \
 	  voicedock:dev pytest -q
 
 # Lint と型検査も使い捨てコンテナで行う。ホストに ruff / mypy を入れない（§3.3）
@@ -3372,6 +3404,9 @@ lock:
 **SPEC が見つからない場合は skip せず fail する。**黙って通すと整合テストが無いのと同じになる。
 `config/` を渡すのは、`config/config.example.yaml` が §7.2 の YAML ブロックの完全な写しで
 あることを突き合わせるためである（§7.2 に既定値を足して写し忘れる事故を落とす）。
+`compose.yaml` を渡すのは、`paths.py` のマウント点定数（`/inbox` `/data` `/obsidian` `/queue`）が
+実際のマウント先と一致していることを突き合わせるためである。**ここがずれると封じ込めが常に偽に
+なり、削除が一切できなくなる**（または逆に意図しない場所を許す）。
 
 **`make lock` も同様に使い捨てコンテナで行う。**`uv.lock` と `requirements.lock` /
 `requirements-dev.lock` は生成後にコミットする（§18.5）。`UV_IMAGE` はタグを固定する（§18.1）。
@@ -4185,7 +4220,22 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 ---
 
-## 付録 A. v4.1 から v4.2 への主な変更点
+## 付録 A. v4.2 から v4.3 への主な変更点
+
+v4.3 は、**パス封じ込めの API を本文へ明記する**改訂である。実装が §14.1.1 のコードを
+各モジュールでインライン展開する余地を消すことが目的で、**規則そのものは 1 つも変えていない。**
+
+| # | 変更 | 理由 |
+|---|---|---|
+| H-1 | **`paths.py` の封じ込め API を §11.2 へ明記**（§11.1, §11.2） | #36（cleaner）と #23（notes）が §14.1.1 のコードを各自でインライン展開する余地を消す。**実装が 2 本に分かれると片方だけ直る** |
+| H-2 | **`is_under()` の判定範囲を規定**（§11.2） | §14.1.1 の `resolved == target`（経路上に symlink が 1 つも無い）は**デバイス側の規則**である。コンテナへ持ち込むと、Vault 内に symlink を張っている利用者の一時ファイルを片付けられなくなる。代わりに `safe_unlink_*` が対象自身が通常ファイルであることを要求する |
+| H-3 | **コンテナ側が担える検証を §14.1.1 に明記**（§14.1.1） | 検証 5・6・7・8・10 は `stat` を要し、`DevicePath` が `PurePosixPath` である以上**コンテナには書けない**。どこまでが誰の責務かを本文に残す |
+| H-4 | **`assert_` で始まる bool 返し関数を禁止**（§11.1） | 戻り値を捨てた呼び出しが黙って何もしない。**封じ込め検査で最も起きてはいけない形**である。`is_under`（判定）と `require_under`（違反で例外）に分ける |
+| H-5 | **本文から付録のレター参照をやめる**（§10.5, §14.1.1） | 付録は新しい順に並べる規約なので、版が上がるたびに `付録 E` → `付録 F` → … とずれ、本文の参照を毎回追わねばならなかった。`v3.1→v3.2 の変更 A-4` のように**版で指す**形に変え、以後は見出しの繰り下げだけで済むようにした |
+
+---
+
+## 付録 B. v4.1 から v4.2 への主な変更点
 
 v4.2 は、**§7.3 の検証規則を実装可能な形へ整え、Helper からコンテナへの報告形式を明文化する**
 改訂である。**§14 の削除設計には一切触れていない。**
@@ -4203,7 +4253,7 @@ v4.2 は、**§7.3 の検証規則を実装可能な形へ整え、Helper から
 
 ---
 
-## 付録 B. v4.0 から v4.1 への主な変更点
+## 付録 C. v4.0 から v4.1 への主な変更点
 
 v4.1 は、**走査対象の許可リストを追加し、あわせて v4.0 が残した設定の積み残しを解消する**改訂である。
 **§14 の削除設計には一切触れていない。**変更範囲は検出側だけである。
@@ -4225,7 +4275,7 @@ v4.1 は、**走査対象の許可リストを追加し、あわせて v4.0 が�
 
 ---
 
-## 付録 C. v3.4 から v4.0 への主な変更点
+## 付録 D. v3.4 から v4.0 への主な変更点
 
 v4.0 は、**#2 の実機検証で現行アーキテクチャが成立しないと判明したことを受けた構成変更**である。
 
@@ -4252,7 +4302,7 @@ Obsidian 出力）、状態機械の骨格、設定項目の意味。
 
 ---
 
-## 付録 D. v3.3 から v3.4 への主な変更点
+## 付録 E. v3.3 から v3.4 への主な変更点
 
 v3.4 は、**#2（Phase 0 PoC）で DJI Mic 3 の実機から得た測定値を反映する**ことだけを目的とした改訂である。
 **機能・安全設計・設定項目は 1 つも変えていない。**実測値の出典はすべて `docs/POC.md` §6。
@@ -4273,7 +4323,7 @@ v3.4 は、**#2（Phase 0 PoC）で DJI Mic 3 の実機から得た測定値を�
 
 ---
 
-## 付録 E. v3.2 から v3.3 への主な変更点
+## 付録 F. v3.2 から v3.3 への主な変更点
 
 v3.3 は、**実装に着手する前に、仕様書に残っていた事実誤りと仕様内の不整合を潰す**ことだけを目的とした
 改訂である。**処理の内容・安全設計・設定項目の意味は 1 つも変えていない**（追加は V-27 と
@@ -4298,7 +4348,7 @@ v3.3 は、**実装に着手する前に、仕様書に残っていた事実誤�
 
 ---
 
-## 付録 F. v3.1 から v3.2 への主な変更点
+## 付録 G. v3.1 から v3.2 への主な変更点
 
 v3.2 は、**実装に着手する前に「個人用途に対して過剰な構造」を削る**ことだけを目的とした改訂である。
 **機能・安全設計・設定項目は 1 つも削っていない。**処理の内容が変わる変更は含まれない。
@@ -4330,7 +4380,7 @@ v3.2 は、**実装に着手する前に「個人用途に対して過剰な構�
 
 ---
 
-## 付録 G. v3.0 から v3.1 への主な変更点
+## 付録 H. v3.0 から v3.1 への主な変更点
 
 v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間録り続ける」へ変わった**ことを起点に全面改訂したものである。
 
@@ -4367,7 +4417,7 @@ v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間
 
 ---
 
-## 付録 H. 参考資料
+## 付録 I. 参考資料
 
 Docker 公式ドキュメントを実装時の一次資料とする。
 
