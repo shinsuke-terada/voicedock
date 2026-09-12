@@ -11,14 +11,7 @@ import signal
 import sys
 
 from voicedock import __version__
-
-# --- 終了コード（SPEC §17.3） --------------------------------------------
-# #6（errors.py）が導入されたらそちらへ移す。
-EXIT_OK = 0
-EXIT_ERROR = 1
-EXIT_CONFIG = 2
-EXIT_UNHEALTHY = 3
-EXIT_DOCTOR_FATAL = 4
+from voicedock.errors import EXIT_ERROR, EXIT_OK
 
 # --- サブコマンド（SPEC §17.1） ------------------------------------------
 # 実装済みは version のみ。残りは --help に並べ、呼ばれたら EXIT_ERROR を返す。
