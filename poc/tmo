@@ -1,0 +1,34 @@
+#!/usr/bin/env perl
+# poc/tmo — ホスト側の有界タイムアウト。macOS に timeout(1) が無いため。
+#
+#   使い方: poc/tmo <秒> <コマンド...>
+#   終了コード: コマンドの終了コード。タイムアウトした場合は 124
+#
+# なぜ必要か:
+#   /Volumes の bind mount は Docker Desktop の共有層を割り込み不可で固めることがあり
+#   （docs/POC.md §2 参照）、コンテナ内の timeout(1) でも中断できない。
+#   素で docker exec を打つと操作者のシェルごと無応答になるため、
+#   PoC のすべての docker コマンドはこれ経由で実行する。
+#
+#   子プロセスを別プロセスグループにして、タイムアウト時はグループごと KILL する。
+#   （exec でなく fork するのが要点。exec すると alarm ハンドラが消える）
+
+use strict;
+use warnings;
+
+my $t = shift @ARGV or die "usage: $0 <seconds> <command...>\n";
+@ARGV or die "usage: $0 <seconds> <command...>\n";
+
+my $pid = fork();
+die "fork: $!" unless defined $pid;
+if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 }
+
+my $timed_out = 0;
+$SIG{ALRM} = sub { $timed_out = 1; kill 'KILL', -$pid; kill 'KILL', $pid };
+alarm $t;
+waitpid($pid, 0);
+my $rc = $? >> 8;
+alarm 0;
+
+if ($timed_out) { print STDERR "[TIMEOUT after ${t}s] @ARGV\n"; exit 124 }
+exit $rc;

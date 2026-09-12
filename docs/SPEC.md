@@ -489,6 +489,9 @@ excluded = any(fnmatch.fnmatch(name, pat) for pat in cfg.device.exclude_volumes)
 | P0-14 | **バッテリー交換・充電で録音が中断したときのファイルの分かれ方** | 必須 | Block 判定（§13.4）の実挙動確認 |
 | P0-15 | **1 日分（64 ファイル）を置いた状態での走査時間の実測** | 必須 | §10.2 / §10.3 のパラメータ調整 |
 
+**測定値と PASS / FAIL の判断は `docs/POC.md` に記録する。**SPEC には設計を書き、実測は POC.md に残す。
+両者が食い違う場合は **POC.md の実測値を正とし、SPEC を直すチケットを起票する。**
+
 P0-6 の検証手順:
 
 ```bash
@@ -534,6 +537,7 @@ voicedock/
 │
 ├── docs/
 │   ├── SPEC.md                     # 本書
+│   ├── POC.md                      # Phase 0 の実測値と判断（#2 / #3 / #13 / #22 が追記）
 │   └── archive/
 │       └── VoiceDock_Docker_Implementation_Spec_v2.0.md
 │
@@ -572,6 +576,10 @@ voicedock/
 │   ├── reduce_ja.txt               # Reduce 段階プロンプト（テンプレート）
 │   └── repair_json.txt             # JSON 修復プロンプト
 │
+├── poc/                            # Phase 0 PoC の使い捨てスクリプト。src/ から import しない
+│   ├── mkimg.sh                    # DJI のストレージを模したディスクイメージの作成・attach・detach
+│   └── tmo                         # ホスト側の有界タイムアウト（§19.2 / docs/POC.md §2.3）
+│
 ├── scripts/
 │   ├── doctor.sh                   # 初回セットアップ検査と環境診断を兼ねる（§17.4, §19.2, §21.1）
 │   └── fetch-models.sh             # Whisper モデル + Silero VAD モデル（§18.6）
@@ -597,6 +605,7 @@ voicedock/
 | `states.py` を独立させる | §9 の状態定義と遷移表はデータであり、`pipeline.py` の制御フローとは変更理由が異なる |
 | `notes.py` / `llm.py` が大きくなる | 400〜600 行を見込む。**実装中に 500 行を超えたら、そのとき初めて分割する**（先に分けない） |
 | `.dockerignore` を置く | 無いと生成 fixture WAV・`tmp/`・`data/`・`.git` が毎ビルドで転送される。除外内容は §18.3 |
+| `poc/` を `tests/` と分ける | PoC は「一度測って判断したら捨てる」もので、CI で回し続ける `tests/` とは寿命が違う。macOS ホストの `hdiutil` / `diskutil` に依存するため CI では実行できない。`src/` から import しないことをディレクトリで表す |
 
 ---
 
