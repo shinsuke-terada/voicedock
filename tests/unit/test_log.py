@@ -21,39 +21,53 @@ from voicedock.log import EVENTS, MAX_VALUE_CHARS, REDACTED, Logger, get_logger
 
 JST = timezone(timedelta(hours=9))
 
+# §8.1 の自然キー。**ログにも識別子をそのまま出す**（§16.2）。短い別名を作ると
+# 「ログの識別子」と「ノートの識別子」が 2 系統になり、障害時の突き合わせが増える。
+RECORDING_KEY = "DJIMIC3/TX_MIC001_20260829_071201/TX01_MIC002_20260829_071204_orig.wav"
+OTHER_KEY = "DJIMIC3/TX_MIC001_20260829_074201/TX01_MIC002_20260829_074210_orig.wav"
+SESSION_KEY = "DJIMIC3:20260829"
+
 # §16.2 の text 例を再現するための引数。SPEC の行と 1 対 1 に対応する。
 TEXT_EXAMPLE_FIELDS: dict[str, dict[str, log.LogValue]] = {
     "service_started": {"version": "0.1.0"},
     "part_discovered": {
-        "recording_id": 42,
+        "recording_key": RECORDING_KEY,
         "tx": "TX01",
         "mic": 2,
         "started_at": "2026-08-29T07:12:04+09:00",
         "duration": 1800.0,
     },
-    "part_skipped": {"recording_id": 43, "reason": "variant_not_orig"},
+    "part_skipped": {"recording_key": OTHER_KEY, "reason": "variant_not_orig"},
     "normalize_completed": {
-        "recording_id": 42,
+        "recording_key": RECORDING_KEY,
         "in_bytes": 345600044,
         "out_bytes": 57600044,
         "elapsed_s": 43.1,
     },
     "transcription_completed": {
-        "recording_id": 42,
+        "recording_key": RECORDING_KEY,
         "elapsed_s": 331.4,
         "chars": 8421,
         "rtf": 0.18,
         "speech_ratio": 0.31,
     },
-    "raw_note_saved": {"session_id": 12, "parts": 1, "bytes": 18402},
-    "session_merged": {"session_id": 12, "parts": 32, "excluded": 1, "chars": 348210},
-    "llm_completed": {"session_id": 12, "chunks": 18, "elapsed_s": 1337.0},
+    "raw_note_saved": {"session_key": SESSION_KEY, "parts": 1, "bytes": 18402},
+    "session_merged": {
+        "session_key": SESSION_KEY,
+        "parts": 32,
+        "excluded": 1,
+        "chars": 348210,
+    },
+    "llm_completed": {"session_key": SESSION_KEY, "chunks": 18, "elapsed_s": 1337.0},
     "obsidian_saved": {
-        "session_id": 12,
+        "session_key": SESSION_KEY,
         "path": "Daily/Voice/Wiki/20260829/2026-08-29 Voice.md",
         "bytes": 12844,
     },
-    "source_delete_skipped": {"session_id": 12, "reason": "delete_source_audio_disabled"},
+    "source_delete_skipped": {
+        "session_key": SESSION_KEY,
+        "reason": "delete_source_audio_disabled",
+    },
 }
 
 TS_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$")
@@ -180,7 +194,7 @@ def test_content_fields_are_redacted() -> None:
     line = _emit(
         "session_merged",
         {
-            "session_id": 12,
+            "session_key": SESSION_KEY,
             "transcript": "これは本文です。" * 20,
             "summary": "秘密の要約",
             "tasks": "買い物に行く",
@@ -192,7 +206,7 @@ def test_content_fields_are_redacted() -> None:
     assert f"transcript={REDACTED}" in line
     assert f"summary={REDACTED}" in line
     assert f"tasks={REDACTED}" in line
-    assert "session_id=12" in line, "本文以外のフィールドは残ること"
+    assert f"session_key={SESSION_KEY}" in line, "本文以外のフィールドは残ること"
 
 
 def test_filename_and_title_are_redacted() -> None:

@@ -43,7 +43,8 @@ CATEGORY_BY_SPEC_TEXT = {
 }
 
 # v4.6 の §15.2 が「自動再試行の対象外」として名指ししていた 6 件。
-# v5.0 でこの概念は廃止したが、**廃止できた前提を固定するために名前を残す**（付録 A L-3）。
+# v5.0 でこの概念は廃止したが、**廃止できた前提を固定するために名前を残す**
+# （v4.6→v5.0 の変更 L-3）。
 FORMERLY_AUTO_RETRY_EXEMPT = {
     ErrorCode.CONFIG_UNKNOWN_KEY,
     ErrorCode.CONFIG_INVALID_VALUE,
@@ -135,7 +136,7 @@ def test_llm_invalid_json_recovers_on_reconnect() -> None:
 
 
 def test_formerly_exempt_codes_never_reach_failed() -> None:
-    """**`auto_retry_exempt` を廃止できた前提そのものを固定する**（付録 A L-3）。
+    """**`auto_retry_exempt` を廃止できた前提そのものを固定する**（v4.6→v5.0 の変更 L-3）。
 
     v5.0 の §15.2 は「`FAILED` を無条件に再評価する」だけで、除外リストを持たない。
     それが成り立つのは、v4.6 が除外していた 6 件がどれも **`FAILED` に来ない**

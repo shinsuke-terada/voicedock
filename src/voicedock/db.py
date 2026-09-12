@@ -8,9 +8,18 @@
    `events` への INSERT と同一トランザクション」と規定する。`status` を直接 UPDATE する
    関数を**作らない** — 遷移箇所が 20 か所に散った後では全数修正できない。
    `tests/unit/test_db.py::test_no_direct_status_update` が静的に固定している。
-2. **スキーマは v1 完全形である。**§8.5 は破壊的変更を禁じている。§14.1 の削除条件は
-   `recordings.id` の同一性に削除可否を賭けており、AUTOINCREMENT が振り直されると
-   **ノートの ID 42 と DB の ID 42 が別の Part を指しうる**。
+2. **識別子は自然キーである**（§8.1）。`recordings.partkey` は
+   `<device_id>/<source_folder>/<filename>`、`sessions.session_key` は
+   `<device_id>:<YYYYMMDD>`。**連番を採番しないので `lastrowid` を使わない。**
+
+   §14.1 の削除条件はノートの frontmatter に載っている鍵と DB の鍵が同じ Part を指す
+   ことに賭けている。v5.0 までは `recordings.id`（`AUTOINCREMENT`）だったため、
+   振り直されると**ノートの ID 42 と DB の ID 42 が別の Part を指しえた**。§8.5 は
+   それを「テーブルを作り直すな」という禁則で防いでいたが、自然キーには**数える対象が
+   無いので壊れようがない**（v5.0→v5.1 の変更 M-1 / `docs/STORE.md` §6）。
+
+   **§8.5 の唯一の禁則は `paths.partkey_for()` の算出規則を変えないことである。**
+   このモジュールは鍵を組み立てない。受け取って保存するだけである。
 
 `config` を import しない。`busy_timeout_ms` と `tz` は引数で受ける（`paths.py` と同じ方針）。
 **状態名の文字列は持たない。**`states.py` が唯一の出所である（§9）。
@@ -50,6 +59,15 @@ class EntityType(StrEnum):
     def table(self) -> str:
         return "recordings" if self is EntityType.RECORDING else "sessions"
 
+    @property
+    def key_column(self) -> str:
+        """主キーの列名（§8.1 の自然キー）。
+
+        **SQL へ埋め込む唯一の可変部分がこれである。**`EntityType` は 2 値の enum なので
+        取りうる値は `"partkey"` と `"session_key"` の 2 つだけで、外部入力は入らない。
+        """
+        return "partkey" if self is EntityType.RECORDING else "session_key"
+
 
 class TransitionConflict(RuntimeError):
     """現在の `status` が `from_status` と違った。
@@ -63,8 +81,14 @@ class TransitionConflict(RuntimeError):
 
 @dataclass(frozen=True)
 class Recording:
-    """`recordings` の 1 行（§8.2）。フィールドは列と 1 対 1 に保つこと。"""
+    """`recordings` の 1 行（§8.2）。フィールドは列と 1 対 1 に保つこと。
 
+    **`partkey` は `paths.partkey_for()` で作る**（§8.1）。文字列を連結してはならない。
+    `partkey == device_id + "/" + source_path` の不変量は
+    `tests/unit/test_db.py` が固定している。
+    """
+
+    partkey: str
     device_id: str
     source_folder: str
     transmitter_id: str
@@ -72,26 +96,19 @@ class Recording:
     started_at: str
     status: str
     updated_at: str
-    id: int | None = None
     duration_seconds: float | None = None
     ended_at: str | None = None
-    source_path_denoised: str | None = None
-    source_path_orig: str | None = None
-    source_size_denoised: int | None = None
-    source_size_orig: int | None = None
-    source_mtime_denoised: float | None = None
-    source_mtime_orig: float | None = None
-    sha256_denoised: str | None = None
-    sha256_orig: str | None = None
+    source_path: str | None = None
+    source_size: int | None = None
+    source_mtime: float | None = None
+    sha256: str | None = None
     sha256_helper: str | None = None
-    primary_variant: str | None = None
     inbox_path: str | None = None
     staging_dir: str | None = None
     normalized_path: str | None = None
     transcript_path: str | None = None
-    session_id: int | None = None
+    session_key: str | None = None
     retry_count: int = 0
-    auto_retry_rounds: int = 0
     error_code: str | None = None
     error_message: str | None = None
     source_deleted_at: str | None = None
@@ -106,7 +123,6 @@ class Session:
     device_id: str
     status: str
     updated_at: str
-    id: int | None = None
     started_at: str | None = None
     ended_at: str | None = None
     recorded_seconds: float | None = None
@@ -119,7 +135,6 @@ class Session:
     output_path: str | None = None
     output_sha256: str | None = None
     retry_count: int = 0
-    auto_retry_rounds: int = 0
     regenerated_count: int = 0
     delete_attempts: int = 0
     error_code: str | None = None
@@ -132,7 +147,7 @@ class Event:
     """`events` の 1 行（§8.4）。"""
 
     entity_type: str
-    entity_id: int
+    entity_key: str
     to_status: str
     created_at: str
     id: int | None = None
@@ -286,7 +301,7 @@ class Database:
     def record_transition(
         self,
         entity: EntityType,
-        entity_id: int,
+        entity_key: str,
         *,
         from_status: str,
         to_status: str,
@@ -300,7 +315,7 @@ class Database:
         **これが状態を変える唯一の API である。**UPDATE と INSERT を同一トランザクションで
         行うので、「`status` だけ進んで `events` が無い」状態にならない。
 
-        `WHERE id = ? AND status = ?` で**現在の状態を確かめる**。合わなければ
+        `WHERE <key> = ? AND status = ?` で**現在の状態を確かめる**。合わなければ
         `TransitionConflict` を投げ、`with` 文が巻き戻す。
 
         `retry_count` は §15.2 に従う。工程通過（`RETRY_RESET_STATUSES`）で 0、
@@ -317,32 +332,36 @@ class Database:
             retry_expr = "retry_count"
 
         with self.conn:
+            # S608（SQL の文字列組み立て）を抑止する。f 文字列へ入るのは
+            # entity.table / entity.key_column / retry_expr の 3 つだけで、いずれも
+            # EntityType（2 値の enum）と上の if 文から来る固定文字列である。
+            # 外部入力はすべて ? のプレースホルダで渡している。
             cursor = self.conn.execute(
                 f"UPDATE {entity.table} SET status = ?, retry_count = {retry_expr}, "  # noqa: S608
                 "error_code = ?, error_message = ?, updated_at = ? "
-                "WHERE id = ? AND status = ?",
+                f"WHERE {entity.key_column} = ? AND status = ?",
                 (
                     to_status,
                     error_code,
                     truncate(error_message),
                     moment,
-                    entity_id,
+                    entity_key,
                     from_status,
                 ),
             )
             if cursor.rowcount != 1:
                 raise TransitionConflict(
-                    f"{entity.table} id={entity_id} の status が {from_status!r} ではありません"
-                    f"（{to_status!r} へ進めません）"
+                    f"{entity.table} {entity.key_column}={entity_key!r} の status が "
+                    f"{from_status!r} ではありません（{to_status!r} へ進めません）"
                 )
             self._insert_event(
-                entity, entity_id, from_status, to_status, error_code, detail, moment
+                entity, entity_key, from_status, to_status, error_code, detail, moment
             )
 
     def _insert_event(
         self,
         entity: EntityType,
-        entity_id: int,
+        entity_key: str,
         from_status: str | None,
         to_status: str,
         error_code: str | None,
@@ -351,21 +370,22 @@ class Database:
     ) -> None:
         self.conn.execute(
             "INSERT INTO events "
-            "(entity_type, entity_id, from_status, to_status, error_code, detail, created_at) "
+            "(entity_type, entity_key, from_status, to_status, error_code, detail, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (entity, entity_id, from_status, to_status, error_code, truncate(detail), created_at),
+            (entity, entity_key, from_status, to_status, error_code, truncate(detail), created_at),
         )
 
     # --- 行の作成と読み取り ----------------------------------------------
 
-    def insert_recording(self, row: Recording, *, now: datetime | None = None) -> int:
+    def insert_recording(self, row: Recording, *, now: datetime | None = None) -> str:
         """`recordings` へ 1 行入れ、初回の `events`（`from_status` は NULL）も残す。
 
         **行の誕生も状態遷移である**（§8.4 の「すべての状態遷移」）。
+        戻り値は `row.partkey`（呼び手が既に持っている値）。
         """
         return self._insert(EntityType.RECORDING, Recording, row, now=now)
 
-    def insert_session(self, row: Session, *, now: datetime | None = None) -> int:
+    def insert_session(self, row: Session, *, now: datetime | None = None) -> str:
         return self._insert(EntityType.SESSION, Session, row, now=now)
 
     def _insert(
@@ -375,33 +395,40 @@ class Database:
         row: Any,
         *,
         now: datetime | None,
-    ) -> int:
-        columns = [name for name in _column_names(row_type) if name != "id"]
+    ) -> str:
+        """行を作り、初回の `events` を同一トランザクションで残す。
+
+        **`lastrowid` を使わない。**識別子は呼び手が渡した自然キーであり（§8.1）、
+        DB が採番するものは無い。v5.0 までは `AUTOINCREMENT` の採番を待つ必要があった。
+        """
+        columns = list(_column_names(row_type))
         values = [getattr(row, name) for name in columns]
         if "error_message" in columns:
             values[columns.index("error_message")] = truncate(row.error_message)
         placeholders = ", ".join("?" for _ in columns)
+        entity_key = str(getattr(row, entity.key_column))
         with self.conn:
-            cursor = self.conn.execute(
+            self.conn.execute(
                 f"INSERT INTO {entity.table} ({', '.join(columns)}) VALUES ({placeholders})",  # noqa: S608
                 values,
             )
-            entity_id = int(cursor.lastrowid or 0)
-            self._insert_event(entity, entity_id, None, row.status, None, None, self._now(now))
-        return entity_id
+            self._insert_event(entity, entity_key, None, row.status, None, None, self._now(now))
+        return entity_key
 
-    def get_recording(self, recording_id: int) -> Recording | None:
-        row = self.conn.execute("SELECT * FROM recordings WHERE id = ?", (recording_id,)).fetchone()
+    def get_recording(self, partkey: str) -> Recording | None:
+        row = self.conn.execute("SELECT * FROM recordings WHERE partkey = ?", (partkey,)).fetchone()
         return None if row is None else _from_row(Recording, row)
 
-    def get_session(self, session_id: int) -> Session | None:
-        row = self.conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    def get_session(self, session_key: str) -> Session | None:
+        row = self.conn.execute(
+            "SELECT * FROM sessions WHERE session_key = ?", (session_key,)
+        ).fetchone()
         return None if row is None else _from_row(Session, row)
 
-    def events_for(self, entity: EntityType, entity_id: int) -> list[Event]:
+    def events_for(self, entity: EntityType, entity_key: str) -> list[Event]:
         rows = self.conn.execute(
-            "SELECT * FROM events WHERE entity_type = ? AND entity_id = ? ORDER BY id",
-            (entity, entity_id),
+            "SELECT * FROM events WHERE entity_type = ? AND entity_key = ? ORDER BY id",
+            (entity, entity_key),
         ).fetchall()
         return [_from_row(Event, row) for row in rows]
 
