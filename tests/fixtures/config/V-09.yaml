@@ -1,0 +1,8 @@
+# SPEC §7.3 V-9 の違反。config.example.yaml へ patch を深くマージして使う。
+# backoff_seconds は 3 要素のままなので足りなくなる
+rule: V-9
+code: CONFIG_INVALID_VALUE
+key: retry.backoff_seconds
+patch:
+  retry:
+    max_attempts: 4

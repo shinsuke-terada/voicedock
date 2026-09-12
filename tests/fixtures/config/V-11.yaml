@@ -1,0 +1,9 @@
+# SPEC §7.3 V-11 の違反。config.example.yaml へ patch を深くマージして使う。
+# 絶対パス。未知プレースホルダは無いので V-13 は当たらない
+rule: V-11
+code: CONFIG_INVALID_VALUE
+key: obsidian.raw.folder_template
+patch:
+  obsidian:
+    raw:
+      folder_template: "/Daily/Voice/Raw/{yyyymmdd}"

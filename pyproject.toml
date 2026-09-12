@@ -22,6 +22,8 @@ dev = [
     "pytest>=9,<10",
     "ruff>=0.16,<0.17",
     "mypy>=2.3,<3",
+    # PyYAML は型スタブを同梱しない。mypy --strict が通らなくなるため dev に入れる
+    "types-PyYAML>=6,<7",
 ]
 
 # 版の出所を 1 つにする。__init__.py と pyproject.toml の二重管理は必ずどちらかが古くなる

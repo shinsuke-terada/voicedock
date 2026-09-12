@@ -37,7 +37,7 @@ _LEVEL_ORDER: Final[Mapping[str, int]] = {
 # SPEC §16.4 の行の区切りを保つため整形を止める（照合しやすさのため）
 # fmt: off
 _EVENT_ORDER: Final[tuple[str, ...]] = (
-    "service_started", "service_stopping", "recovery_completed",
+    "service_started", "service_stopping", "recovery_completed", "config_warning",
     "device_detected", "device_lost", "device_unreadable", "device_excluded",
     "helper_heartbeat_stale", "helper_recovered", "remount_readonly_failed",
     "inbox_part_found", "inbox_meta_missing", "inbox_source_deleted", "source_hash_mismatch",

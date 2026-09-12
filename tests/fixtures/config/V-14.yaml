@@ -1,0 +1,9 @@
+# SPEC §7.3 V-14 の違反。config.example.yaml へ patch を深くマージして使う。
+# {title} は V-13 の許可集合にも無い。V-14 を先に見る順序が効く
+rule: V-14
+code: CONFIG_INVALID_VALUE
+key: obsidian.wiki.filename_template
+patch:
+  obsidian:
+    wiki:
+      filename_template: "{date} {title}"
