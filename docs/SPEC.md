@@ -1,16 +1,16 @@
-# VoiceDock 詳細仕様書 v4.0
+# VoiceDock 詳細仕様書 v4.1
 
 **DJI Mic 3 × ローカル文字起こし × ローカルLLM × Obsidian**
 
 | 項目 | 内容 |
 |---|---|
-| 文書版 | **v4.0（ホスト側 Helper アーキテクチャ）** |
-| 前身文書 | v3.4 / v3.3 / v3.2 / v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
+| 文書版 | **v4.1（ホスト側 Helper アーキテクチャ / 検出設定の一本化）** |
+| 前身文書 | v4.0 / v3.4 / v3.3 / v3.2 / v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
 | 作成日 | 2026-09-11 |
 | 改訂日 | 2026-09-12 |
 | 実測記録 | `docs/POC.md`（Phase 0 の実測値と判断。本書と食い違う場合は POC.md を正とする） |
 | 対象環境 | macOS / Apple Silicon |
-| 位置づけ | 本書が実装時の唯一の規範。v3.x / v2.0 と矛盾する場合は本書を優先する |
+| 位置づけ | 本書が実装時の唯一の規範。v4.0 / v3.x / v2.0 と矛盾する場合は本書を優先する |
 
 > **v4.0 は構成の変更を含む。**v3.x は「`/Volumes` をコンテナへ bind mount する」前提だったが、
 > #2 の実機検証で **Docker Desktop の VirtioFS が物理 USB を読めない**ことが確定した（`docs/POC.md` §2）。
@@ -572,20 +572,51 @@ part_key = (transmitter_id, mic_index, started_at)
 
 **この判定は `voicedock-ingest`（ホスト）が行う**（§4.2）。コンテナはデバイスを見ない。
 
-Volume 名を固定しない。ホストの `/Volumes` 直下の各エントリについて以下を評価し、**すべて**を満たす場合に DJI デバイスと判定する。
+Volume 名を固定しない。ホストの `/Volumes` 直下の各エントリについて以下を**この順に**評価し、**すべて**を満たす場合に DJI デバイスと判定する。
 
-1. **エントリ自身がシンボリックリンクでない**（`os.path.islink()` が偽）。macOS には
+1. **`INCLUDE_VOLUMES` が空でなければ、そのいずれかに一致する**（空なら制限なし ＝ 既定）
+2. `EXCLUDE_VOLUMES` のいずれのパターンにも一致しない
+3. **エントリ自身がシンボリックリンクでない**。macOS には
    `/Volumes/Macintosh HD -> /` が実在し、辿ると起動ディスク全体が走査対象になる（§22 R-19）
-2. ディレクトリであり、読み取り可能である
-3. `RECORDING_FOLDER_RE` に一致するサブディレクトリが 1 個以上存在する、**または** `RECORDING_FILENAME_RE` に一致する `.wav` が 1 個以上存在する
-4. `config.device.exclude_volumes` のいずれのパターンにも一致しない
+4. ディレクトリであり、読み取り可能である
+5. `RECORDING_FOLDER_RE` に一致するサブディレクトリが 1 個以上存在する、**または** `RECORDING_FILENAME_RE` に一致する `.wav` が 1 個以上存在する
+6. 再帰探索の深さを `MAX_SCAN_DEPTH`（既定 `3`）に制限する
 
-**除外パターンは `fnmatch` による glob として評価する（正規表現ではない）。**既定値は §7.2 と同一でなければならない。
+> **1 と 2 を先に評価する理由**: この 2 つは `readdir` が返した**名前だけ**で判定でき、
+> **`stat` を 1 回も呼ばずに落とせる。**#2 では 1 個のボリュームへ触れただけで
+> Docker Desktop 全体が固まった（`docs/POC.md` §2.3）。**触れないことが最大の防壁**であり、
+> 許可リストの価値はここにある。
+>
+> **`INCLUDE_VOLUMES` の既定を空にする理由**: 本節は「Volume 名を固定しない」と規定している。
+> 既定で許可リストを有効にすると、**ユーザーがボリュームを改名した瞬間に無言で検出されなくなる。**
+> 使いたい人が明示的に有効にする防壁とする。
 
-```python
-# コンテナ側の規範実装（同じ規則を helper/voicedock-ingest が bash で実装する）
-excluded = any(fnmatch.fnmatch(name, pat) for pat in cfg.device.exclude_volumes)
+**パターンは `fnmatch` による glob として評価する（正規表現ではない）。**
+値は **`<VOICEDOCK_HOME>/helper.conf` にのみ置く**（§7.4）。
+
+```sh
+# helper/voicedock-ingest の規範実装（bash 3.2）
+matches_any() {                      # $1=名前, $2...=パターン
+  local name="$1"; shift
+  local pat
+  for pat in "$@"; do
+    case "$name" in ($pat) return 0 ;; esac
+  done
+  return 1
+}
+
+# 1. 許可リスト（空なら素通り）
+if [ ${#INCLUDE_VOLUMES[@]} -gt 0 ] && ! matches_any "$name" "${INCLUDE_VOLUMES[@]}"; then
+  skip "$name" "not in INCLUDE_VOLUMES"; continue
+fi
+# 2. 拒否リスト
+if [ ${#EXCLUDE_VOLUMES[@]} -gt 0 ] && matches_any "$name" "${EXCLUDE_VOLUMES[@]}"; then
+  skip "$name" "in EXCLUDE_VOLUMES"; continue
+fi
 ```
+
+> **配列でなければならない。**ボリューム名には空白が入る（`Macintosh HD` / 出荷時の `NO NAME`）。
+> 空白区切りの文字列にすると `"Macintosh HD"` が 2 つのパターンへ分解され、**除外が働かない。**
 
 > **規則の二重実装について**: §5.4 と §10.3 の規則は、コンテナ（Python）ではなく
 > **Helper（bash）が実行する**。両者で食い違うと検出漏れが無言で起きるため、
@@ -593,9 +624,7 @@ excluded = any(fnmatch.fnmatch(name, pat) for pat in cfg.device.exclude_volumes)
 > `doctor` の D-18 は Helper が報告した `inventory.json` とコンテナ側の期待を突き合わせ、
 > 食い違いを検出する（§19.2）。
 
-> `.*` を正規表現として解釈すると全 Volume 名に一致し、DJI が 1 台も検出されないまま無言で停止する。この症状は P0-6（ホットプラグ伝播の失敗）と区別がつかないため、`doctor` は除外された Volume 名を必ず列挙する（§19.2 D-5）。
-
-判定は再帰探索の深さを `config.device.max_scan_depth`（既定 `3`）に制限する。
+> `.*` を正規表現として解釈すると全 Volume 名に一致し、DJI が 1 台も検出されないまま無言で停止する。この症状は P0-6（ホットプラグ伝播の失敗）と区別がつかない。**`INCLUDE_VOLUMES` を設定した場合も同じ症状になりうる**（綴りを間違えると 1 台も通らない）。そのため `doctor` は **`INCLUDE` で対象外にした名前と `EXCLUDE` で除外した名前を、理由ごとに分けて必ず列挙する**（§19.2 D-5）。
 
 デバイス識別子 `device_id` は Volume 名とする。Volume 名は変わりうるため、**二重処理防止にも削除対象の同定にも単独では使わない**（§14.1）。
 
@@ -747,10 +776,11 @@ voicedock/
 │       ├── log.py                  # 構造化ログ（§16）
 │       ├── errors.py               # エラーコード定義（§15）
 │       ├── db.py                   # 接続・行データクラス・クエリ・マイグレーション（§8）
-│       ├── paths.py                # DevicePath / StagingPath / VaultPath
-│       │                           #   + safe_unlink_staging / safe_unlink_tmp（§11.2, §14.4 N-10）
-│       ├── device.py               # 検出・ファイル名パース・安定性判定・Part 列挙
-│       │                           #   + 削除対象の解決（§5, §10.1-10.3）。削除は行わない
+│       ├── paths.py                # DevicePath / InboxPath / StagingPath / VaultPath
+│       │                           #   + safe_unlink_inbox / _staging / _tmp（§11.2, §14.4 N-10）
+│       ├── device.py               # inbox の走査・.meta.json 読み取り・ファイル名パース
+│       │                           #   + inventory.json の読み取り（§10.2, §11.1）
+│       │                           #   デバイスには到達しない
 │       ├── audio.py                # ffprobe + ffmpeg 変換 + SHA-256（§10.5）
 │       ├── transcribe.py           # whisper-cli 実行（VAD 含む）（§10.6）
 │       ├── llm.py                  # クライアント・動的スキーマ生成・Map-Reduce 分割
@@ -760,7 +790,8 @@ voicedock/
 │       ├── session.py              # セッション分組（日単位）・統合・Block 算出（§10.4, §10.8）
 │       ├── states.py               # 状態定義・遷移表（§9）
 │       ├── pipeline.py             # ensure_* の直列実行・backoff / 自動再試行（§10, §15.2）
-│       ├── cleaner.py              # デバイス上のファイル削除のみ（§10.12, §14）
+│       ├── cleaner.py              # §14.1 の評価と削除要求の書き込み（§10.12, §14）
+│       │                           #   削除そのものは行わない。reaper が実行する（N-16）
 │       ├── cli.py                  # status / history / show / retry / pending
 │       │                           #   / cleanup / scan / health / version（§17.1）
 │       └── doctor.py               # 環境診断（§19.2）
@@ -860,21 +891,14 @@ TZ=Asia/Tokyo
 timezone: Asia/Tokyo
 
 # --- デバイス検出 -------------------------------------------
+# 検出・走査・安定性判定は Helper が行う（§4.2, §10.1）。
+# 関連する設定はすべて <VOICEDOCK_HOME>/helper.conf にある（§7.4）。
 device:
   root: /inbox                   # コンテナが監視するルート（Helper が原本を置く場所。§4.1）
-  poll_interval_seconds: 5       # 軽量チェック（Volume の増減のみ）の間隔
-  deep_scan_interval_seconds: 600  # 既知デバイスを深く走査する最小間隔
-  rescan_on_mount_change: true   # 新しい Volume を見つけたら即座に深い走査
-  skip_unchanged_dirs: true      # ディレクトリ mtime が前回と同じなら中へ入らない
-  max_scan_depth: 3              # 再帰探索の深さ上限
-  exclude_volumes:               # 除外する Volume 名（fnmatch の glob。正規表現ではない）
-    - "Macintosh HD"
-    - "com.apple.TimeMachine.*"
-    - ".*"
-  # ファイル安定性判定（§10.3）
-  stability_checks: 2            # size+mtime の一致を要求する連続回数
-  stability_interval_seconds: 3  # 判定間の待機秒数
-  stability_fast_path_seconds: 60  # mtime がこの秒数以上前なら待たずに安定と判定
+  # コンテナのワーカーループが /inbox を走査する間隔（§10.0）。
+  # v3.x では「デバイスの増減を見る間隔」だったが、v4.0 で検出が Helper へ移ったため
+  # 「ローカルディレクトリを 1 階層 scandir する間隔」の意味に狭まった。
+  poll_interval_seconds: 5
 
 # --- 音声 ---------------------------------------------------
 audio:
@@ -1051,9 +1075,9 @@ database:
 | V-1 | 未知のキーが存在しない（タイポ検出のため strict に扱う） | `CONFIG_UNKNOWN_KEY` |
 | V-2 | `audio.transcribe_variant` が `denoised` / `orig` のいずれか | `CONFIG_INVALID_VALUE` |
 | V-3 | `audio.target_sample_rate == 16000` かつ `target_channels == 1` かつ `target_codec == pcm_s16le` | `CONFIG_INVALID_VALUE`（whisper.cpp の入力要件、変更不可） |
-| V-4 | `device.poll_interval_seconds >= 1` | `CONFIG_INVALID_VALUE` |
-| V-5 | `device.stability_checks >= 1` | `CONFIG_INVALID_VALUE` |
-| V-6 | `device.deep_scan_interval_seconds >= device.poll_interval_seconds` | `CONFIG_INVALID_VALUE` |
+| V-4 | `device.poll_interval_seconds >= 1`（§10.0 のワーカーループが `/inbox` を走査する間隔） | `CONFIG_INVALID_VALUE` |
+| V-5 | ~~`device.stability_checks >= 1`~~ **v4.1 で廃止**（安定性判定は Helper が行う。§7.4 の起動時検証と DH-13 が担う） | — |
+| V-6 | ~~`device.deep_scan_interval_seconds >= device.poll_interval_seconds`~~ **v4.1 で廃止**（2 段走査は Helper へ移り、コンテナの `/inbox` 走査は 1 段で足りる） | — |
 | V-7 | `session.group_by == "day"` | `CONFIG_INVALID_VALUE`（MVP は day のみ） |
 | V-8 | `session.block_gap_seconds >= 0` | `CONFIG_INVALID_VALUE` |
 | V-9 | `retry.backoff_seconds` の要素数 >= `retry.max_attempts` | `CONFIG_INVALID_VALUE` |
@@ -1080,6 +1104,10 @@ database:
 | V-30 | `cleanup.delete_source_audio == true` のとき、**`helper.conf` の `delete_source_audio` も `true`** | `CONFIG_LOCK_MISMATCH`（片方だけの解除は事故。§14.2） |
 | V-31 | `import.helper_heartbeat_max_age_seconds >= 60` | `CONFIG_INVALID_VALUE` |
 
+> **廃止した規則の番号は詰めない。**V-7 以降を繰り上げると本文中の参照がすべてずれる。
+> **`INCLUDE_VOLUMES` / `EXCLUDE_VOLUMES` に対する V 規則は作らない。**V-* は `config.py` が
+> `config.yaml` を検証する規則であり、`helper.conf` は対象外である（検証は §7.4 と DH-13 が担う）。
+
 ### 7.4 `<VOICEDOCK_HOME>/helper.conf`
 
 Helper（bash）が `source` する KEY=VALUE 形式。**コンテナはこのファイルを読まない**が、
@@ -1091,8 +1119,19 @@ Helper が `state/heartbeat.json` へ写した値をコンテナが参照する�
 # 取り込み対象の探索ルート。通常は変更しない
 VOLUMES_ROOT=/Volumes
 
-# 除外するボリューム名（glob。空白区切り）。config.yaml の device.exclude_volumes と同一にすること
-EXCLUDE_VOLUMES="Macintosh HD Time Machine*"
+# 【許可リスト】走査対象をボリューム名で限定する（fnmatch の glob）。
+#   空（既定）なら制限なし。指定した場合、一致しないボリュームには stat すら行わない（§5.4）。
+#   既定を空にする理由: ボリュームを改名した瞬間に無言で検出されなくなるのを避けるため。
+#   使う場合の例: INCLUDE_VOLUMES=("DJIMIC3" "DJIMIC*")
+INCLUDE_VOLUMES=()
+
+# 【拒否リスト】INCLUDE を通ったものからさらに除外する（fnmatch の glob）。
+#   ★空白を含むボリューム名があるため、必ず配列で書くこと（§5.4）
+EXCLUDE_VOLUMES=(
+  "Macintosh HD"
+  "com.apple.TimeMachine.*"
+  ".*"
+)
 
 # 【安全ロック 2-B】デバイスのマウントモード。ro | rw
 #   ro: 接続を検知したら diskutil mount readOnly で再マウントし直す（既定）
@@ -1107,7 +1146,7 @@ DELETE_SOURCE_AUDIO=false
 # 取り込み先。.env の VOICEDOCK_HOME と一致させること
 VOICEDOCK_HOME="$HOME/VoiceDock"
 
-# 安定性判定（§10.3）。config.yaml の device.* と同一にすること
+# ファイル安定性判定（§10.3）
 STABILITY_FAST_PATH_SECONDS=60
 STABILITY_INTERVAL_SECONDS=3
 STABILITY_CHECKS=2
@@ -1116,9 +1155,42 @@ STABILITY_CHECKS=2
 MAX_SCAN_DEPTH=3
 ```
 
-**`helper.conf` と `config.yaml` で重複するキー**（`exclude_volumes` / 安定性判定 / 削除の可否）は、
-**§5.4 / §10.3 / §14.2 の規定が唯一の規範**であり、両ファイルはそれに従う。
-食い違いは `doctor` の D-18 が検出する（§19.2）。
+**検出・走査・安定性判定の設定は `helper.conf` にしか無い。**v4.0 では `config.yaml` の `device:` にも
+同じキーが残っていたが、**検出を行うのは Helper だけ**であり、`config.yaml` 側は誰も読まない
+死んだ設定だった（実際に両者の既定値は食い違っていた）。v4.1 で `helper.conf` へ一本化し、
+**値の二重定義を無くした**（§22 R-26）。
+
+残る二重実装は**規則（ロジック）だけ**である。**§5.4 / §10.3 の記述が唯一の規範**であり、
+`voicedock-ingest`（bash）はこれに従う。実効値は `doctor` の D-18 が表示する（§19.2）。
+
+削除の可否（`DELETE_SOURCE_AUDIO`）だけは**意図的に両方へ置く。**片方だけの解除を事故と見なし、
+起動時に弾くためである（V-30 / 安全ロック 1。§14.2）。
+
+**起動時の検証**:
+
+`voicedock-ingest` は起動時に `helper.conf` を検証し、違反があれば**取り込みを行わずに終了**して
+`state/heartbeat.json` へ `config_error` を記録する（コンテナの H-8 / D-18 が拾う）。
+**設定ミスで無言のまま 1 本も取り込まれない状態を作らない**（§22 R-23）。
+
+| # | 検査 |
+|---|---|
+| 1 | `VOLUMES_ROOT` が存在するディレクトリである |
+| 2 | `VOICEDOCK_HOME` が存在し、`/Users` 配下である（§7.1 V-28 と同じ条件） |
+| 3 | `INCLUDE_VOLUMES` / `EXCLUDE_VOLUMES` が**配列として宣言されている**（文字列なら拒否） |
+| 4 | 両配列の各要素が空文字列でない（空文字は何にも一致せず、全ボリュームが落ちる罠になる） |
+| 5 | `MOUNT_MODE` が `ro` / `rw` のいずれか |
+| 6 | `DELETE_SOURCE_AUDIO` が `true` / `false` のいずれか |
+| 7 | `STABILITY_CHECKS >= 1` かつ `STABILITY_INTERVAL_SECONDS >= 1` かつ `MAX_SCAN_DEPTH >= 1` |
+
+検査 3 は次で判定する。
+
+```sh
+declare -p INCLUDE_VOLUMES 2>/dev/null | grep -q '^declare -a'
+```
+
+> **検査 3 が必要な理由**: v4.0 の例は `EXCLUDE_VOLUMES="Macintosh HD Time Machine*"` という
+> 空白区切りの文字列だった。bash はこれを 4 つのパターンへ分解するため、**除外がまったく働かない。**
+> 配列へ直し忘れた設定を、無言で通さずに検出する。
 
 > **なぜ 1 つの設定ファイルにまとめないのか**: `config.yaml` は
 > `./config:/app/config:ro` でコンテナへ bind mount されるが、**Helper は Docker が止まっていても
@@ -1523,17 +1595,24 @@ def worker_loop() -> None:
     recover_interrupted()                   # §9.4 クラッシュリカバリ
     close_stale_open_sessions()             # §9.4 過去日の OPEN を READY へ
     while not stop_requested:
-        mounts = monitor.list_mounts()      # §10.1 軽量チェック（1 階層 scandir）
-        for device in monitor.resolve_devices(mounts):
-            if monitor.needs_deep_scan(device):
-                discover_parts(device)      # §10.2 - 10.4
-        close_idle_sessions()               # §10.4
-        process_pending_parts()             # §10.5 - 10.7（1 件ずつ直列・古い順）
-        process_ready_sessions()            # §10.8 - 10.11
-        retry_pending_deletions()           # §10.12
-        requeue_auto_retry()                # §15.2
+        inventory = device.read_inventory()  # §11.1 Helper の報告（/state:ro）
+        if inventory.is_stale(cfg):          # §19.1 H-8
+            log_warn("helper_heartbeat_stale"); sleep(...); continue
+        discover_parts(cfg.device.root)      # §10.2 /inbox を走査（.meta.json 付きのみ）
+        close_idle_sessions()                # §10.4
+        process_pending_parts()              # §10.5 - 10.7（1 件ずつ直列・古い順）
+        process_ready_sessions()             # §10.8 - 10.11
+        collect_delete_results(inventory)    # §10.12 queue/result/ を回収
+        retry_pending_deletions(inventory)   # §10.12
+        requeue_auto_retry()                 # §15.2
         sleep(cfg.device.poll_interval_seconds)
 ```
+
+**v4.0 以降、このループはデバイスを一切見ない。**見るのは `/inbox`（Helper が原本を置く場所）と
+`/state`（Helper の報告）だけである。デバイスの検出・走査・安定性判定は Helper が行う（§10.1）。
+
+**Helper のハートビートが古ければ取り込みを進めない。**Helper が止まっているのに
+「新しい録音が無い」と解釈して静かに待ち続ける状態を作らないため（§22 R-23）。
 
 並列化しない理由: CPU 負荷管理、whisper 同時実行の回避、状態管理の単純化、**削除事故の回避**、LLM 競合の回避。
 
@@ -1635,13 +1714,15 @@ device
 
 ```text
 1. 候補ファイル全件の (size, mtime) を一括取得
-2. mtime が現在時刻から stability_fast_path_seconds（既定 60 秒）以上前のものは
+2. mtime が現在時刻から STABILITY_FAST_PATH_SECONDS（既定 60 秒）以上前のものは
    → その場で「安定」と確定する（録音中のファイルだけが新しい mtime を持つ）
-3. 残りについてのみ stability_interval_seconds（既定 3 秒）待機し、一括で再取得
-4. 一致すれば 1 回成立。stability_checks（既定 2）回成立するまで 3 を繰り返す
+3. 残りについてのみ STABILITY_INTERVAL_SECONDS（既定 3 秒）待機し、一括で再取得
+4. 一致すれば 1 回成立。STABILITY_CHECKS（既定 2）回成立するまで 3 を繰り返す
 ```
 
-- 待機時間は合計 `stability_interval_seconds × stability_checks` であり、ファイル数に比例しない
+**設定キーは `helper.conf` にある**（§7.4）。`config.yaml` には存在しない。
+
+- 待機時間は合計 `STABILITY_INTERVAL_SECONDS × STABILITY_CHECKS` であり、ファイル数に比例しない
 - 不一致が出たファイルは成立回数を 0 に戻す
 - 成立しなかったファイルは当該走査パスでは登録せず、次回に再評価する（`FILE_NOT_STABLE` は失敗ではなく「保留」）
 - 全 Variant について判定し、**すべてが安定した場合のみ** inbox へコピーする
@@ -3615,7 +3696,10 @@ VoiceDock doctor
 [✓] Helper mount mode    readOnly (lock 2-B engaged)
 [✓] Inbox                /inbox  3 parts pending, 1.1 GiB
 [✓] Delete queue         /queue  0 requested, 0 awaiting result
-[✓] Host volumes         2 entries, 1 excluded: "Macintosh HD"   (reported by Helper)
+[✓] Host volumes         3 entries  (reported by Helper)
+                           included : "DJIMIC3"
+                           skipped by INCLUDE_VOLUMES : (none — list is empty)
+                           skipped by EXCLUDE_VOLUMES : "Macintosh HD", "Backup SSD"
 [✓] DJI device           DJIMIC3  readOnly  parts=3  free=4.2 GiB (≈4.3h)
 [✓] Whisper executable   /usr/local/bin/whisper-cli (v1.9.4, VAD: supported)
 [✓] Whisper model        ggml-large-v3-turbo-q5_0.bin (574.0 MiB)
@@ -3638,7 +3722,7 @@ VoiceDock doctor
 | D-2 | DB へ接続でき、スキーマバージョンが最新。`events` 行数と DB サイズを表示 | 致命的 |
 | D-3 | `/data` が書き込み可能、空き容量が `free_space_margin_bytes` 以上 | 致命的 |
 | D-4 | staging 使用量が上限内 | 警告 |
-| D-5 | Helper が報告した Volume 一覧（`state/inventory.json`）。**除外パターンで除外した Volume 名を必ず列挙する** | 致命的 |
+| D-5 | Helper が報告した Volume 一覧（`state/inventory.json`）。**`INCLUDE_VOLUMES` で対象外にした Volume 名と、`EXCLUDE_VOLUMES` で除外した Volume 名を、理由ごとに分けて必ず列挙する** | 致命的 |
 | D-6 | DJI デバイスの検出状況と**本体の残容量・推定残り録音時間**（未接続は正常）。推定残り録音時間は下記の基準で算出する | 情報 |
 | D-7 | `whisper-cli` が存在し `--help` が成功する。**VAD オプションの有無を表示** | 致命的 |
 | D-8 | Whisper モデルが存在し、サイズが 0 でない | 致命的 |
@@ -3651,7 +3735,7 @@ VoiceDock doctor
 | D-15 | `FAILED` / `SOURCE_DELETE_PENDING` / 自動再試行待ちの件数 | 警告 |
 | D-16 | **自コンテナに公開ポートが無いこと、LLM エンドポイントが `*.docker.internal` であること** | 致命的 |
 | D-17 | **削除モードの状態を必ず表示する。三重ロックの 3 つすべてを個別に表示する**（§14.2） | 有効なら警告表示 |
-| **D-18** | **Helper が稼働している**（`heartbeat.json` が `helper_heartbeat_max_age_seconds` 以内）。`mount_readonly` と Helper のバージョンを表示する。**Helper が報告した除外一覧と `config.yaml` の `device.exclude_volumes` が一致すること**（§7.4 の二重定義の食い違いを検出する） | 致命的 |
+| **D-18** | **Helper が稼働している**（`heartbeat.json` が `helper_heartbeat_max_age_seconds` 以内）。`mount_readonly`・Helper のバージョン・`config_error` の有無を表示する。**Helper が報告した `INCLUDE_VOLUMES` / `EXCLUDE_VOLUMES` の実効値を表示する**（設定が意図どおり読めているかの確認。v4.1 で値の二重定義が無くなったため突き合わせは不要になった） | 致命的 |
 | **D-19** | `/inbox` と `/queue` が読み書き可能。**inbox の滞留件数・容量、削除キューの未処理件数と最古の経過時間**を表示する | 警告（滞留が閾値超のとき） |
 
 **推定残り録音時間の算出基準**:
@@ -3704,7 +3788,7 @@ VoiceDock doctor
 | DH-10 | `docker compose config` が成功する（変数解決・構文の検証） | 致命的 |
 | DH-11 | `docker compose config` の出力に `ports:` が含まれない（§14.4 N-13） | 致命的 |
 | **DH-12** | **`com.voicedock.ingest` の LaunchAgent が load されている**（`launchctl print gui/$UID/com.voicedock.ingest`） | 致命的（Helper が動かなければ録音は 1 本も取り込まれない） |
-| **DH-13** | `<VOICEDOCK_HOME>` が存在し `/Users` 配下である。`helper.conf` が存在し、`MOUNT_MODE` と `DELETE_SOURCE_AUDIO` の値を表示する | 致命的 |
+| **DH-13** | `<VOICEDOCK_HOME>` が存在し `/Users` 配下である。`helper.conf` が存在し、**§7.4 の起動時検証 1〜7 を実行する**。`MOUNT_MODE` / `DELETE_SOURCE_AUDIO` / `INCLUDE_VOLUMES` / `EXCLUDE_VOLUMES` の値を表示する | 致命的 |
 | **DH-14** | **`<VOICEDOCK_HOME>/bin/voicedock-reaper` の有無を表示する**（ロック 2-A の状態） | 存在すれば警告表示 |
 | **DH-15** | `docker compose config` の出力に **`/Volumes` が含まれない**（§14.4 N-3） | 致命的 |
 
@@ -3721,8 +3805,8 @@ VoiceDock doctor
 | ファイル名パーサ | 正常形・`_orig` 付き・大文字拡張子・不正形・境界値（`MIC000` / `MIC999` / `TX00`） |
 | フォルダ名パーサ | 同上 |
 | Variant ペアリング | 両方あり / denoised のみ / orig のみ / 同名衝突 |
-| デバイス判定 | DJI 形式あり / なし / **除外パターンが glob として評価されること**（`.*` が全件に一致しない） / 深さ制限 |
-| 安定性判定 | バッチ判定 / `stability_fast_path_seconds` による即断 / size 変化 / mtime 変化 / 途中で変化して再カウント |
+| デバイス判定 | **Helper 層で検証する**（§20.4 と同じ枠組みで `bash helper/voicedock-ingest` を `tmp_path` の偽 `/Volumes` に対して実行）。DJI 形式あり / なし / **`INCLUDE_VOLUMES` が空なら素通り・非空なら一致のみ通す** / **glob として評価されること**（`.*` が全件に一致しない） / **空白を含むボリューム名が 1 パターンとして扱われること** / 深さ制限 |
+| 安定性判定 | **Helper 層で検証する。**バッチ判定 / `STABILITY_FAST_PATH_SECONDS` による即断 / size 変化 / mtime 変化 / 途中で変化して再カウント |
 | セッション分組 | 同一日で結合 / 日境界で分割（23:50 開始 30 分の Part） / デバイス違い / `session_id IS NULL` のみ対象 / 再オープン |
 | Block 算出 | ギャップ超過で分割 / duration NULL のとき境界扱い |
 | SHA-256 ストリーム | チャンク境界・空ファイル・大容量 |
@@ -3979,7 +4063,7 @@ docker compose exec voicedock voicedock cleanup --backlog
 | R-23 | **Helper が停止しても、コンテナは正常に見え続ける** | 録音が 1 本も取り込まれないまま何日も気づかない。**無人稼働では最も起きやすい沈黙** | `heartbeat.json` を **H-8 で unhealthy 条件にする**（§19.1）。`doctor` D-18 と DH-12 でも検査。`status` に Helper の状態を常時表示（§17.2） |
 | R-24 | **削除の判断（コンテナ）と実行（reaper）がテスト境界をまたぐ** | 境界のどちらかだけをテストしても安全性を保証できない | §20.4 を 2 層に分け、境界そのものを狙う ND-24〜ND-30 を追加。reaper を POSIX bash に限定して **CI で実行可能**にした（§14.4 N-19） |
 | R-25 | **`diskutil mount readOnly` による再マウントが失敗する**（他プロセスが使用中など） | ロック 2-B が掛からないまま運用が続く | **失敗は安全側へ倒す。**ingest は取り込みを続行しつつ `heartbeat.json` に `mount_readonly: false` を書き、**reaper が検証 2 で削除を拒否する**（§14.2）。`doctor` D-18 が表示 |
-| R-26 | **Helper（bash）とコンテナ（Python）で §5.4 / §10.3 の規則が二重実装になる** | 食い違うと検出漏れが無言で起きる | **§5.4 / §10.3 の記述が唯一の規範**と明記（§7.4）。`doctor` D-18 が両者の除外一覧を突き合わせる |
+| R-26 | **Helper（bash）とコンテナ（Python）で §5.4 / §10.3 の規則が二重実装になる** | 食い違うと検出漏れが無言で起きる | **値の二重定義は v4.1 で解消した**（検出系の設定は `helper.conf` にのみ存在する。§7.4）。残るのは**規則の二重実装**だけで、**§5.4 / §10.3 の記述が唯一の規範**。`doctor` D-18 が Helper の実効値を表示し、D-5 が除外理由を列挙する |
 
 ---
 
@@ -3999,7 +4083,29 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 ---
 
-## 付録 A. v3.4 から v4.0 への主な変更点
+## 付録 A. v4.0 から v4.1 への主な変更点
+
+v4.1 は、**走査対象の許可リストを追加し、あわせて v4.0 が残した設定の積み残しを解消する**改訂である。
+**§14 の削除設計には一切触れていない。**変更範囲は検出側だけである。
+
+| # | 変更 | 理由 |
+|---|---|---|
+| F-1 | **`INCLUDE_VOLUMES`（許可リスト）を新設**（§5.4, §7.4） | 拒否リストは「知っている悪いもの」しか弾けない。#2 で **1 個のボリュームへ触れただけで Docker Desktop 全体が固まった**（`docs/POC.md` §2.3）以上、**許可外に触れない**防壁が要る |
+| F-2 | **名前による判定を先頭へ移した**（§5.4） | `readdir` が返す名前だけで落とせる ＝ **`stat` を 1 回も呼ばない**。許可リストの価値はここにある |
+| F-3 | **検出系の設定を `helper.conf` へ一本化**（§7.2, §7.4） | v4.0 では `config.yaml` の `device:` にも同じキーが残っていたが、**検出を行うのは Helper だけ**で、`config.yaml` 側は誰も読まない死んだ設定だった。**実際に両者の既定値は食い違っていた** |
+| F-4 | **`EXCLUDE_VOLUMES` を bash 配列へ**（§5.4, §7.4） | 空白区切りの文字列だと `"Macintosh HD"` が 2 つのパターンへ分解され、**除外がまったく働かない**。ボリューム名には空白が入る（出荷時の `NO NAME` も） |
+| F-5 | **`helper.conf` の起動時検証 1〜7 を規定**（§7.4, DH-13） | 配列でない宣言を検出する（F-4 の移行漏れ対策）。違反時は**取り込まずに終了**し `heartbeat.json` へ記録する。設定ミスで無言のまま 1 本も取り込まれない状態を作らない |
+| F-6 | **V-5 / V-6 を廃止**（§7.3） | 対応する `config.yaml` のキーが無くなった。**番号は詰めない**（V-7 以降の参照がずれるため）。**V-4（`poll_interval_seconds`）は残す** — コンテナのワーカーループが `/inbox` を走査する間隔として今も必要で、意味が「デバイス監視」から「ローカルディレクトリ走査」に狭まっただけ |
+| F-11 | **§10.0 のワーカーループを v4.0 の実態へ修正**（§10.0） | `monitor.list_mounts()` / `resolve_devices()` / `discover_parts(device)` が v3.x のまま残っていた。**v4.0 以降このループはデバイスを一切見ない。**あわせて **Helper のハートビートが古ければ取り込みを進めない**ことを明記した（§22 R-23） |
+| F-12 | **§10.3 の設定キー名を `helper.conf` の表記へ**（§10.3） | 小文字（`stability_checks` 等）のままで、`config.yaml` のキーと誤読されうる状態だった |
+| F-7 | **D-5 / D-18 / DH-13 を更新**（§19.2） | `INCLUDE` で落ちた名前も理由別に列挙する。D-18 の突き合わせは一本化により不要になり、**実効値の表示**へ変えた |
+| F-8 | **§6 のツリーコメントを v4.0 の実態へ修正** | `paths.py` / `device.py` / `cleaner.py` の説明が v3.x のまま残っていた（§11 は v4.0 で更新済みだった） |
+| F-9 | **§20.1 の検出系テストを Helper 層へ移管**（§20.1） | 実行主体が Helper になったため。`bash` を `subprocess` で叩く §20.4 と同じ枠組みで検証する |
+| F-10 | **§22 R-26 を更新** | 値の二重定義は解消した。残るのは規則（ロジック）の二重実装だけ |
+
+---
+
+## 付録 B. v3.4 から v4.0 への主な変更点
 
 v4.0 は、**#2 の実機検証で現行アーキテクチャが成立しないと判明したことを受けた構成変更**である。
 
@@ -4026,7 +4132,7 @@ Obsidian 出力）、状態機械の骨格、設定項目の意味。
 
 ---
 
-## 付録 B. v3.3 から v3.4 への主な変更点
+## 付録 C. v3.3 から v3.4 への主な変更点
 
 v3.4 は、**#2（Phase 0 PoC）で DJI Mic 3 の実機から得た測定値を反映する**ことだけを目的とした改訂である。
 **機能・安全設計・設定項目は 1 つも変えていない。**実測値の出典はすべて `docs/POC.md` §6。
@@ -4047,7 +4153,7 @@ v3.4 は、**#2（Phase 0 PoC）で DJI Mic 3 の実機から得た測定値を�
 
 ---
 
-## 付録 C. v3.2 から v3.3 への主な変更点
+## 付録 D. v3.2 から v3.3 への主な変更点
 
 v3.3 は、**実装に着手する前に、仕様書に残っていた事実誤りと仕様内の不整合を潰す**ことだけを目的とした
 改訂である。**処理の内容・安全設計・設定項目の意味は 1 つも変えていない**（追加は V-27 と
@@ -4072,7 +4178,7 @@ v3.3 は、**実装に着手する前に、仕様書に残っていた事実誤�
 
 ---
 
-## 付録 D. v3.1 から v3.2 への主な変更点
+## 付録 E. v3.1 から v3.2 への主な変更点
 
 v3.2 は、**実装に着手する前に「個人用途に対して過剰な構造」を削る**ことだけを目的とした改訂である。
 **機能・安全設計・設定項目は 1 つも削っていない。**処理の内容が変わる変更は含まれない。
@@ -4104,7 +4210,7 @@ v3.2 は、**実装に着手する前に「個人用途に対して過剰な構�
 
 ---
 
-## 付録 E. v3.0 から v3.1 への主な変更点
+## 付録 F. v3.0 から v3.1 への主な変更点
 
 v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間録り続ける」へ変わった**ことを起点に全面改訂したものである。
 
@@ -4141,7 +4247,7 @@ v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間
 
 ---
 
-## 付録 F. 参考資料
+## 付録 G. 参考資料
 
 Docker 公式ドキュメントを実装時の一次資料とする。
 
