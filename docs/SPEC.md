@@ -1,11 +1,11 @@
-# VoiceDock 詳細仕様書 v4.5
+# VoiceDock 詳細仕様書 v4.6
 
 **DJI Mic 3 × ローカル文字起こし × ローカルLLM × Obsidian**
 
 | 項目 | 内容 |
 |---|---|
-| 文書版 | **v4.5（スキーマ v1 の確定）** |
-| 前身文書 | v4.4 / v4.3 / v4.2 / v4.1 / v4.0 / v3.4 / v3.3 / v3.2 / v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
+| 文書版 | **v4.6（状態機械の内部整合）** |
+| 前身文書 | v4.5 / v4.4 / v4.3 / v4.2 / v4.1 / v4.0 / v3.4 / v3.3 / v3.2 / v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
 | 作成日 | 2026-09-11 |
 | 改訂日 | 2026-09-12 |
 | 実測記録 | `docs/POC.md`（Phase 0 の実測値と判断。本書と食い違う場合は POC.md を正とする） |
@@ -1477,6 +1477,7 @@ stateDiagram-v2
     [*] --> DISCOVERED
     DISCOVERED --> NORMALIZING
     NORMALIZING --> NORMALIZED
+    NORMALIZING --> SKIPPED
     NORMALIZED --> TRANSCRIBING
     TRANSCRIBING --> TRANSCRIBED
     TRANSCRIBING --> SKIPPED
@@ -1487,6 +1488,7 @@ stateDiagram-v2
     SOURCE_DELETING --> COMPLETED
     SOURCE_DELETING --> SOURCE_DELETE_PENDING
     SOURCE_DELETE_PENDING --> SOURCE_DELETING
+    COMPLETED --> SOURCE_DELETING
 
     NORMALIZING --> FAILED
     TRANSCRIBING --> FAILED
@@ -1524,6 +1526,7 @@ stateDiagram-v2
     OPEN --> READY
     READY --> MERGING
     MERGING --> MERGED
+    MERGING --> COMPLETED
     MERGED --> ANALYZING
     ANALYZING --> ANALYZED
     ANALYZED --> WRITING
@@ -1590,7 +1593,7 @@ stateDiagram-v2
 | `SOURCE_DELETING` | デバイス未接続 / 同定失敗 / 失敗 / **`delete_result_timeout_seconds` 超過** | — | `SOURCE_DELETE_PENDING` | ノートは残す。要求はキューに残したままにしない（`request_id` を変えて再投入する） |
 | `SOURCE_DELETE_PENDING` | デバイス再接続 | §14.1 が真 | `SOURCE_DELETING` | — |
 | `COMPLETED` | 削除の後追い | §14.1 が真（Phase 7 移行・§17.1 `cleanup --backlog`） | `SOURCE_DELETING` | — |
-| `FAILED` | `retry` / 自動再試行 | `retry_count < max_attempts` または `--force` | 直前の進行中状態 | `retry_count += 1` |
+| `FAILED` | `retry` / 自動再試行 | `retry_count < max_attempts` または `--force` | 直前の進行中状態（`NORMALIZING` / `TRANSCRIBING` / `RAW_WRITING`） | `retry_count += 1` |
 | 各工程通過 | — | — | — | **`retry_count = 0` にリセットする**（§15.2） |
 
 **Session:**
@@ -1605,6 +1608,7 @@ stateDiagram-v2
 | `READY` | 定期評価 | 進行中の Part が残っている | `READY` のまま | 待機 |
 | `MERGING` | 統合成功 | 統合結果の文字数 > 0 | `MERGED` | — |
 | `MERGING` | 有効な Part が 0 件 | 全 Part が `SKIPPED` / `FAILED` | `COMPLETED` | ノートを作らず完了（`session_empty`） |
+| `MERGING` | 統合失敗 | — | `FAILED` | `SESSION_MERGE_FAILED`。**元音声は削除しない** |
 | `MERGED` | LLM 要求 | LLM エンドポイント到達可 | `ANALYZING` | — |
 | `ANALYZING` | JSON 検証成功 | Pydantic 検証通過 | `ANALYZED` | `analysis_path` 更新 |
 | `ANALYZING` | JSON 不正 | repair も失敗 | `FAILED` | `LLM_INVALID_JSON`。**元音声は削除しない** |
@@ -1617,7 +1621,16 @@ stateDiagram-v2
 | `SAVED` / `COMPLETED` | 同日の新 Part が `RAW_SAVED` | `allow_reopen == true` | `MERGING` | `regenerated_count += 1` |
 | `SOURCE_DELETING` | 全 Part 削除完了 | — | `CLEANUP` | — |
 | `SOURCE_DELETING` | 一部失敗 | — | `SOURCE_DELETE_PENDING` | ノートは残す |
+| `SOURCE_DELETE_PENDING` | デバイス再接続 | §14.1 が真 | `SOURCE_DELETING` | — |
 | `CLEANUP` | staging 削除完了 | — | `COMPLETED` | — |
+| `FAILED` | `retry` / 自動再試行 | `retry_count < max_attempts` または `--force` | 直前の進行中状態（`MERGING` / `ANALYZING` / `WRITING`） | `retry_count += 1` |
+
+> **「`X` のまま」は遷移ではない。**`READY のまま`（待機）と `SAVED のまま`
+> （`delete_attempts += 1`）は状態が変わらないので `events` を書かない。とくに
+> `READY のまま`は定期評価のたびに現れるため、記録すると §8.4 が想定する
+> 「1 日約 260 行」を桁で超える。**列の更新は `status` を変えない UPDATE で行う。**
+> 一方 `OPEN → OPEN`（Part 追加）は表が `のまま`と書いていない**遷移**であり、
+> Part が増えたことを `events` に残す。
 
 ### 9.4 再開規則
 
@@ -1636,7 +1649,8 @@ stateDiagram-v2
 
 セッション統合（§10.8）は永続化しないため、毎回安価に再実行する。
 
-起動時に、進行中状態（`*ING`）で残っている行を検出したら、**その工程の直前の完了状態へ巻き戻す**（クラッシュリカバリ）。
+起動時に、進行中状態で残っている行を検出したら、**その工程の直前の完了状態へ巻き戻す**（クラッシュリカバリ）。
+**`SOURCE_DELETE_PENDING` は進行中ではない**（巻き戻しの行き先そのものである）。名前が `ING` で終わるため接尾辞だけで判定すると取り違える。逆に `CLEANUP` は `ING` で終わらないが進行中である。
 
 ```text
 NORMALIZING     -> DISCOVERED   （部分出力を削除してから）
@@ -2805,7 +2819,13 @@ Part の元音声を削除してよいのは、以下の論理式が真のとき
 > （§14.1.1）。二重に検証することが v4.0 の設計である。
 
 ```python
-TERMINAL = ("RAW_SAVED", "SOURCE_DELETING", "SOURCE_DELETE_PENDING", "COMPLETED")
+# ★2 つの集合を使い分ける（§9.1 の「終端状態」と混同しないこと）
+#   PART_TERMINAL  : §9.1 の 6 件。Session の進行判定に使う（FAILED / SKIPPED を含む）
+#   PART_DELETABLE : 削除してよい 4 件。FAILED / SKIPPED は本文が保存されていないので含めない
+PART_TERMINAL = ("RAW_SAVED", "SOURCE_DELETING", "SOURCE_DELETE_PENDING", "COMPLETED",
+                 "FAILED", "SKIPPED")
+PART_DELETABLE = ("RAW_SAVED", "SOURCE_DELETING", "SOURCE_DELETE_PENDING", "COMPLETED")
+SESSION_DELETABLE = ("SAVED", "SOURCE_DELETING", "SOURCE_DELETE_PENDING", "CLEANUP", "COMPLETED")
 
 def can_delete_source(part, session, cfg, device) -> bool:
     return (
@@ -2819,8 +2839,7 @@ def can_delete_source(part, session, cfg, device) -> bool:
         and part.id in frontmatter_ids(session.raw_output_path)
 
         # --- Daily ノートが保存検証済みで、この Part を含む ---
-        and session.status in ("SAVED", "SOURCE_DELETING", "SOURCE_DELETE_PENDING",
-                               "CLEANUP", "COMPLETED")
+        and session.status in SESSION_DELETABLE
         and session.output_path is not None
         and verify_daily_note(session) is True        # §13.7 W-1〜W-9 を実ファイルで再実行
         and part.id in frontmatter_ids(session.output_path)
@@ -2831,14 +2850,13 @@ def can_delete_source(part, session, cfg, device) -> bool:
 
         # --- Part 自身の処理が完了 ---
         and part.session_id == session.id
-        and part.status in TERMINAL
+        and part.status in PART_DELETABLE
         and part.transcript_path is not None
         and part_transcript_is_valid(part)
 
         # --- 同一 Session の全 Part が終端状態（空集合を真にしない） ---
         and len(session.parts) >= 1
-        and all(p.status in TERMINAL or p.status in ("FAILED", "SKIPPED")
-                for p in session.parts)
+        and all(p.status in PART_TERMINAL for p in session.parts)   # ★§9.1 の 6 件
 
         # --- 削除対象ファイルの同定（§14.1.1）。空集合を真にしない ---
         and len(part.variant_paths) >= 1
@@ -2855,6 +2873,12 @@ def can_delete_source(part, session, cfg, device) -> bool:
 - **削除の根拠は「音声のコピーが正しかったこと」ではなく「テキストが Vault に確実に残っていること」である。**原音のコピーを保持しない設計（§10.5）に合わせて、v3.0 の「staging 上のファイルからハッシュを再計算する」条件は廃止した
 - 処理できなかった Part（`FAILED` / `SKIPPED`）はノートの `voicedock_recording_ids` に載らないため、**自動的に削除対象から外れる**
 - `all()` / `any()` を安全条件に使う場合は、**対象集合が空でないことを別条件として必ず明示する**（空集合の `all()` は真になるため）
+- **`PART_DELETABLE` は §9.1 の「終端状態」（`PART_TERMINAL`）とは別集合である。**§9.1 の終端状態は
+  `FAILED` / `SKIPPED` を**含む**（失敗した 1 本でその日の記録全体を止めないため。§1.3）が、
+  それらは**文字起こし本文が保存されていない**ので削除してはならない。v4.5 まで削除条件側を
+  `TERMINAL` という同じ名前で呼んでいた。**実装は `states.py` の `PART_TERMINAL`（6 件）と
+  `PART_DELETABLE`（4 件）を使い分け、文字列を再掲しない**（`tests/unit/test_states.py` が
+  包含関係と差を固定している）
 
 #### 14.1.1 削除対象ファイルの同定（reaper の独立検証）
 
@@ -4244,7 +4268,22 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 ---
 
-## 付録 A. v4.4 から v4.5 への主な変更点
+## 付録 A. v4.5 から v4.6 への主な変更点
+
+v4.6 は、**状態機械の内部整合を取る**改訂である。SPEC を parse して図と表を突き合わせた
+結果として見つかった食い違いを直した。**§14.1 の論理式そのものは変えていない**（参照する
+定数の名前を分けただけである）。
+
+| # | 変更 | 理由 |
+|---|---|---|
+| K-1 | **§14.1 の `TERMINAL` を `PART_DELETABLE` へ改名し、`PART_TERMINAL` / `SESSION_DELETABLE` を明示**（§14.1） | §9.1 の「終端状態」（**6 件**）と同名なのに**別集合**（4 件）だった。混同して §9.1 側を使うと **`FAILED` / `SKIPPED` の Part の元音声を削除する** — 文字起こし本文が保存されていない Part を消す経路であり、**ND-01〜28 のどれも検出しない**。あわせて「全 Part が終端状態」の条件が実際には `PART_TERMINAL` そのものであることを本文で明示した |
+| K-2 | **Session の遷移表に 3 行追加**（§9.3） | mermaid 図にあって表に無い辺が 5 つあり、**`FAILED` からの復帰行が 1 つも無かった**（Part にはある）。§15.2 は `SESSION_MERGE_FAILED` / `LLM_*` / `OBSIDIAN_*` を「可（3 回）」としているのに、表のうえでは復帰できなかった |
+| K-3 | **mermaid 図に 3 辺追加**（§9.1, §9.2） | 表にあって図に無い辺（Part `COMPLETED → SOURCE_DELETING` / Part `NORMALIZING → SKIPPED` / Session `MERGING → COMPLETED`）。**以後は「図の辺集合 == 表の辺集合」をテストで固定する** |
+| K-4 | **「`X` のまま」は遷移ではないと明記**（§9.3） | `READY のまま`を `events` に書くと、定期評価のたびに行が増えて §8.4 が想定する「1 日約 260 行」を桁で超える。表記の違いに意味があることを本文に残した |
+
+---
+
+## 付録 B. v4.4 から v4.5 への主な変更点
 
 v4.5 は、**スキーマ v1 を確定させる**改訂である。§8.5 が破壊的変更を禁じているため、
 **v1 に入れ損ねた制約は後から安全に足せない。**§14 の削除設計には触れていない。
@@ -4256,7 +4295,7 @@ v4.5 は、**スキーマ v1 を確定させる**改訂である。§8.5 が破�
 
 ---
 
-## 付録 B. v4.3 から v4.4 への主な変更点
+## 付録 C. v4.3 から v4.4 への主な変更点
 
 v4.4 は、**テスト fixture の形式と組み立て方式を実測へ合わせる**改訂である。
 **規則そのものは 1 つも変えていない。**変更範囲はテスト仕様だけである。
@@ -4270,7 +4309,7 @@ v4.4 は、**テスト fixture の形式と組み立て方式を実測へ合わ�
 
 ---
 
-## 付録 C. v4.2 から v4.3 への主な変更点
+## 付録 D. v4.2 から v4.3 への主な変更点
 
 v4.3 は、**パス封じ込めの API を本文へ明記する**改訂である。実装が §14.1.1 のコードを
 各モジュールでインライン展開する余地を消すことが目的で、**規則そのものは 1 つも変えていない。**
@@ -4285,7 +4324,7 @@ v4.3 は、**パス封じ込めの API を本文へ明記する**改訂である
 
 ---
 
-## 付録 D. v4.1 から v4.2 への主な変更点
+## 付録 E. v4.1 から v4.2 への主な変更点
 
 v4.2 は、**§7.3 の検証規則を実装可能な形へ整え、Helper からコンテナへの報告形式を明文化する**
 改訂である。**§14 の削除設計には一切触れていない。**
@@ -4303,7 +4342,7 @@ v4.2 は、**§7.3 の検証規則を実装可能な形へ整え、Helper から
 
 ---
 
-## 付録 E. v4.0 から v4.1 への主な変更点
+## 付録 F. v4.0 から v4.1 への主な変更点
 
 v4.1 は、**走査対象の許可リストを追加し、あわせて v4.0 が残した設定の積み残しを解消する**改訂である。
 **§14 の削除設計には一切触れていない。**変更範囲は検出側だけである。
@@ -4325,7 +4364,7 @@ v4.1 は、**走査対象の許可リストを追加し、あわせて v4.0 が�
 
 ---
 
-## 付録 F. v3.4 から v4.0 への主な変更点
+## 付録 G. v3.4 から v4.0 への主な変更点
 
 v4.0 は、**#2 の実機検証で現行アーキテクチャが成立しないと判明したことを受けた構成変更**である。
 
@@ -4352,7 +4391,7 @@ Obsidian 出力）、状態機械の骨格、設定項目の意味。
 
 ---
 
-## 付録 G. v3.3 から v3.4 への主な変更点
+## 付録 H. v3.3 から v3.4 への主な変更点
 
 v3.4 は、**#2（Phase 0 PoC）で DJI Mic 3 の実機から得た測定値を反映する**ことだけを目的とした改訂である。
 **機能・安全設計・設定項目は 1 つも変えていない。**実測値の出典はすべて `docs/POC.md` §6。
@@ -4373,7 +4412,7 @@ v3.4 は、**#2（Phase 0 PoC）で DJI Mic 3 の実機から得た測定値を�
 
 ---
 
-## 付録 H. v3.2 から v3.3 への主な変更点
+## 付録 I. v3.2 から v3.3 への主な変更点
 
 v3.3 は、**実装に着手する前に、仕様書に残っていた事実誤りと仕様内の不整合を潰す**ことだけを目的とした
 改訂である。**処理の内容・安全設計・設定項目の意味は 1 つも変えていない**（追加は V-27 と
@@ -4398,7 +4437,7 @@ v3.3 は、**実装に着手する前に、仕様書に残っていた事実誤�
 
 ---
 
-## 付録 I. v3.1 から v3.2 への主な変更点
+## 付録 J. v3.1 から v3.2 への主な変更点
 
 v3.2 は、**実装に着手する前に「個人用途に対して過剰な構造」を削る**ことだけを目的とした改訂である。
 **機能・安全設計・設定項目は 1 つも削っていない。**処理の内容が変わる変更は含まれない。
@@ -4430,7 +4469,7 @@ v3.2 は、**実装に着手する前に「個人用途に対して過剰な構�
 
 ---
 
-## 付録 J. v3.0 から v3.1 への主な変更点
+## 付録 K. v3.0 から v3.1 への主な変更点
 
 v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間録り続ける」へ変わった**ことを起点に全面改訂したものである。
 
@@ -4467,7 +4506,7 @@ v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間
 
 ---
 
-## 付録 K. 参考資料
+## 付録 L. 参考資料
 
 Docker 公式ドキュメントを実装時の一次資料とする。
 
