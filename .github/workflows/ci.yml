@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+# CI はプロジェクトイメージをビルドしない。
+# #5 以降 Dockerfile は whisper.cpp をソースからビルドするため、PR ごとに回すには重すぎる。
+# §20.2 の統合テストが実 ffmpeg を要求するようになったら、ここで apt-get install ffmpeg を足す
+# （イメージ全体のビルドはしない）。
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # setup-uv は v8 以降 浮動メジャータグ（vN）を打っていないため完全な版へピンする。
+      # §18.5「latest / master への無条件依存を禁止する」にも沿う。
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: "0.12.13"   # Makefile の UV_IMAGE と同じ版に揃える（SPEC §18.5）
+          enable-cache: true
+
+      - run: uv sync --frozen
+
+      - name: ruff (lint)
+        run: uv run ruff check --output-format=github .
+
+      - name: ruff (format)
+        run: uv run ruff format --check .
+
+      - name: mypy --strict
+        run: uv run mypy
+
+      - name: pytest
+        run: uv run pytest -q
