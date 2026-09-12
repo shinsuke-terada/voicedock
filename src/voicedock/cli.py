@@ -11,7 +11,7 @@ import argparse
 import signal
 import sys
 
-from voicedock import __version__, db, doctor
+from voicedock import __version__, db, doctor, health
 from voicedock.config import ConfigError, load_config, logger_for, startup_notices
 from voicedock.errors import EXIT_CONFIG, EXIT_ERROR, EXIT_OK
 
@@ -31,7 +31,7 @@ v5.0 で `scan` / `history` / `show` / `retry` / `pending` / `cleanup` を削除
 **`health` は `compose.yaml` の healthcheck が呼ぶので消せない。**
 """
 
-IMPLEMENTED: frozenset[str] = frozenset({"doctor", "service", "version"})
+IMPLEMENTED: frozenset[str] = frozenset({"doctor", "health", "service", "version"})
 
 UNIMPLEMENTED_MESSAGE = "voicedock: サブコマンド '{name}' は未実装です（SPEC §17.1）。"
 
@@ -65,6 +65,9 @@ def dispatch(args: argparse.Namespace) -> int:
 
     if command == "doctor":
         return doctor.run()
+
+    if command == "health":
+        return health.run()
 
     if command == "service":
         return _service()
