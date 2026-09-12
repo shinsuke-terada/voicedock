@@ -322,7 +322,7 @@ def test_key_count_counts_leaves() -> None:
         return 1
 
     assert key_count(document) == leaves(document)
-    assert key_count(document) == 110
+    assert key_count(document) == 107
 
 
 def test_config_is_frozen() -> None:

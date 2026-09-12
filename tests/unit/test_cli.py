@@ -9,29 +9,59 @@ import pytest
 import yaml
 
 from tests.helpers import complete_tree, merge
+from tests.spec_sync import spec_removed_subcommands, spec_subcommands
 from voicedock import __version__, db, paths
 from voicedock.cli import IMPLEMENTED, SUBCOMMANDS
 from voicedock.errors import EXIT_CONFIG, EXIT_ERROR, EXIT_OK
 from voicedock.main import main
 
-# SPEC §17.1 の 11 サブコマンド。ここを唯一の期待値とし、漏れたらテストが落ちる。
-SPEC_SUBCOMMANDS: tuple[str, ...] = (
-    "service",
-    "scan",
-    "status",
-    "history",
-    "show",
-    "retry",
-    "pending",
-    "cleanup",
-    "doctor",
-    "health",
-    "version",
-)
+# SPEC §17.1 の表そのものを期待値にする。**直書きしない。**
+# v5.0 まではここに 11 本を写していたため、SPEC の表に 1 行足しても何も落ちなかった。
+SPEC_SUBCOMMANDS: tuple[str, ...] = tuple(spec_subcommands())
+
+# §17.1 の「v5.0 で削除した 6 本」の表（付録 A L-4）。**戻っていないことを固定する。**
+REMOVED_SUBCOMMANDS: tuple[str, ...] = tuple(spec_removed_subcommands())
 
 
 def test_subcommand_set_matches_spec() -> None:
     assert tuple(SUBCOMMANDS) == SPEC_SUBCOMMANDS
+
+
+def test_spec_subcommand_tables_do_not_overlap() -> None:
+    """§17.1 の 2 つの表に同じ名前が載っていないこと。
+
+    「残す」表と「削除した」表の両方に現れたら、どちらかの編集が中途半端である。
+    """
+    assert set(SPEC_SUBCOMMANDS).isdisjoint(REMOVED_SUBCOMMANDS), (
+        SPEC_SUBCOMMANDS,
+        REMOVED_SUBCOMMANDS,
+    )
+
+
+@pytest.mark.parametrize("name", REMOVED_SUBCOMMANDS)
+def test_removed_subcommands_are_gone(name: str) -> None:
+    """v5.0 で削った 6 本が argparse の使い方エラーになること（付録 A L-4）。
+
+    **未実装（EXIT_ERROR）と区別する。**未実装は「いずれ実装する」を意味するが、
+    この 6 本は代替へ移した結果として存在しない（§17.1 の対応表）。
+    """
+    assert name not in SUBCOMMANDS
+    with pytest.raises(SystemExit) as excinfo:
+        main([name])
+    assert excinfo.value.code == EXIT_CONFIG
+
+
+@pytest.mark.parametrize("name", SPEC_SUBCOMMANDS)
+@pytest.mark.parametrize("extra", [["1"], ["--limit", "5"], ["--force"]])
+def test_no_subcommand_takes_arguments(name: str, extra: list[str]) -> None:
+    """引数を取るサブコマンドが無いこと（§17.1）。
+
+    `--limit` / `session_id` / `--force` は v5.0 で全滅した。足したくなったら
+    §17.1 の表を先に直すこと。余分な引数は argparse の使い方エラー（終了コード 2）になる。
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        main([name, *extra])
+    assert excinfo.value.code == EXIT_CONFIG
 
 
 def test_version_prints_version(capsys: pytest.CaptureFixture[str]) -> None:
@@ -148,9 +178,5 @@ def test_unknown_subcommand_exits_2() -> None:
 
 
 def _minimal_argv(name: str) -> list[str]:
-    """必須の位置引数を持つサブコマンドに、最小限の引数を足す（SPEC §17.1）。"""
-    if name == "show":
-        return [name, "1"]
-    if name == "retry":
-        return [name, "1"]
+    """サブコマンドの argv。**v5.0 以降、引数を取るサブコマンドは無い**（§17.1）。"""
     return [name]

@@ -101,7 +101,6 @@ _IV: Final = ErrorCode.CONFIG_INVALID_VALUE
 
 RULES: Final[tuple[Rule, ...]] = (
     Rule("V-1", "<未知のキー>", ErrorCode.CONFIG_UNKNOWN_KEY),
-    Rule("V-2", "audio.transcribe_variant", _IV),
     Rule("V-3", "audio.target_sample_rate", _IV),
     Rule("V-4", "device.poll_interval_seconds", _IV),
     Rule("V-7", "session.group_by", _IV),
@@ -137,7 +136,6 @@ IMPLEMENTED_RULES: Final[frozenset[str]] = frozenset(r.id for r in RULES)
 # 制約（Literal / ge / le）で検出される規則だけを持つ表。
 # validator が投げる規則はメッセージが自分で規則 ID を名乗るため、ここには入れない。
 _RULE_BY_LOCATION: Final[Mapping[tuple[str | int, ...], str]] = {
-    ("audio", "transcribe_variant"): "V-2",
     ("audio", "target_sample_rate"): "V-3",
     ("audio", "target_channels"): "V-3",
     ("audio", "target_codec"): "V-3",
@@ -169,7 +167,6 @@ class DeviceConfig(_Section):
 
 
 class AudioConfig(_Section):
-    transcribe_variant: Literal["denoised", "orig"]  # V-2
     ffmpeg: Path
     ffprobe: Path
     target_sample_rate: Literal[16000]  # V-3
@@ -385,8 +382,6 @@ class CleanupConfig(_Section):
 class RetryConfig(_Section):
     max_attempts: int
     backoff_seconds: tuple[int, ...]
-    auto_retry_failed_after_hours: int
-    auto_retry_max_rounds: int
 
     @model_validator(mode="after")
     def _check(self) -> RetryConfig:
