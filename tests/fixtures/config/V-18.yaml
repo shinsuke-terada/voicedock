@@ -1,0 +1,9 @@
+# SPEC §7.3 V-18 の違反。config.example.yaml へ patch を深くマージして使う。
+rule: V-18
+code: CONFIG_INVALID_VALUE
+key: llm.analysis.sections.summary.enabled
+patch:
+  llm:
+    analysis:
+      sections:
+        summary: {enabled: false, heading: "## Summary"}

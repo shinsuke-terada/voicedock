@@ -1,0 +1,7 @@
+# SPEC §7.3 V-16 の違反。config.example.yaml へ patch を深くマージして使う。
+rule: V-16
+code: CONFIG_INVALID_VALUE
+key: obsidian.max_title_bytes
+patch:
+  obsidian:
+    max_title_bytes: 0

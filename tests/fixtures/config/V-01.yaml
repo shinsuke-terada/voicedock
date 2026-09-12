@@ -1,0 +1,8 @@
+# SPEC §7.3 V-1 の違反。config.example.yaml へ patch を深くマージして使う。
+# 既存キーのタイポ。正しいキーは残るので V-1 だけが当たる
+rule: V-1
+code: CONFIG_UNKNOWN_KEY
+key: audio.tarrget_sample_rate
+patch:
+  audio:
+    tarrget_sample_rate: 16000
