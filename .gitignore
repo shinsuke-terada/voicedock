@@ -34,5 +34,8 @@ htmlcov/
 *.swp
 
 # ---- テスト生成物 ----
-tests/fixtures/fake_volumes/**/*.wav
+# fixture は tmp_path へ組み立てる方式なので本来ここには出ない（SPEC §20.2）。
+# 手で生成したときの歯止めとして残す。
+tests/fixtures/**/*.wav
+tests/fixtures/**/*.meta.json
 tests/output/
