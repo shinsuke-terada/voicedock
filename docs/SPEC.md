@@ -3268,7 +3268,7 @@ ID   DATE         PARTS  RECORDED  STATUS      TITLE
 ```makefile
 UV_IMAGE ?= ghcr.io/astral-sh/uv:0.12.13-python3.12-trixie-slim
 
-.PHONY: up down logs status doctor models test lock helper-install helper-status
+.PHONY: up down logs status doctor models test lint fmt lock helper-install helper-status
 
 up:      ; docker compose up -d --build
 down:    ; docker compose down
@@ -3286,6 +3286,16 @@ test:
 	docker build --target dev -t voicedock:dev .
 	docker run --rm -v "$(CURDIR)/tests:/app/tests:ro" voicedock:dev pytest -q
 
+# Lint と型検査も使い捨てコンテナで行う。ホストに ruff / mypy を入れない（§3.3）
+UV_RUN = docker run --rm -v "$(CURDIR)":/w -w /w \
+           -e UV_PROJECT_ENVIRONMENT=/tmp/.venv $(UV_IMAGE) sh -c
+
+lint:
+	$(UV_RUN) 'uv sync --frozen && uv run ruff check . && uv run ruff format --check . && uv run mypy'
+
+fmt:
+	$(UV_RUN) 'uv sync --frozen && uv run ruff check --fix . && uv run ruff format .'
+
 # lock の生成も使い捨てコンテナで行う。ホストに uv を入れない（§3.3, §18.5）
 lock:
 	docker run --rm -v "$(CURDIR)":/w -w /w $(UV_IMAGE) sh -c '\
@@ -3300,6 +3310,24 @@ lock:
 
 **`make lock` も同様に使い捨てコンテナで行う。**`uv.lock` と `requirements.lock` /
 `requirements-dev.lock` は生成後にコミットする（§18.5）。`UV_IMAGE` はタグを固定する（§18.1）。
+`UV_PROJECT_ENVIRONMENT=/tmp/.venv` を渡し、コンテナの root が作った `.venv` を
+リポジトリへ残さない。
+
+**`mypy --strict` は CI の必須チェックである。**§11.2 の `DevicePath` / `InboxPath` /
+`StagingPath` は `NewType` であり、**型検査器が回らない限り一切機能しない飾り**になる。
+v4.0 で `DevicePath` を `PurePosixPath` にして「コンテナがデバイスを開くコードは書けない」と
+規定した（N-10）が、その保証は mypy が成立させている。
+
+**CI（GitHub Actions）は ubuntu ランナー上で `uv` を使いネイティブに実行する。**
+§3.3 の「ホストへ Python を入れない」は**ユーザーの Mac** についての規定であり、CI ランナーには
+適用されない。**CI はプロジェクトイメージをビルドしない**（§18.3 の `Dockerfile` は whisper.cpp を
+ソースからビルドするため、PR ごとに回すには重すぎる）。§20.2 の統合テストが実 `ffmpeg` を
+要求するようになったら、CI では `apt-get install ffmpeg` で足す。
+
+**`ruff` の設定で `docs/` を除外する。**ruff は Markdown 内の Python コードブロックも整形対象に
+するため、除外しないと本書と保管済みの方針書の例示コードを機械的に書き換えてしまう。
+あわせて **RUF001 / RUF002 / RUF003（全角記号の「曖昧な文字」検出）を無効化する。**
+本書もコメントも日本語で書く方針であり、全角括弧は正しい表記である。
 
 スクリプトはすべて `set -euo pipefail` で始め、パスは `"$VAR"` で引用する（Vault パスに空白を含むため）。
 
