@@ -7,15 +7,8 @@ import signal
 import pytest
 
 from voicedock import __version__
-from voicedock.cli import (
-    EXIT_CONFIG,
-    EXIT_DOCTOR_FATAL,
-    EXIT_ERROR,
-    EXIT_OK,
-    EXIT_UNHEALTHY,
-    IMPLEMENTED,
-    SUBCOMMANDS,
-)
+from voicedock.cli import IMPLEMENTED, SUBCOMMANDS
+from voicedock.errors import EXIT_CONFIG, EXIT_ERROR, EXIT_OK
 from voicedock.main import main
 
 # SPEC §17.1 の 11 サブコマンド。ここを唯一の期待値とし、漏れたらテストが落ちる。
@@ -92,11 +85,6 @@ def test_unknown_subcommand_exits_2() -> None:
     with pytest.raises(SystemExit) as excinfo:
         main(["no-such-command"])
     assert excinfo.value.code == EXIT_CONFIG  # argparse の使い方エラーは 2
-
-
-def test_exit_codes_match_spec() -> None:
-    # SPEC §17.3
-    assert (EXIT_OK, EXIT_ERROR, EXIT_CONFIG, EXIT_UNHEALTHY, EXIT_DOCTOR_FATAL) == (0, 1, 2, 3, 4)
 
 
 def _minimal_argv(name: str) -> list[str]:

@@ -3284,7 +3284,10 @@ helper-status:  ; ./helper/install.sh --status
 # テストはコンテナ内で実行する。ホストに Python / pytest を入れない（§3.3）
 test:
 	docker build --target dev -t voicedock:dev .
-	docker run --rm -v "$(CURDIR)/tests:/app/tests:ro" voicedock:dev pytest -q
+	docker run --rm \
+	  -v "$(CURDIR)/tests:/app/tests:ro" \
+	  -v "$(CURDIR)/docs:/app/docs:ro" \
+	  voicedock:dev pytest -q
 
 # Lint と型検査も使い捨てコンテナで行う。ホストに ruff / mypy を入れない（§3.3）
 UV_RUN = docker run --rm -v "$(CURDIR)":/w -w /w \
@@ -3307,6 +3310,13 @@ lock:
 **`make test` がホストに Python を要求しないこと。**§3.3 は「ホストへ Python / pip / venv を入れない」と
 規定しており、`test: ; pytest` はこれと両立しない。テストは `Dockerfile` の `dev` ステージ（§18.3）で
 実行する。`tests/` を bind mount するのは、テストを 1 行直すたびにイメージを焼き直さないため。
+
+**`docs/` を読み取り専用でマウントするのは、SPEC と実装の整合をテストで固定するためである。**
+§15.1 のエラーコード表と `errors.py` の `ErrorCode`、§16.4 のイベント名一覧と `log.py` の
+`EVENTS`、§16.2 の出力例と `log.py` の整形、§17.3 の終了コード表と `errors.py` の定数は、
+**`docs/SPEC.md` を parse して突き合わせる**（`tests/spec_sync.py`）。SPEC に 1 行足して実装を
+忘れる、あるいは実装だけ増やして SPEC に書き忘れる、という事故が即座に落ちる。
+**SPEC が見つからない場合は skip せず fail する。**黙って通すと整合テストが無いのと同じになる。
 
 **`make lock` も同様に使い捨てコンテナで行う。**`uv.lock` と `requirements.lock` /
 `requirements-dev.lock` は生成後にコミットする（§18.5）。`UV_IMAGE` はタグを固定する（§18.1）。
