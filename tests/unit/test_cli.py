@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import signal
+
 import pytest
 
 from voicedock import __version__
@@ -56,6 +58,27 @@ def test_unimplemented_returns_error(name: str, capsys: pytest.CaptureFixture[st
     argv = _minimal_argv(name)
     assert main(argv) == EXIT_ERROR
     assert "未実装" in capsys.readouterr().err
+
+
+def test_service_waits_and_announces_stub(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """service はスタブである間、未実装を明示してから待機する。
+
+    TODO(#19): worker_loop() が実装されたら、このテストは書き換わる。
+    即座に終了すると compose の restart: unless-stopped でクラッシュループになるため、
+    「待機すること」自体が現時点の仕様である。
+    """
+    paused = False
+
+    def _fake_pause() -> None:
+        nonlocal paused
+        paused = True
+
+    monkeypatch.setattr(signal, "pause", _fake_pause)
+    assert main(["service"]) == EXIT_OK
+    assert paused, "service は待機しなければならない（即座に終了するとクラッシュループになる）"
+    assert "未実装" in capsys.readouterr().out
 
 
 def test_no_subcommand_prints_help_and_returns_error(
