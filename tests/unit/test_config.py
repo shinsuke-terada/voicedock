@@ -9,7 +9,6 @@ from __future__ import annotations
 import ast
 import json
 import os
-from collections.abc import Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -19,6 +18,15 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from tests.helpers import (
+    EXAMPLE_PATH,
+    REPO_ROOT,
+    complete_tree,
+    example_document,
+    merge,
+    parsed,
+    write_heartbeat,
+)
 from tests.spec_sync import spec_config_example, spec_validation_rules
 from voicedock import config as config_module
 from voicedock.config import (
@@ -40,8 +48,6 @@ from voicedock.config import (
 )
 from voicedock.errors import ErrorCode
 
-REPO_ROOT = Path(__file__).parents[2]
-EXAMPLE_PATH = REPO_ROOT / "config" / "config.example.yaml"
 FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "config"
 
 # 専用のテスト関数で扱う規則（fixture を置かないもの）
@@ -54,24 +60,6 @@ NOW = datetime(2026, 8, 30, 7, 0, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
 # --- ヘルパ --------------------------------------------------------------
 
 
-def example_document() -> dict[str, Any]:
-    document = yaml.safe_load(EXAMPLE_PATH.read_text(encoding="utf-8"))
-    assert isinstance(document, dict)
-    return document
-
-
-def merge(base: Mapping[str, Any], patch: Mapping[str, Any]) -> dict[str, Any]:
-    """`patch` を `base` へ再帰的に深くマージする（辞書は再帰、それ以外は置換）。"""
-    merged = dict(base)
-    for key, value in patch.items():
-        current = merged.get(key)
-        if isinstance(current, Mapping) and isinstance(value, Mapping):
-            merged[key] = merge(current, value)
-        else:
-            merged[key] = value
-    return merged
-
-
 def fixtures() -> list[dict[str, Any]]:
     loaded = []
     for path in sorted(FIXTURE_DIR.glob("*.yaml")):
@@ -81,51 +69,6 @@ def fixtures() -> list[dict[str, Any]]:
         loaded.append(data)
     assert loaded, f"fixture が見つかりません: {FIXTURE_DIR}"
     return loaded
-
-
-def complete_tree(tmp_path: Path) -> dict[str, Any]:
-    """ファイル実在検査（V-20 / V-23 / V-24 / V-25）を通る設定を作る。
-
-    プロンプトは #25、モデルは #13 の成果物であり実環境にはまだ無い。
-    **検査そのものは今のうちに固定しておく。**
-    """
-    for name in ("analyze", "map", "reduce", "repair"):
-        (tmp_path / f"{name}.txt").write_text("x", encoding="utf-8")
-    (tmp_path / "whisper.bin").write_bytes(b"\0" * 16)
-    (tmp_path / "vad.bin").write_bytes(b"\0" * 16)
-    executable = tmp_path / "whisper-cli"
-    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    executable.chmod(0o755)
-    return merge(
-        example_document(),
-        {
-            "llm": {
-                "prompts": {
-                    "analyze": str(tmp_path / "analyze.txt"),
-                    "map": str(tmp_path / "map.txt"),
-                    "reduce": str(tmp_path / "reduce.txt"),
-                    "repair": str(tmp_path / "repair.txt"),
-                }
-            },
-            "transcription": {
-                "executable": str(executable),
-                "model": str(tmp_path / "whisper.bin"),
-                "vad": {"model": str(tmp_path / "vad.bin")},
-            },
-        },
-    )
-
-
-def parsed(document: Mapping[str, Any]) -> Config:
-    cfg, violations = parse_config(document)
-    assert violations == [], violations
-    assert cfg is not None
-    return cfg
-
-
-def write_heartbeat(state_root: Path, **fields: Any) -> None:
-    state_root.mkdir(parents=True, exist_ok=True)
-    (state_root / "heartbeat.json").write_text(json.dumps(fields), encoding="utf-8")
 
 
 # --- SPEC 整合 -----------------------------------------------------------
