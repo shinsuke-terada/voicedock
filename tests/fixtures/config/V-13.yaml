@@ -1,0 +1,8 @@
+# SPEC §7.3 V-13 の違反。config.example.yaml へ patch を深くマージして使う。
+rule: V-13
+code: CONFIG_INVALID_VALUE
+key: obsidian.raw.folder_template
+patch:
+  obsidian:
+    raw:
+      folder_template: "Daily/Voice/Raw/{unknown}"

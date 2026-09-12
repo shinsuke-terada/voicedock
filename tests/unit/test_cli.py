@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import pathlib
 import signal
 
 import pytest
+import yaml
 
+from tests.unit.test_config import complete_tree
 from voicedock import __version__
 from voicedock.cli import IMPLEMENTED, SUBCOMMANDS
 from voicedock.errors import EXIT_CONFIG, EXIT_ERROR, EXIT_OK
@@ -54,9 +57,11 @@ def test_unimplemented_returns_error(name: str, capsys: pytest.CaptureFixture[st
 
 
 def test_service_waits_and_announces_stub(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """service はスタブである間、未実装を明示してから待機する。
+    """service は設定を検証したあと、未実装を明示してから待機する。
 
     TODO(#19): worker_loop() が実装されたら、このテストは書き換わる。
     即座に終了すると compose の restart: unless-stopped でクラッシュループになるため、
@@ -68,10 +73,51 @@ def test_service_waits_and_announces_stub(
         nonlocal paused
         paused = True
 
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump(complete_tree(tmp_path)), encoding="utf-8")
+    monkeypatch.setenv("VOICEDOCK_CONFIG", str(config))
     monkeypatch.setattr(signal, "pause", _fake_pause)
+
     assert main(["service"]) == EXIT_OK
     assert paused, "service は待機しなければならない（即座に終了するとクラッシュループになる）"
-    assert "未実装" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "service_started" in out, "設定を読めたら service_started を出す（§16.2）"
+    assert "未実装" in out
+
+
+def test_service_returns_config_exit_code_on_violation(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """設定違反では終了コード 2 を返し、stderr へ規則 ID とキー名を出す（§17.3）。"""
+    document = complete_tree(tmp_path)
+    document["audio"]["target_sample_rate"] = 44100
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump(document), encoding="utf-8")
+    monkeypatch.setenv("VOICEDOCK_CONFIG", str(config))
+
+    assert main(["service"]) == EXIT_CONFIG
+    err = capsys.readouterr().err
+    assert "V-3  CONFIG_INVALID_VALUE  audio.target_sample_rate" in err
+
+
+def test_service_returns_config_exit_code_when_the_file_is_missing(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("VOICEDOCK_CONFIG", str(tmp_path / "nope.yaml"))
+    assert main(["service"]) == EXIT_CONFIG
+    assert "設定ファイルがありません" in capsys.readouterr().err
+
+
+def test_doctor_runs(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump(complete_tree(tmp_path)), encoding="utf-8")
+    monkeypatch.setenv("VOICEDOCK_CONFIG", str(config))
+    # state_root は既定（/state）のまま。delete_source_audio が false のあいだ
+    # V-30 は heartbeat を読まないので、結果に影響しない（§7.3）
+    assert main(["doctor"]) == EXIT_OK
+    assert "VoiceDock doctor" in capsys.readouterr().out
 
 
 def test_no_subcommand_prints_help_and_returns_error(

@@ -1,0 +1,182 @@
+# このファイルは docs/SPEC.md §7.2 の完全な写しである。
+# cp config/config.example.yaml config/config.yaml して編集する（config.yaml は Git 管理外）。
+# ============================================================
+# VoiceDock 設定
+# ============================================================
+
+timezone: Asia/Tokyo
+
+# --- デバイス検出 -------------------------------------------
+# 検出・走査・安定性判定は Helper が行う（§4.2, §10.1）。
+# 関連する設定はすべて <VOICEDOCK_HOME>/helper.conf にある（§7.4）。
+device:
+  root: /inbox                   # コンテナが監視するルート（Helper が原本を置く場所。§4.1）
+  # コンテナのワーカーループが /inbox を走査する間隔（§10.0）。
+  # v3.x では「デバイスの増減を見る間隔」だったが、v4.0 で検出が Helper へ移ったため
+  # 「ローカルディレクトリを 1 階層 scandir する間隔」の意味に狭まった。
+  poll_interval_seconds: 5
+
+# --- 音声 ---------------------------------------------------
+audio:
+  # 読み込む Variant。denoised | orig（もう一方は一度も読まない）
+  transcribe_variant: denoised
+  ffmpeg: /usr/bin/ffmpeg
+  ffprobe: /usr/bin/ffprobe
+  # whisper.cpp の入力要件。変更不可（§10.5）
+  target_sample_rate: 16000
+  target_channels: 1
+  target_codec: pcm_s16le
+  ffprobe_timeout_seconds: 30
+  ffmpeg_timeout_factor: 0.5     # duration × この値
+  ffmpeg_min_timeout_seconds: 180
+  duration_tolerance_seconds: 1.0  # 変換結果の長さの許容誤差（§10.5）
+
+# --- 取り込み -----------------------------------------------
+import:
+  inbox_root: /inbox                       # Helper が原本を置く場所（§4.1）
+  staging_root: /data/staging
+  # 空き容量の必要量: 変換後の見込みサイズ × multiplier + margin（§10.5）
+  free_space_multiplier: 2.0
+  free_space_margin_bytes: 2147483648      # 2 GiB
+  # staging 全体の上限。原本を置かないため異常時の歯止めとしてのみ機能する
+  staging_max_bytes: 5368709120            # 5 GiB
+  hash_chunk_bytes: 1048576                # 1 MiB
+  # inbox の原本をいつ消すか（§10.5）。normalized | raw_saved
+  #   normalized: 16 kHz 変換の検証後に即削除（既定。inbox の常駐使用量を数 GB に抑える）
+  #   raw_saved : Raw ノートの保存検証まで保持（変換やり直しに強いが 1 日 8〜22 GB 滞留する）
+  inbox_retain: normalized
+  # Helper のハートビートがこの秒数より古ければ HELPER_UNAVAILABLE（§19.1 H-8）
+  helper_heartbeat_max_age_seconds: 300
+
+# --- セッション分組（§10.4） ---------------------------------
+session:
+  group_by: day                  # MVP は day のみ（同一デバイス・同一日付）
+  # Timeline の見出しを区切る無録音区間（分組には使わない）
+  block_gap_seconds: 3600
+  # 当日の OPEN セッションを READY にするまでの無追加時間
+  idle_close_seconds: 1800
+  # SAVED 後に同じ日の Part が現れたら再生成する
+  allow_reopen: true
+  # 暴走防止の上限（日境界で切れるため通常は到達しない）
+  max_parts: 64
+  max_duration_seconds: 86400
+
+# --- 文字起こし ---------------------------------------------
+transcription:
+  engine: whisper_cpp
+  executable: /usr/local/bin/whisper-cli
+  model: /models/whisper/ggml-large-v3-turbo-q5_0.bin
+  language: ja
+  threads: 6                     # 0 で自動（nproc と 8 の小さい方）
+  # タイムアウト = clamp(duration × factor, min, max)
+  timeout_factor: 3.0
+  min_timeout_seconds: 600
+  max_timeout_seconds: 21600
+  # 文字起こし結果がこの文字数未満なら NO_SPEECH_DETECTED とする
+  min_chars: 1
+  # 無音区間の自動スキップ（§10.6）
+  vad:
+    enabled: true
+    model: /models/whisper/ggml-silero-v5.1.2.bin
+    threshold: 0.5
+    min_speech_duration_ms: 250
+    min_silence_duration_ms: 1000
+    speech_pad_ms: 200
+
+# --- LLM ----------------------------------------------------
+llm:
+  # URL とモデル名は Compose の models 機能が環境変数で注入する（§18.2）
+  endpoint_env: VOICEDOCK_LLM_URL
+  model_env: VOICEDOCK_LLM_MODEL
+  temperature: 0.1
+  top_p: 0.9
+  max_output_tokens: 4096
+  request_timeout_seconds: 1800
+  # Map-Reduce しきい値（§12.4）
+  max_chars_per_request: 20000
+  max_seconds_per_request: 3600  # 1 チャンクが覆う実時間の上限
+  chunk_overlap_chars: 500
+  # JSON 検証失敗時の修復試行回数
+  repair_attempts: 1
+  prompts:
+    analyze: /app/prompts/analyze_ja.txt
+    map: /app/prompts/map_ja.txt
+    reduce: /app/prompts/reduce_ja.txt
+    repair: /app/prompts/repair_json.txt
+  # 抽出する項目。プロンプトと出力スキーマはここから自動生成する（§12.2）
+  analysis:
+    sections:
+      summary:    {enabled: true, heading: "## Summary"}
+      timeline:   {enabled: true, heading: "## Timeline"}
+      key_points: {enabled: true, heading: "## Key Points", max_items: 20}
+      tasks:      {enabled: true, heading: "## Tasks",      max_items: 50}
+      decisions:  {enabled: true, heading: "## Decisions",  max_items: 30}
+      ideas:      {enabled: true, heading: "## Ideas",      max_items: 30}
+      tags:       {enabled: true, max_items: 15}
+    order: [summary, timeline, key_points, tasks, decisions, ideas]
+    # プロンプト末尾へ追記する自由記述（例: 特定の話題を要約しない指示）
+    custom_instructions: ""
+
+# --- Obsidian -----------------------------------------------
+obsidian:
+  root: /obsidian
+  max_title_bytes: 180           # UTF-8 バイト数（§13.5）
+  default_tags:
+    - voice
+    - voicedock
+  # 文字起こし生データ
+  raw:
+    folder_template: "Daily/Voice/Raw/{yyyymmdd}"
+    granularity: day             # day | part
+    filename_template: "{date} raw"
+    timestamp_interval_seconds: 300   # 0 で見出しを入れない
+    part_boundary_heading: true
+  # 整理済みノート
+  wiki:
+    folder_template: "Daily/Voice/Wiki/{yyyymmdd}"
+    filename_template: "{date} Voice"   # {title} を入れてはならない（§13.5）
+    include_transcript: false    # true にすると全文も埋め込む
+    timeline: true
+    link_raw: true
+    link_daily_note: true
+    link_adjacent_days: true
+    link_tags: true              # false なら Vault インデックスを作らない
+    link_only_existing: true     # Vault に実在するノートだけ [[]] 化
+    vault_index_cache_seconds: 300
+    max_links: 20
+
+# --- 削除（§14） --------------------------------------------
+cleanup:
+  # 【安全ロック 1】DJI 側の元音声を削除するか。既定 false
+  delete_source_audio: false
+  # 【安全ロック 2-A / 2-B は helper.conf 側にある（§7.4, §14.2）】
+  # 文字起こし後に 16 kHz 音声を削除するか（容量節約）
+  delete_normalized_after_transcribe: true
+  # Part transcript JSON の保持日数。再生成に必要なため 0（無期限）固定
+  retain_transcript_days: 0
+  # 削除条件が偽だったときの再評価間隔（§9.3）
+  delete_evaluation_backoff_seconds: [60, 300, 900, 3600]
+  # 削除キューの配置（§14.3）
+  queue_root: /queue
+  # reaper の結果がこの秒数以内に来なければ SOURCE_DELETE_PENDING へ落とす（§10.12）
+  delete_result_timeout_seconds: 3600
+
+# --- リトライ（§15.2） ---------------------------------------
+retry:
+  max_attempts: 3
+  backoff_seconds: [3, 10, 30]
+  # FAILED を自動で再投入するまでの時間。0 で無効（手動 retry のみ）
+  auto_retry_failed_after_hours: 24
+  auto_retry_max_rounds: 3
+
+# --- ログ（§16） --------------------------------------------
+logging:
+  level: INFO                    # DEBUG | INFO | WARNING | ERROR
+  format: text                   # text | json
+  # true にすると transcript 本文を DEBUG ログへ出す。本番では必ず false
+  unsafe_log_content: false
+
+# --- データベース -------------------------------------------
+database:
+  path: /data/voicedock.db
+  busy_timeout_ms: 10000

@@ -1,0 +1,7 @@
+# SPEC §7.3 V-31 の違反。config.example.yaml へ patch を深くマージして使う。
+rule: V-31
+code: CONFIG_INVALID_VALUE
+key: import.helper_heartbeat_max_age_seconds
+patch:
+  import:
+    helper_heartbeat_max_age_seconds: 30

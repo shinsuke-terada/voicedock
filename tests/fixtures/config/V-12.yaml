@@ -1,0 +1,9 @@
+# SPEC §7.3 V-12 の違反。config.example.yaml へ patch を深くマージして使う。
+# wiki と同一。相対でプレースホルダも既知なので V-11 / V-13 は当たらない
+rule: V-12
+code: CONFIG_INVALID_VALUE
+key: obsidian.wiki.folder_template
+patch:
+  obsidian:
+    raw:
+      folder_template: "Daily/Voice/Wiki/{yyyymmdd}"

@@ -14,6 +14,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 SPEC_PATH = Path(__file__).parents[1] / "docs" / "SPEC.md"
 
@@ -28,11 +29,17 @@ def spec_text() -> str:
     return SPEC_PATH.read_text(encoding="utf-8")
 
 
+# 次の見出し。`#` の後を「数字」か「付録」に限る。
+# `^#+ ` だけで切ると、§7.2 の yaml ブロック中の `# ==========` をコメントではなく
+# 見出しと見なしてしまい、節が途中で切れる。
+_NEXT_HEADING = r"(?=^#{1,6} (?:\d|付録)|\Z)"
+
+
 def _section(heading: str) -> str:
     """`### <heading>` から次の見出しまでの本文を返す。"""
     text = spec_text()
     m = re.search(
-        rf"^#+ {re.escape(heading)}[^\n]*\n(.*?)(?=^#+ |\Z)",
+        rf"^#+ {re.escape(heading)}[^\n]*\n(.*?)" + _NEXT_HEADING,
         text,
         re.S | re.M,
     )
@@ -112,3 +119,27 @@ def spec_log_json_example() -> str:
     if m is None:
         pytest.fail("SPEC §16.2 の json 例を読み取れませんでした")
     return m.group(1).strip()
+
+
+def spec_config_example() -> dict[str, object]:
+    """§7.2 の yaml ブロックを safe_load して返す（`config.example.yaml` の正）。"""
+    m = re.search(r"```yaml\n(.*?)\n```", _section("7.2"), re.S)
+    if m is None:
+        pytest.fail("SPEC §7.2 の yaml ブロックを読み取れませんでした")
+    document = yaml.safe_load(m.group(1))
+    if not isinstance(document, dict):
+        pytest.fail("SPEC §7.2 の yaml ブロックがマッピングになっていません")
+    return document
+
+
+def spec_validation_rules() -> dict[str, str]:
+    """§7.3 の表から「規則 ID → 規則本文」を出現順に返す。
+
+    **打ち消し（`~~`）の行は除く。**v4.1 で V-5 / V-6、v4.2 で V-28 を廃止しており、
+    廃止された規則を実装することはない（番号は詰めない）。
+    """
+    rows = re.findall(r"^\| (V-\d+) \| ([^|]*?) \| ([^|]*?) \|", _section("7.3"), re.M)
+    rules = {rule: body.strip() for rule, body, _error in rows if not body.strip().startswith("~~")}
+    if not rules:
+        pytest.fail("SPEC §7.3 の表を読み取れませんでした")
+    return rules

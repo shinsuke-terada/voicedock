@@ -1,0 +1,7 @@
+# SPEC §7.3 V-29 の違反。config.example.yaml へ patch を深くマージして使う。
+rule: V-29
+code: CONFIG_INVALID_VALUE
+key: import.inbox_retain
+patch:
+  import:
+    inbox_retain: both
