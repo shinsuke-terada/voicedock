@@ -39,7 +39,13 @@ target-version = "py312"
 src = ["src", "tests"]
 # ruff は Markdown 内の Python コードブロックも整形対象にする。
 # docs/ は SPEC と保管済みの方針書であり、例示コードを機械的に書き換えてはならない。
-extend-exclude = ["docs"]
+#
+# poc/ は Phase 0 の計測用スクリプトで、**イメージへ COPY されない**（§18.3 は src/ だけを入れる）。
+# 除外するのは怠慢ではなく、**計測の意図と lint 規則が衝突するため**である。
+# poc/store_bench.py は `open()` と `os.scandir()` を測っているので、PTH123 / PTH208 の
+# 指示どおり `Path.open()` / `Path.iterdir()` に直すと**測る対象が変わる**。
+# src/ と tests/ は strict のままである。
+extend-exclude = ["docs", "poc"]
 
 [tool.ruff.lint]
 # S（bandit）は SPEC §14.4 の N-5（shell=True 禁止）/ N-6（コマンド文字列の連結禁止）を
