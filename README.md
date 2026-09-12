@@ -14,7 +14,7 @@ DJI Mic 3 で録音 → 帰宅 → Mac へ USB 接続 → （以降すべて自�
 
 ## ドキュメント
 
-実装時の規範は **[docs/SPEC.md](docs/SPEC.md)（詳細仕様書 v4.6）** に集約されている。
+実装時の規範は **[docs/SPEC.md](docs/SPEC.md)（詳細仕様書 v5.0）** に集約されている。
 
 前身の方針書は [docs/archive/](docs/archive/) に保存してある。両者が矛盾する場合は `docs/SPEC.md` を優先する。
 

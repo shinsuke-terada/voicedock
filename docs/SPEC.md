@@ -1,11 +1,11 @@
-# VoiceDock 詳細仕様書 v4.6
+# VoiceDock 詳細仕様書 v5.0
 
 **DJI Mic 3 × ローカル文字起こし × ローカルLLM × Obsidian**
 
 | 項目 | 内容 |
 |---|---|
-| 文書版 | **v4.6（状態機械の内部整合）** |
-| 前身文書 | v4.5 / v4.4 / v4.3 / v4.2 / v4.1 / v4.0 / v3.4 / v3.3 / v3.2 / v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
+| 文書版 | **v5.0（不要な処理の整理）** |
+| 前身文書 | v4.6 / v4.5 / v4.4 / v4.3 / v4.2 / v4.1 / v4.0 / v3.4 / v3.3 / v3.2 / v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
 | 作成日 | 2026-09-11 |
 | 改訂日 | 2026-09-12 |
 | 実測記録 | `docs/POC.md`（Phase 0 の実測値と判断。本書と食い違う場合は POC.md を正とする） |
@@ -67,7 +67,7 @@ DJI Mic 3 で録音 → 帰宅 → Mac へ USB 接続 → （以降すべて自�
 | # | 起きること | 実行主体 | 目安 |
 |---|---|---|---|
 | 1 | USB 接続を検出する（launchd の `StartOnMount` + 定期実行） | **Helper**（ホスト） | 〜5 秒 |
-| 2 | 未処理の録音を特定する（既処理はファイル名で即スキップ） | **Helper** | 即時 |
+| 2 | 未処理の `_orig` 録音を特定する（既処理はファイル名で即スキップ。denoised は対象外。§5.3） | **Helper** | 即時 |
 | 3 | 書き込み中でないことを確認する（安定性判定） | **Helper** | 通常 0 秒 |
 | 4 | 未取り込みの録音を inbox へコピーする | **Helper** | 1 日分で 2〜3 分 |
 | 5 | 同じ日の録音を 1 セッションにまとめる | コンテナ | 即時 |
@@ -78,7 +78,8 @@ DJI Mic 3 で録音 → 帰宅 → Mac へ USB 接続 → （以降すべて自�
 | 9 | その日の Daily ノート（整理済み 1 枚）を Vault へ書く | コンテナ | 即時 |
 | 10 | 保存内容を機械的に検証する | コンテナ | 即時 |
 | 11 | 検証に成功した録音の削除を要求する（既定は無効） | コンテナ | — |
-| 12 | 要求を独立に再検証して DJI 本体から削除する（既定は無効） | **Helper**（reaper） | — |
+| 12 | 要求を独立に再検証して DJI 本体から `_orig` を削除する（既定は無効） | **Helper**（reaper） | — |
+| 13 | 失敗した録音を、次の USB 接続で再投入する（§9.4 の再開規則に従い、完了済みの工程は飛ばす。§15.2） | コンテナ | — |
 
 **ユーザーの操作は「録音・USB 接続・Obsidian を見る」の 3 つだけである。**Helper はホスト上で
 launchd により常駐し、ユーザーが意識することはない（§4.1）。
@@ -156,7 +157,7 @@ Vault/Daily/Voice/Wiki/20260829/2026-08-29 Voice.md   ← 要約・タスク・T
 |---|---|
 | **Device（デバイス）** | macOS にマウントされた DJI Mic 3 のストレージ 1 個。ホストの `/Volumes/<volume名>` に対応する。**コンテナからは到達できない**（§5.6） |
 | **Part（パート）** | DJI Mic 3 が 30 分ごとに分割生成した録音 1 本の論理単位。`recordings` テーブルの 1 行に対応する |
-| **Variant（バリアント）** | 同一パートのファイル実体。`orig`（原音）と `denoised`（ノイズ除去済み）の最大 2 個。1 パートは 1 個以上のバリアントを持つ |
+| **Variant（バリアント）** | 同一パートのファイル実体。`orig`（原音）と `denoised`（ノイズ除去済み）。**v5.0 は `orig` だけを取り込み、denoised は登録も削除もしない**（§5.3）。したがって 1 パート = 1 ファイルである |
 | **Session（セッション）** | **同一デバイス・同一日付（`config.timezone`）の Part の集合。**Obsidian の Daily ノート 1 枚に 1 対 1 対応する。`sessions` テーブルの 1 行 |
 | **Block（ブロック）** | セッション内で、`session.block_gap_seconds` を超える無録音区間で区切られた連続録音の塊。Timeline の見出し単位。DB には持たず、レンダリング時に算出する |
 | **Transmitter（送信機）** | DJI Mic 3 の送信機。ファイル名の `TX01` などに対応。**ペアリングし直すと番号が変わるため恒久 ID として使用しない** |
@@ -194,7 +195,7 @@ Vault/Daily/Voice/Wiki/20260829/2026-08-29 Voice.md   ← 要約・タスク・T
 - **Compose がメジャー 5 系である。**要件「2.38 以上」は満たすが、§18.2 の `models` 長構文が
   5 系で実際に環境変数を注入するかは未検証であり、**#13（T-13）で確認する**（§22 R-21）。
 - Model Runner の有効化と AutoStart は **ホスト側の一度きりの作業**として §3.4 に残る。
-  `doctor.sh` の DH-2 / DH-4 が実施状況を検査する。
+  DH-10（`docker compose config`）と D-12（LLM への実疎通）が結果として実施状況を検査する。
 
 ### 3.2 仮想化バックエンドの制約（必須）
 
@@ -331,7 +332,8 @@ docker version --format '{{.Server.Version}}'   # => 29.7.2
 docker compose version --short                  # => 5.5.1
 ```
 
-**Compose は 5 系である。**DH-3（§19.2）の「2.38 以上」の判定は、`5.5.1` を `2.38` より新しいと
+**Compose は 5 系である。**バージョン判定は v5.0 で DH-3 ごと廃止し、DH-10（`docker compose config` の成否）へ委ねた。
+仮に数値比較を書くなら、`5.5.1` を `2.38` より新しいと
 正しく扱えること。文字列の辞書順比較は将来のメジャー 10 系で誤判定するため使わない。
 
 ---
@@ -467,7 +469,7 @@ macOS の Docker Desktop は Linux VM 上でコンテナを動かすため、**�
 [Queue]   <VOICEDOCK_HOME>/queue/delete/<request_id>.json   ← relpath のみ。絶対パスを持たない
              │ ★reaper: コンテナの判断を信用せず 11 項目を独立検証（§14.1.1）
              ▼
-[Device]  Part 全 Variant を削除 → 不在を確認
+[Device]  Part の `_orig` を削除 → 不在を確認
              │ 結果を書く
              ▼
 [Queue]   <VOICEDOCK_HOME>/queue/result/<request_id>.json
@@ -550,29 +552,37 @@ RECORDING_FOLDER_RE = re.compile(
 | `transmitter_id` | `str` | `TX01` など。**弱い識別子**。恒久 ID として使わない |
 | `mic_index` | `int` | `MIC002` → `2` |
 | `started_at` | `datetime` | 録音開始時刻。タイムゾーンは `config.timezone`（既定 `Asia/Tokyo`）を付与 |
-| `variant` | `Literal["orig", "denoised"]` | `_orig` の有無 |
+| `variant` | `Literal["orig", "denoised"]` | `_orig` の有無。**`denoised` は取り込まない**（§5.3） |
 
 パースに失敗したファイルは **無視する**（`WARN unparsable_filename` をログ出力し、DB へ登録しない）。DJI 以外のファイルを誤って処理しないための防御である。**このパターンは削除時の同定にも使う**（§14.1）。
 
-### 5.3 Part キーと Variant のペアリング
-
-同一 Part の 2 バリアントは、`_orig` を除いたファイル名が一致することで対応づける。
+### 5.3 Part キーと取り込む Variant
 
 ```python
 part_key = (transmitter_id, mic_index, started_at)
 ```
 
-| 状態 | 扱い |
+**取り込むのは `_orig` だけである。1 Part = 1 ファイルとする。**
+
+| ファイル | 扱い |
 |---|---|
-| `denoised` と `orig` の両方が存在 | 1 Part・2 Variant。**文字起こしには `denoised` を使う**（§7.2 `audio.transcribe_variant`） |
-| `denoised` のみ | 1 Part・1 Variant。`denoised` を使う |
-| `orig` のみ | 1 Part・1 Variant。`orig` を使う |
+| `_orig` あり | Part として登録する。これが唯一の経路 |
+| `_orig` なし（denoised） | **登録しない。**`part_skipped` を `reason=variant_not_orig` で 1 行出して次へ進む。DB へは書かない |
 
-> **実機での観測**: 本書の検証機では、録音 2 本とも **`_orig` のみが生成され、denoised は作られなかった**
-> （`docs/POC.md` §6.2）。したがって「`orig` のみ」の分岐が実運用の既定経路になる。
-> 両方が生成される設定も存在しうるため、**上表の分岐設計は変更しない**（P0-13 / #3 で確認する）。
+> **なぜ `_orig` 固定にしたのか**: 本書の検証機では、録音 2 本とも **`_orig` のみが生成され、
+> denoised は作られなかった**（`docs/POC.md` §6.2）。v4.6 までは「両方あり / denoised のみ /
+> orig のみ」の 3 分岐と、そのための列 5 つ（§8.2）を持っていたが、**denoised の経路は
+> 一度も実物で動かしていない。未検証の分岐を削除処理の手前に置くほうが危険である。**
+> 実機で denoised が生成される設定が見つかったら、`ALTER TABLE ADD COLUMN` で列を足して
+> 分岐を戻せる（§8.5）。P0-13 / #3 で `_orig` 保存をオフにできるかを確認する。
 
-**読み込むのは `primary_variant` だけである。**もう一方の Variant は一度も読まない（§10.5）。ただし **削除は Part 単位で全 Variant をまとめて行う**（§10.12）。
+**削除するのも `_orig` の 1 ファイルだけである**（§10.12 / §14.1）。denoised がデバイスに残っていても
+VoiceDock は触らない。**これは意図した非対称である。**削除の根拠は「その音声の文字起こしが Vault に
+残っていること」であり（§14.1）、**読まなかったファイルを消してよい根拠はどこにも無い。**
+
+> **代償**: denoised が生成される設定では、denoised がデバイスに溜まり続けて本体が満杯になる。
+> その設定が実機で見つかった場合は、①`_orig` 保存をオフにする、②列を戻して 2 Variant を扱う、
+> のいずれかを選ぶ。**「読まずに消す」は選ばない。**
 
 ### 5.4 デバイス判定
 
@@ -630,7 +640,7 @@ fi
 > `doctor` の D-18 は Helper が報告した `inventory.json` とコンテナ側の期待を突き合わせ、
 > 食い違いを検出する（§19.2）。
 
-> `.*` を正規表現として解釈すると全 Volume 名に一致し、DJI が 1 台も検出されないまま無言で停止する。この症状は P0-6（ホットプラグ伝播の失敗）と区別がつかない。**`INCLUDE_VOLUMES` を設定した場合も同じ症状になりうる**（綴りを間違えると 1 台も通らない）。そのため `doctor` は **`INCLUDE` で対象外にした名前と `EXCLUDE` で除外した名前を、理由ごとに分けて必ず列挙する**（§19.2 D-5）。
+> `.*` を正規表現として解釈すると全 Volume 名に一致し、DJI が 1 台も検出されないまま無言で停止する。この症状は P0-6（ホットプラグ伝播の失敗）と区別がつかない。**`INCLUDE_VOLUMES` を設定した場合も同じ症状になりうる**（綴りを間違えると 1 台も通らない）。そのため `doctor` は **`INCLUDE_VOLUMES` / `EXCLUDE_VOLUMES` の実効値を必ず表示する**（§19.2 DH-13）。**除外の「理由別列挙」は v5.0 で D-5 ごと廃止した**（Helper だけが持つ情報をコンテナ側へ運ぶ経路になっていた）。
 
 デバイス識別子 `device_id` は Volume 名とする。Volume 名は変わりうるため、**二重処理防止にも削除対象の同定にも単独では使わない**（§14.1）。
 
@@ -795,7 +805,7 @@ voicedock/
 │       │                           #   ・atomic write・保存検証（§13）
 │       ├── session.py              # セッション分組（日単位）・統合・Block 算出（§10.4, §10.8）
 │       ├── states.py               # 状態定義・遷移表（§9）
-│       ├── pipeline.py             # ensure_* の直列実行・backoff / 自動再試行（§10, §15.2）
+│       ├── pipeline.py             # ensure_* の直列実行・backoff / FAILED の再評価（§10, §15.2）
 │       ├── cleaner.py              # §14.1 の評価と削除要求の書き込み（§10.12, §14）
 │       │                           #   削除そのものは行わない。reaper が実行する（N-16）
 │       ├── cli.py                  # status / history / show / retry / pending
@@ -910,8 +920,7 @@ device:
 
 # --- 音声 ---------------------------------------------------
 audio:
-  # 読み込む Variant。denoised | orig（もう一方は一度も読まない）
-  transcribe_variant: denoised
+  # 読み込むのは _orig のみ。denoised は取り込まない（§5.3）
   ffmpeg: /usr/bin/ffmpeg
   ffprobe: /usr/bin/ffprobe
   # whisper.cpp の入力要件。変更不可（§10.5）
@@ -1055,11 +1064,10 @@ cleanup:
 
 # --- リトライ（§15.2） ---------------------------------------
 retry:
-  max_attempts: 3
+  max_attempts: 3                # 1 工程あたりの試行回数（§15.2）
   backoff_seconds: [3, 10, 30]
-  # FAILED を自動で再投入するまでの時間。0 で無効（手動 retry のみ）
-  auto_retry_failed_after_hours: 24
-  auto_retry_max_rounds: 3
+  # FAILED はデバイス再接続とサービス起動で無条件に再評価する。
+  # タイマーもラウンド上限も持たない（§15.2）
 
 # --- ログ（§16） --------------------------------------------
 logging:
@@ -1081,7 +1089,7 @@ database:
 | # | 規則 | 違反時のエラー |
 |---|---|---|
 | V-1 | 未知のキーが存在しない（タイポ検出のため strict に扱う） | `CONFIG_UNKNOWN_KEY` |
-| V-2 | `audio.transcribe_variant` が `denoised` / `orig` のいずれか | `CONFIG_INVALID_VALUE` |
+| V-2 | ~~`audio.transcribe_variant` が `denoised` / `orig` のいずれか~~ **v5.0 で廃止**（`_orig` 固定にしたためキーごと無くなった。§5.3） | — |
 | V-3 | `audio.target_sample_rate == 16000` かつ `target_channels == 1` かつ `target_codec == pcm_s16le` | `CONFIG_INVALID_VALUE`（whisper.cpp の入力要件、変更不可） |
 | V-4 | `device.poll_interval_seconds >= 1`（§10.0 のワーカーループが `/inbox` を走査する間隔） | `CONFIG_INVALID_VALUE` |
 | V-5 | ~~`device.stability_checks >= 1`~~ **v4.1 で廃止**（安定性判定は Helper が行う。§7.4 の起動時検証と DH-13 が担う） | — |
@@ -1254,7 +1262,7 @@ declare -p INCLUDE_VOLUMES 2>/dev/null | grep -q '^declare -a'
 **壊れた JSON・欠落したキーは「不明」として扱い、例外にしてはならない。**Helper の書き込み途中を
 読む可能性があるためである。**不明は常に安全側へ倒す**（＝削除しない / 警告する）。
 
-`state/inventory.json`（D-5 が使う Volume 一覧）の形式は**まだ規定していない。**Helper 実装の
+`state/inventory.json`（コンテナが現存ファイルの確認に使う一覧。§14.1）の形式は**まだ規定していない。**Helper 実装の
 チケットで定める。
 
 ---
@@ -1292,21 +1300,22 @@ CREATE TABLE recordings (
     duration_seconds      REAL,               -- ffprobe 由来。失敗時は NULL のまま続行
     ended_at              TEXT,               -- started_at + duration_seconds
 
-    -- Variant（最大 2）。削除時の同定に使う（§14.1）
+    -- 取り込み元。削除時の同定に使う（§14.1）
     -- ★v4.0: ボリュームルートからの相対パスを格納する。絶対パスを持たない（§14.1.1）
-    source_path_denoised  TEXT,               -- 'TX_MIC001_.../TX01_..._.wav'
-    source_path_orig      TEXT,
-    source_size_denoised  INTEGER,
+    -- ★v5.0: `_orig` 固定にしたため `*_denoised` と primary_variant は使わない（§5.3）。
+    --        列は残すが常に NULL である。削除はストア方式の決定（T-52）後に 1 回だけ行う
+    source_path_denoised  TEXT,               -- ★v5.0 で未使用（常に NULL）
+    source_path_orig      TEXT,               -- 'TX_MIC001_.../TX01_..._orig.wav'
+    source_size_denoised  INTEGER,            -- ★v5.0 で未使用（常に NULL）
     source_size_orig      INTEGER,
-    source_mtime_denoised REAL,
+    source_mtime_denoised REAL,               -- ★v5.0 で未使用（常に NULL）
     source_mtime_orig     REAL,
-    -- 読み込むのは primary_variant のみ。もう一方の sha256 は NULL のまま
-    sha256_denoised       TEXT,
+    sha256_denoised       TEXT,               -- ★v5.0 で未使用（常に NULL）
     sha256_orig           TEXT,
     -- Helper がコピー時に算出した値。コンテナが再計算して照合する（§10.5）
     sha256_helper         TEXT,
 
-    primary_variant       TEXT,               -- 'denoised' | 'orig'
+    primary_variant       TEXT,               -- ★v5.0 で未使用（常に NULL。実質 'orig' 固定）
 
     -- 作業成果物
     inbox_path            TEXT,               -- /inbox/<device_id>/<folder>/<name>.wav
@@ -1320,7 +1329,7 @@ CREATE TABLE recordings (
     -- 状態（§9.1）
     status                TEXT    NOT NULL,
     retry_count           INTEGER NOT NULL DEFAULT 0,   -- 現在の工程での連続失敗回数
-    auto_retry_rounds     INTEGER NOT NULL DEFAULT 0,   -- 自動再試行の実施回数
+    auto_retry_rounds     INTEGER NOT NULL DEFAULT 0,   -- ★v5.0 で未使用。常に 0（§15.2）
     error_code            TEXT,
     error_message         TEXT,
 
@@ -1334,6 +1343,7 @@ CREATE UNIQUE INDEX idx_recordings_partkey
     ON recordings (transmitter_id, mic_index, started_at, source_folder);
 
 -- 内容同一性による二重処理防止。NULL は重複可なので未ハッシュ行は衝突しない
+-- ★v5.0: sha256_denoised は常に NULL なのでこの索引は空のままである（§5.3）
 CREATE UNIQUE INDEX idx_recordings_sha_denoised
     ON recordings (sha256_denoised) WHERE sha256_denoised IS NOT NULL;
 CREATE UNIQUE INDEX idx_recordings_sha_orig
@@ -1354,7 +1364,7 @@ CREATE INDEX idx_recordings_started  ON recordings (started_at);
 - `sha256_helper` は Helper がコピーしながら算出した値。コンテナは inbox から読み直して再計算し、
   一致しなければ `SOURCE_HASH_MISMATCH` → `FAILED` とする（§10.5）。**コピー破損を検出する唯一の経路**
 - `inbox_path` は `NORMALIZED` 到達後に削除される（`import.inbox_retain`）。削除後も列は残す（監査用）
-- **工程ごとの監査タイムスタンプ列は持たない。**§14.1 の削除条件（ノートの実体と ID で判定）も §9.4 の再開規則（パスと sha256 で判定）もこれらを 1 つも参照しない。工程別の所要時間は §16.2 のログ（`elapsed_s` / `rtf` / `speech_ratio`）で追える。**`FAILED` からの経過時間（§15.2 の自動再試行）は `updated_at` を基準にする**
+- **工程ごとの監査タイムスタンプ列は持たない。**§14.1 の削除条件（ノートの実体と ID で判定）も §9.4 の再開規則（パスと sha256 で判定）もこれらを 1 つも参照しない。工程別の所要時間は §16.2 のログ（`elapsed_s` / `rtf` / `speech_ratio`）で追える。**v5.0 は `FAILED` からの経過時間を使わない**（再評価は時間ではなく契機で起こる。§15.2）
 
 ### 8.3 `sessions`（1 デバイス・1 日）
 
@@ -1384,7 +1394,7 @@ CREATE TABLE sessions (
 
     status              TEXT    NOT NULL,
     retry_count         INTEGER NOT NULL DEFAULT 0,
-    auto_retry_rounds   INTEGER NOT NULL DEFAULT 0,
+    auto_retry_rounds   INTEGER NOT NULL DEFAULT 0,     -- ★v5.0 で未使用。常に 0（§15.2）
     regenerated_count   INTEGER NOT NULL DEFAULT 0,
     delete_attempts     INTEGER NOT NULL DEFAULT 0,   -- 削除評価のバックオフ段数
     error_code          TEXT,
@@ -1511,7 +1521,7 @@ stateDiagram-v2
 | `SOURCE_DELETING` | **削除要求をキューへ投入済み。reaper の結果を待っている**（§10.12） | — | ✅ |
 | `SOURCE_DELETE_PENDING` | 削除すべきだがデバイス未接続 / 同定失敗 / 削除失敗 / **結果がタイムアウト**。次回接続時に再試行 | — | ✅ |
 | `COMPLETED` | 当該 Part の処理をすべて終えた | 可（§14.1 が真なら） | ✅ |
-| `FAILED` | 失敗。自動再試行（§15.2）または手動 `retry` で復帰可能 | 不可 | ✅ |
+| `FAILED` | 失敗。デバイス再接続とサービス起動で再評価される（§15.2） | 不可 | ✅ |
 | `SKIPPED` | 既知の重複、発話が検出されなかった、または取り込み対象の実体が失われた | 不可 | ✅ |
 
 **終端状態**（Session の進行判定に使う）: `RAW_SAVED` / `SOURCE_DELETING` / `SOURCE_DELETE_PENDING` / `COMPLETED` / `FAILED` / `SKIPPED`
@@ -1562,7 +1572,7 @@ stateDiagram-v2
 | `SOURCE_DELETE_PENDING` | 削除保留（デバイス未接続、同定失敗など） |
 | `CLEANUP` | staging の残骸を削除中 |
 | `COMPLETED` | 完了 |
-| `FAILED` | 失敗。自動再試行または手動 `retry` で復帰可能 |
+| `FAILED` | 失敗。デバイス再接続とサービス起動で再評価される（§15.2） |
 
 **再オープン**: `SAVED` / `COMPLETED` に達したセッションへ、同じ日の新しい Part が `RAW_SAVED` に到達したら `MERGING` へ戻して作り直す（`session.allow_reopen`、既定 true）。Daily ノートは同一ファイル名へ atomic write で上書きされるため増殖しない。
 
@@ -1575,7 +1585,7 @@ stateDiagram-v2
 | — | **inbox の走査で新規検出** | `.meta.json` が揃っている ∧ ファイル名パース成功 ∧ partkey 未登録 | `DISCOVERED` | 行 INSERT、ffprobe で duration 取得（**inbox のファイルから**） |
 | — | 走査で検出 | partkey 登録済み | （遷移なし） | `DEBUG already_known` のみ |
 | `DISCOVERED` | 取り込み | 空き容量 OK ∧ staging 上限内 | `NORMALIZING` | staging ディレクトリ作成 |
-| `DISCOVERED` | 取り込み直前の再確認 | `primary_variant` のファイルが存在しない、または `size == 0` | `SKIPPED` | `SOURCE_MISSING` を記録し `part_skipped` を出力。**デバイス上のファイルには触れない。**自動再試行の対象外 |
+| `DISCOVERED` | 取り込み直前の再確認 | `_orig` のファイルが存在しない、または `size == 0` | `SKIPPED` | `SOURCE_MISSING` を記録し `part_skipped` を出力。**デバイス上のファイルには触れない** |
 | `NORMALIZING` | 変換成功 | 出力が 16kHz/1ch/s16 ∧ `size > 0` ∧ 長さが入力と ±`duration_tolerance_seconds` ∧ **再計算した SHA-256 が `sha256_helper` と一致** | `NORMALIZED` | `sha256_<primary>`・`normalized_path` 更新。**`inbox_retain == normalized` なら inbox の原本を削除** |
 | `NORMALIZING` | **ハッシュ不一致** | 再計算値 ≠ `sha256_helper` | `FAILED` | `SOURCE_HASH_MISMATCH`。出力削除。**inbox の原本も残す**（再コピーの判断材料） |
 | `NORMALIZING` | SHA-256 衝突 | 同一 sha256 の別行が存在 | `SKIPPED` | 出力削除、`DUPLICATE_CONTENT` 記録 |
@@ -1589,11 +1599,12 @@ stateDiagram-v2
 | `RAW_WRITING` | 検証失敗 | — | `FAILED` | 一時ファイル削除。**最終ファイルは差し替えない。`FAILED` にするのは今回の再生成を起動した Part（トリガ Part）1 件のみ**とし、同じ Raw ノートに含まれる他の Part は `TRANSCRIBED` のまま据え置いて次回の再生成で再試行する |
 | `RAW_SAVED` | 削除要求 | §14.1 が真 | `SOURCE_DELETING` | **`queue/delete/<request_id>.json` を書く**（§14.1.1）。デバイスには触れない |
 | `RAW_SAVED` | 削除要求 | `delete_source_audio == false` | `COMPLETED` | 元音声を残したまま完了 |
-| `SOURCE_DELETING` | **reaper の結果が成功** | `queue/result/` の結果が全 Variant 削除済み ∧ `state/inventory.json` でも不在 | `COMPLETED` | `source_deleted_at` 更新 |
+| `SOURCE_DELETING` | **reaper の結果が成功** | `queue/result/` の結果が削除済み ∧ `state/inventory.json` でも不在 | `COMPLETED` | `source_deleted_at` 更新 |
 | `SOURCE_DELETING` | デバイス未接続 / 同定失敗 / 失敗 / **`delete_result_timeout_seconds` 超過** | — | `SOURCE_DELETE_PENDING` | ノートは残す。要求はキューに残したままにしない（`request_id` を変えて再投入する） |
 | `SOURCE_DELETE_PENDING` | デバイス再接続 | §14.1 が真 | `SOURCE_DELETING` | — |
 | `COMPLETED` | 削除の後追い | §14.1 が真（Phase 7 移行・§17.1 `cleanup --backlog`） | `SOURCE_DELETING` | — |
-| `FAILED` | `retry` / 自動再試行 | `retry_count < max_attempts` または `--force` | 直前の進行中状態（`NORMALIZING` / `TRANSCRIBING` / `RAW_WRITING`） | `retry_count += 1` |
+| `FAILED` | 工程内リトライ | `retry_count < max_attempts` | 直前の進行中状態（`NORMALIZING` / `TRANSCRIBING` / `RAW_WRITING`） | `retry_count += 1` |
+| `FAILED` | 再評価（デバイス再接続 / サービス起動） | **なし（無条件）** | 直前の進行中状態（`NORMALIZING` / `TRANSCRIBING` / `RAW_WRITING`） | `retry_count = 0`（§15.2） |
 | 各工程通過 | — | — | — | **`retry_count = 0` にリセットする**（§15.2） |
 
 **Session:**
@@ -1623,7 +1634,8 @@ stateDiagram-v2
 | `SOURCE_DELETING` | 一部失敗 | — | `SOURCE_DELETE_PENDING` | ノートは残す |
 | `SOURCE_DELETE_PENDING` | デバイス再接続 | §14.1 が真 | `SOURCE_DELETING` | — |
 | `CLEANUP` | staging 削除完了 | — | `COMPLETED` | — |
-| `FAILED` | `retry` / 自動再試行 | `retry_count < max_attempts` または `--force` | 直前の進行中状態（`MERGING` / `ANALYZING` / `WRITING`） | `retry_count += 1` |
+| `FAILED` | 工程内リトライ | `retry_count < max_attempts` | 直前の進行中状態（`MERGING` / `ANALYZING` / `WRITING`） | `retry_count += 1` |
+| `FAILED` | 再評価（デバイス再接続 / サービス起動） | **なし（無条件）** | 直前の進行中状態（`MERGING` / `ANALYZING` / `WRITING`） | `retry_count = 0`（§15.2） |
 
 > **「`X` のまま」は遷移ではない。**`READY のまま`（待機）と `SAVED のまま`
 > （`delete_attempts += 1`）は状態が変わらないので `events` を書かない。とくに
@@ -1645,7 +1657,7 @@ stateDiagram-v2
 | Session の `raw_output_path` が存在し `raw_output_sha256` と一致 | Raw ノート生成 |
 | `analysis_path` が存在しスキーマ検証通過 | LLM 解析 |
 | `output_path` が存在し `output_sha256` と一致 | Daily ノート生成・書き込み |
-| DJI 側の全 Variant が存在しない | 元音声削除（成功扱い） |
+| DJI 側の `_orig` が存在しない | 元音声削除（成功扱い） |
 
 セッション統合（§10.8）は永続化しないため、毎回安価に再実行する。
 
@@ -1687,7 +1699,7 @@ def worker_loop() -> None:
         process_ready_sessions()             # §10.8 - 10.11
         collect_delete_results(inventory)    # §10.12 queue/result/ を回収
         retry_pending_deletions(inventory)   # §10.12
-        requeue_auto_retry()                 # §15.2
+        requeue_failed(inventory)            # §15.2 再接続の立ち上がりで FAILED を再投入
         sleep(cfg.device.poll_interval_seconds)
 ```
 
@@ -1741,7 +1753,7 @@ device
        └─ *.wav / *.WAV
             └─ RECORDING_FILENAME_RE でパース
                  └─ part_key = (transmitter_id, mic_index, started_at)
-                      └─ variant を orig / denoised に振り分け
+                      └─ `_orig` 以外は候補から落とす（§5.3）
 ```
 
 **Helper が inbox へ書くもの**（1 ファイルにつき 2 つ。`.meta.json` を**後に** rename することで、
@@ -1808,7 +1820,7 @@ device
 - 待機時間は合計 `STABILITY_INTERVAL_SECONDS × STABILITY_CHECKS` であり、ファイル数に比例しない
 - 不一致が出たファイルは成立回数を 0 に戻す
 - 成立しなかったファイルは当該走査パスでは登録せず、次回に再評価する（`FILE_NOT_STABLE` は失敗ではなく「保留」）
-- 全 Variant について判定し、**すべてが安定した場合のみ** inbox へコピーする
+- **`_orig` のファイルだけを判定し、安定していれば inbox へコピーする。**`_orig` の無いファイルはコピーしない（§5.3）
 - **コピー自体もアトミックに行う。**`<name>.wav.partial` へ書いてから `mv`（同一ファイルシステム内の
   `rename(2)`）で確定し、その後に `.meta.json` を同じ手順で置く。
   **コンテナが中途半端なファイルを読む経路を無くす**
@@ -1882,9 +1894,9 @@ proc.stdin.close()
 
 | 項目 | 規定 |
 |---|---|
-| 入力 | `primary_variant` に対応する **inbox 上の**ファイル。もう一方の Variant は読まない |
+| 入力 | **inbox 上の `_orig` ファイル**（§5.3。denoised は取り込まれていない） |
 | 出力 | `/data/staging/<recording_id>/audio16k.wav`（30 分で約 58 MB） |
-| ハッシュ | 読みながら SHA-256 を算出し `sha256_<primary_variant>` に保存する |
+| ハッシュ | 読みながら SHA-256 を算出し `sha256_orig` に保存する |
 | **コピー検証** | 算出した SHA-256 が **`.meta.json` の `sha256`（`sha256_helper`）と一致すること。**不一致は `SOURCE_HASH_MISMATCH` → `FAILED`。**Helper のコピーが壊れていないことを確認する唯一の経路** |
 | タイムアウト | `max(ffmpeg_min_timeout_seconds, duration_seconds × ffmpeg_timeout_factor)` |
 | 検証 | 出力が存在し `size > 0`、ffprobe で 16000 Hz / 1 ch / `s16`、かつ **出力の duration が入力の duration と ±`duration_tolerance_seconds` 以内** |
@@ -2077,7 +2089,7 @@ for part in sorted(valid_parts, key=lambda p: p.started_at):
               ↓
             §14.1.1 の 11 項目を独立検証（コンテナの判断を信用しない）
               ↓ すべて真
-            Part の全 Variant を unlink
+            Part の `_orig` を unlink
               ↓
             不在を確認（stat が ENOENT）
               ↓
@@ -2095,10 +2107,10 @@ for part in sorted(valid_parts, key=lambda p: p.started_at):
 |---|---|
 | デバイス未接続（`inventory.json` に無い） | 要求を書かない。`SOURCE_DELETE_PENDING`。ノートは残す |
 | **reaper の結果がタイムアウト**（`cleanup.delete_result_timeout_seconds` 超過） | `SOURCE_DELETE_PENDING`。**古い要求はキューから取り下げ、再試行時は新しい `request_id` で投入する**（リプレイ防止と両立させるため） |
-| **reaper が同定に失敗** | 結果に `SOURCE_IDENTITY_MISMATCH` が入る → `SOURCE_DELETE_PENDING`。**削除しない**。`WARN source_identity_mismatch` |
+| **reaper が同定に失敗** | 結果に `SOURCE_IDENTITY_MISMATCH` が入る → `SOURCE_DELETE_PENDING`。**削除しない**。`WARN source_delete_pending reason=identity_mismatch`（§16.4） |
 | **reaper が存在しない**（ロック 2-A） | 結果が来ない → タイムアウト → `SOURCE_DELETE_PENDING`。**これは正常な状態である**（Phase 7 前） |
 | 削除は成功したが `inventory.json` にまだ在る | `SOURCE_DELETE_FAILED` → `SOURCE_DELETE_PENDING` |
-| 一部 Variant のみ削除成功 | `SOURCE_DELETE_PENDING`。残りを次回処理する |
+
 | staging 削除失敗 | `LOCAL_DELETE_FAILED`。Session は `CLEANUP` に留める。次回リトライ |
 | キューへ書けない（権限・容量） | `DELETE_QUEUE_FAILED` → `SOURCE_DELETE_PENDING` |
 
@@ -2226,8 +2238,8 @@ class DeviceInventory:
     def contains(self, device_id: str, rel: DevicePath) -> bool: ...
 
 @dataclass(frozen=True)
-class VariantFile:
-    variant: Literal["orig", "denoised"]
+class SourceFile:
+    """取り込み対象の `_orig` ファイル 1 本（§5.3）。denoised は候補にならない。"""
     relpath: DevicePath     # ボリュームルートからの相対パス。絶対パスを持たない
     inbox_path: InboxPath | None    # 変換後に削除されると None になる
     size: int
@@ -2241,7 +2253,7 @@ class PartCandidate:
     mic_index: int
     started_at: datetime
     source_folder: str
-    variants: dict[str, VariantFile]    # "orig" / "denoised"
+    source: SourceFile                  # `_orig` の 1 本だけ（§5.3）
 
 # cleaner.py
 @dataclass(frozen=True)
@@ -2252,7 +2264,7 @@ class DeleteRequest:
     device_id: str
     recording_id: int
     session_key: str
-    targets: list[VariantFile]
+    targets: list[SourceFile]           # 常に 1 要素（§5.3）。list のままにするのは JSON 形式を変えないため
 
 # transcribe.py
 @dataclass(frozen=True)
@@ -2712,7 +2724,7 @@ VoiceDock の削除条件を整理し、午後の打ち合わせで MVP の範�
 - 本文の `# タイトル` 直後に次の 1 行を挿入する
 
 ```markdown
-> ⚠ この日の録音のうち 2 本が処理できませんでした（合計 60 分）。`voicedock retry` で再試行できます。
+> ⚠ この日の録音のうち 2 本が処理できませんでした（合計 60 分）。次にデバイスを接続したときに自動で再試行されます。
 ```
 
 **欠落を隠さないこと。**除外された Part の音声は削除されない（§14.1 が `voicedock_recording_ids` への収録を要求するため自動的に保証される）。
@@ -2797,7 +2809,7 @@ VoiceDock の削除条件を整理し、午後の打ち合わせで MVP の範�
 - `wiki.link_tags: false` の場合は**インデックスを構築しない**（日付リンクと Raw リンクだけならファイル一覧は不要）
 - 突き合わせは NFC 正規化 + 大小無視の**完全一致のみ**。部分一致・曖昧一致はしない
 - 自己参照リンクは除外。`[` `]` `|` `#` `^` を含む候補は除外。総数上限は `wiki.max_links`（既定 20。Raw リンクは対象外）
-- **リンクの生成失敗は保存検証の合否に影響させない**（`WARN wikilink_skipped` のみ。削除判断に持ち込まない）
+- **リンクの生成失敗は保存検証の合否に影響させない**（`DEBUG` に落とすだけ。削除判断に持ち込まない。§16.4）
 
 「既存ノートだけリンクする」のは、未解決リンクを毎日大量に作るとグラフが空ノードで埋まり実用性が落ちるため。
 
@@ -2858,10 +2870,10 @@ def can_delete_source(part, session, cfg, device) -> bool:
         and len(session.parts) >= 1
         and all(p.status in PART_TERMINAL for p in session.parts)   # ★§9.1 の 6 件
 
-        # --- 削除対象ファイルの同定（§14.1.1）。空集合を真にしない ---
-        and len(part.variant_paths) >= 1
-        and all(target_is_identical(part, variant, device)
-                for variant in part.variant_paths)
+        # --- 削除対象ファイルの同定（§14.1.1）。NULL / 空文字を真にしない ---
+        and part.source_path_orig is not None
+        and part.source_path_orig != ""
+        and target_is_identical(part, device)
     )
 ```
 
@@ -2872,7 +2884,9 @@ def can_delete_source(part, session, cfg, device) -> bool:
   Helper が `.meta.json` に記録した値であり、**実ファイルとの突き合わせは reaper が行う**（§14.1.1）
 - **削除の根拠は「音声のコピーが正しかったこと」ではなく「テキストが Vault に確実に残っていること」である。**原音のコピーを保持しない設計（§10.5）に合わせて、v3.0 の「staging 上のファイルからハッシュを再計算する」条件は廃止した
 - 処理できなかった Part（`FAILED` / `SKIPPED`）はノートの `voicedock_recording_ids` に載らないため、**自動的に削除対象から外れる**
-- `all()` / `any()` を安全条件に使う場合は、**対象集合が空でないことを別条件として必ず明示する**（空集合の `all()` は真になるため）
+- `all()` / `any()` を安全条件に使う場合は、**対象集合が空でないことを別条件として必ず明示する**（空集合の `all()` は真になるため。§14.1 では `session.parts` がこれに当たる）
+- **`_orig` 固定（§5.3）で削除対象は 1 ファイルになったが、`all()` を外しても「非空の明示」は消さない。**スカラーに退化した以上の危険は `NULL` / 空文字であり、`os.path.join(volume, "")` は**ボリュームのルートを指す。**上の 2 条件はそのための番犬である（v3.0 の欠陥 A-14 と同型）
+- **denoised はデバイスに残しても削除しない。**読まなかったファイルを消してよい根拠が無いためである（§5.3）
 - **`PART_DELETABLE` は §9.1 の「終端状態」（`PART_TERMINAL`）とは別集合である。**§9.1 の終端状態は
   `FAILED` / `SKIPPED` を**含む**（失敗した 1 本でその日の記録全体を止めないため。§1.3）が、
   それらは**文字起こし本文が保存されていない**ので削除してはならない。v4.5 まで削除条件側を
@@ -2901,7 +2915,6 @@ def can_delete_source(part, session, cfg, device) -> bool:
   "session_key": "DJIMIC3:20260829",
   "targets": [
     {
-      "variant": "orig",
       "relpath": "TX_MIC001_20260829_071201/TX01_MIC002_20260829_071204_orig.wav",
       "size": 345600000,
       "mtime": 1787000000.0
@@ -3026,7 +3039,7 @@ v3.x の `DJI_MOUNT_MODE=ro` と同じ強度である。
 | 状況 | ingest の挙動 |
 |---|---|
 | 再マウント成功 | `heartbeat.json` に `mount_readonly: true` を書く。取り込みを続行 |
-| **再マウント失敗**（他プロセスが使用中など） | **取り込みは続行する**（記録を優先。§1.3）。`WARN remount_readonly_failed` を出し、`heartbeat.json` に `mount_readonly: false` を書く |
+| **再マウント失敗**（他プロセスが使用中など） | **取り込みは続行する**（記録を優先。§1.3）。**Helper 側のログに警告を出し**（§4.1）、`heartbeat.json` に `mount_readonly: false` を書く |
 
 **失敗は安全側へ倒れる。**`mount_readonly: false` を見た reaper は検証 2 で削除を拒否する
 （§14.1.1）。つまり **「ロック 2-B をかけられなかった」ことが「削除しない」理由になる。**
@@ -3076,7 +3089,7 @@ cleanup:
               ↓
             独立検証 11 項目（§14.1.1）→ すべて真
               ↓
-            DJI 側 Part の全 Variant を unlink
+            DJI 側 Part の `_orig` を unlink
               ↓
             削除検証（ファイルが存在しないことを確認）
               ↓
@@ -3193,19 +3206,45 @@ VoiceDock Container ──HTTP──> Docker Model Runner（ローカル）
 retry:
   max_attempts: 3
   backoff_seconds: [3, 10, 30]
-  auto_retry_failed_after_hours: 24
-  auto_retry_max_rounds: 3
 ```
 
-- 自動リトライの対象は上表で「可」のもののみ
+**リトライは 2 層しかない。**
+
+| 層 | 範囲 | 回数 |
+|---|---|---|
+| **工程内リトライ** | 1 つの工程（変換 / 文字起こし / 保存 …）の中での即時再試行 | `max_attempts` 回、`backoff_seconds` 間隔 |
+| **再評価** | `FAILED` に落ちた行を、次の契機でもう一度流す | **無制限**（契機のたびに 1 回） |
+
+**工程内リトライ**
+
+- 自動リトライの対象は §15.1 の表で「可」のもののみ
 - **`retry_count` は「現在の工程での連続失敗回数」を意味する。工程を通過したら 0 にリセットする**（`NORMALIZED` / `TRANSCRIBED` / `RAW_SAVED` / `MERGED` / `ANALYZED` / `SAVED` への遷移時）。工程をまたいで累積させると、前段で 2 回失敗した行が後段の 1 回の失敗で打ち切られてしまうため
 - 累積の失敗回数は `events` テーブルから復元する
 - `retry_count` が `max_attempts` に達したら `FAILED` として残す
-- **`FAILED` は `auto_retry_failed_after_hours`（既定 24 時間）経過後に自動で再投入する。**1 日 32 Part の運用で、失敗のたびに人が `retry` を打つのは現実的でないため。`auto_retry_max_rounds`（既定 3）を超えたら以降は自動で触らず、`status` / `doctor` の警告に出し続ける（`retry_exhausted`）
-- **自動再試行の対象外**: 設定エラー系、`DUPLICATE_CONTENT`、`NO_SPEECH_DETECTED`、`SOURCE_MISSING`
-- `HELPER_UNAVAILABLE` と `DELETE_TIMEOUT` は `max_attempts` の対象外。**Helper の復帰／デバイスの再接続のたびに無期限に再評価する**（`SOURCE_DELETE_PENDING` と同じ扱い）
-- `FAILED` からの即時復帰は CLI の `voicedock retry <id>`（`--force` 付きで上限無視）
 - **リトライは最初からやり直さない。**§9.4 の再開規則に従って完了済みステップを飛ばす
+
+**再評価（`FAILED` からの復帰）**
+
+- **`FAILED` の行は、次の契機で `retry_count` を 0 に戻して無条件に再投入する。**契機は 2 つだけ。
+
+  | 契機 | 判定 |
+  |---|---|
+  | **デバイスの再接続** | `state/inventory.json` の対象デバイス一覧が、**前回のループでは空で今回は非空**になった（コンテナはデバイスを見ないため、これが唯一の観測手段。§10.1） |
+  | **サービスの起動** | §9.4 の復帰処理の一部として 1 回 |
+
+- **時間で待たない。**`auto_retry_failed_after_hours`（24 時間タイマー）と
+  `auto_retry_max_rounds`（ラウンド上限）と `recordings.auto_retry_rounds` 列は **v5.0 で廃止した。**
+  デバイスを繋ぐのは人の操作であり、**そのときに直っていれば通り、直っていなければまた `FAILED` に戻る。**
+  接続は 1 日 1 回程度なので、これが自然な再試行間隔になる（§5.1 の接続頻度）
+- **上限を持たないのは意図である。**v4.6 は 3 ラウンドを超えた行を「以降は自動で触らない」
+  状態（`retry_exhausted`）に置いていたが、**原因が直っても人が手を動かすまで永久に戻らない**
+  という穴があった。`retry` コマンドも v5.0 で削除した（§17.1）ため、上限を残すと復帰経路が無くなる
+- **「自動再試行の対象外」リストは廃止した。**v4.6 は設定エラー系・`DUPLICATE_CONTENT`・
+  `NO_SPEECH_DETECTED`・`SOURCE_MISSING` を除外していたが、**この 4 系統はどれも `FAILED` に
+  ならない**（設定エラーは起動中止、残る 3 つは `SKIPPED`。§15.1 の遷移先列）。
+  **`FAILED` だけを再評価する規則のもとでは、除外リストが指すものが存在しない。**
+  したがって `ErrorSpec` から `auto_retry_exempt` の概念ごと取り除く（§11.1）
+- `HELPER_UNAVAILABLE` と `DELETE_TIMEOUT` は `max_attempts` の対象外。**Helper の復帰／デバイスの再接続のたびに無期限に再評価する**（`SOURCE_DELETE_PENDING` と同じ扱い）
 - `SOURCE_DELETE_PENDING` は `max_attempts` の対象外。デバイスが接続されるたびに無期限に再試行する
 - **`SAVED` で削除条件が偽の場合**は `cleanup.delete_evaluation_backoff_seconds`（`[60, 300, 900, 3600]`）に従って再評価する。5 秒ごとに実ファイル検証を繰り返すビジーループを避けるため
 
@@ -3229,11 +3268,9 @@ make logs
 **text（既定）:**
 
 ```text
-2026-08-30T07:00:12+09:00 INFO  service_started version=3.2.0
-2026-08-30T07:00:17+09:00 INFO  device_detected device_id=DJIMIC3 source=helper_inventory writable=false
-2026-08-30T07:00:18+09:00 INFO  deep_scan_completed device_id=DJI_MIC files=64 new_parts=32 elapsed_s=1.4
-2026-08-30T07:00:18+09:00 INFO  part_discovered recording_id=42 tx=TX01 mic=2 started_at=2026-08-29T07:12:04+09:00 duration=1800.0 variants=2
-2026-08-30T07:00:18+09:00 INFO  session_opened session_id=12 session_key=DJI_MIC:20260829
+2026-08-30T07:00:12+09:00 INFO  service_started version=0.1.0
+2026-08-30T07:00:18+09:00 INFO  part_discovered recording_id=42 tx=TX01 mic=2 started_at=2026-08-29T07:12:04+09:00 duration=1800.0
+2026-08-30T07:00:18+09:00 INFO  part_skipped recording_id=43 reason=variant_not_orig
 2026-08-30T07:01:02+09:00 INFO  normalize_completed recording_id=42 in_bytes=345600044 out_bytes=57600044 elapsed_s=43.1
 2026-08-30T07:06:33+09:00 INFO  transcription_completed recording_id=42 elapsed_s=331.4 chars=8421 rtf=0.18 speech_ratio=0.31
 2026-08-30T07:06:34+09:00 INFO  raw_note_saved session_id=12 parts=1 bytes=18402
@@ -3241,7 +3278,6 @@ make logs
 2026-08-30T10:03:22+09:00 INFO  llm_completed session_id=12 chunks=18 elapsed_s=1337.0
 2026-08-30T10:03:23+09:00 INFO  obsidian_saved session_id=12 path="Daily/Voice/Wiki/20260829/2026-08-29 Voice.md" bytes=12844
 2026-08-30T10:03:23+09:00 INFO  source_delete_skipped session_id=12 reason=delete_source_audio_disabled
-2026-08-30T10:03:24+09:00 INFO  session_completed session_id=12 total_elapsed_s=11592.0
 ```
 
 **json:**
@@ -3267,29 +3303,53 @@ make logs
 
 ### 16.4 イベント名一覧
 
+**1 工程につき「完了」1 件と「失敗」1 件だけを置く。**開始イベントは出さない
+（完了イベントに `elapsed_s` が載るので、開始行は所要時間の計算にも要らない）。
+**状態遷移は `events` テーブル（§8.4）が持つので、ログに二重で並べない。**
+細かい分岐は新しいイベント名を作らず、`reason=` か `error_code=` のフィールドで表す。
+**Helper（bash）が出すイベントはここに列挙しない**（Helper のログは §4.1 の範囲であり、T-49 が定める）。
+
 ```text
-service_started / service_stopping / recovery_completed / config_warning
-device_detected / device_lost / device_unreadable / device_excluded
-helper_heartbeat_stale / helper_recovered / remount_readonly_failed
-inbox_part_found / inbox_meta_missing / inbox_source_deleted / source_hash_mismatch
-delete_requested / delete_result_received / delete_timeout / delete_queue_failed
-deep_scan_started / deep_scan_completed / deep_scan_skipped
-part_discovered / part_skipped / unparsable_filename / file_not_stable
-normalize_started / normalize_completed / normalize_failed / duplicate_content
-transcription_started / transcription_completed / transcription_failed
-transcription_timeout / no_speech_detected
-raw_note_saved / raw_note_write_failed / raw_note_verify_failed
-session_opened / session_ready / session_reopened / session_merged
-session_merge_failed / session_empty
-llm_started / llm_completed / llm_invalid_json / llm_repair_attempted / llm_unavailable
-wikilink_index_built / wikilink_skipped
-obsidian_saved / obsidian_write_failed / obsidian_verify_failed
-source_delete_started / source_deleted / source_delete_failed
-source_identity_mismatch / source_delete_pending / source_delete_skipped
-staging_deleted / staging_delete_failed
-session_completed / part_completed
-disk_space_low / retry_scheduled / auto_retry_queued / retry_exhausted
+service_started / service_stopping / config_warning / recovery_completed
+helper_heartbeat_stale / helper_recovered
+part_discovered / part_skipped / unparsable_filename
+normalize_completed / normalize_failed
+transcription_completed / transcription_failed
+raw_note_saved / raw_note_failed
+session_merged / session_merge_failed / session_empty / session_reopened
+llm_completed / llm_failed
+obsidian_saved / obsidian_failed
+delete_requested / source_deleted / source_delete_skipped / source_delete_pending
+disk_space_low
 ```
+
+**28 件。**`log.py` の `_EVENT_ORDER` はこの順序・この名前と一致しなければならない
+（`tests/unit/test_log.py` が本節と突き合わせる）。
+
+**v5.0 で削除した 43 件と、その行き先:**
+
+| 削除 | 行き先 |
+|---|---|
+| `normalize_started` / `transcription_started` / `llm_started` / `source_delete_started` | 対応する完了イベントの `elapsed_s` |
+| `duplicate_content` / `no_speech_detected` | `part_skipped` の `reason=duplicate_content` / `reason=no_speech` |
+| `source_hash_mismatch` | `normalize_failed` の `error_code=SOURCE_HASH_MISMATCH` |
+| `transcription_timeout` | `transcription_failed` の `error_code=TRANSCRIPTION_TIMEOUT` |
+| `llm_invalid_json` / `llm_repair_attempted` / `llm_unavailable` | `llm_failed` の `error_code=` |
+| `raw_note_write_failed` / `raw_note_verify_failed` | `raw_note_failed` の `reason=write` / `reason=verify` |
+| `obsidian_write_failed` / `obsidian_verify_failed` | `obsidian_failed` の `reason=write` / `reason=verify` |
+| `delete_result_received` / `delete_timeout` / `delete_queue_failed` / `source_delete_failed` / `source_identity_mismatch` | `source_delete_pending` の `reason=`。**削除が起きなかったことは 1 件で足り、内訳は `events` テーブルと `error_code` にある** |
+| `session_opened` / `session_ready` / `session_completed` / `part_completed` | **`events` テーブル**（状態遷移そのもの） |
+| `inbox_part_found` / `inbox_meta_missing` / `inbox_source_deleted` | `part_discovered` と DEBUG |
+| `device_detected` / `device_lost` / `device_unreadable` / `device_excluded` / `remount_readonly_failed` | **Helper 側。**v4.0 でデバイス検出が Helper へ移ったのに §16.4 に残っていた |
+| `deep_scan_started` / `deep_scan_completed` / `deep_scan_skipped` / `file_not_stable` | **Helper 側。**v4.1 で走査と安定性判定が Helper へ移ったのに §16.4 に残っていた |
+| `wikilink_index_built` / `wikilink_skipped` | 削除（DEBUG で足りる。§13.8 は本文の処理であり、失敗しても保存は続く） |
+| `staging_deleted` / `staging_delete_failed` | 削除。失敗は `LOCAL_DELETE_FAILED` として `events` に残る（§10.12） |
+| `retry_scheduled` | DEBUG（工程内リトライ。§15.2） |
+| `auto_retry_queued` / `retry_exhausted` | **自動再試行の廃止で消えた**（§15.2） |
+
+> **`device_*` と `deep_scan_*` の 9 件は v3.x の残骸である。**v4.0 で検出が、v4.1 で走査が
+> Helper へ移ったが、§16.4 の一覧は更新されていなかった。**コンテナはデバイスを見ないので、
+> これらのイベントを出せるコードは書けない**（§11.1 の `DevicePath`）。
 
 ---
 
@@ -3303,21 +3363,42 @@ docker compose exec voicedock voicedock <subcommand> [options]
 
 ### 17.1 サブコマンド
 
-| コマンド | 引数 | 説明 |
-|---|---|---|
-| `service` | — | 常駐サービスを起動する（コンテナの既定 CMD） |
-| `scan` | — | 走査を 1 回だけ実行して結果を表示する |
-| `status` | — | 現在の処理状況サマリを表示する |
-| `history` | `[--limit N] [--status S]` | 処理履歴を新しい順に表示する（既定 20 件） |
-| `show` | `<session_id>` | セッション 1 件の詳細（Part 一覧・各状態・出力先）を表示する |
-| `retry` | `<id> [--session] [--force]` | `FAILED` からの即時再開。既定は Part ID。`--session` で Session ID |
-| `pending` | — | `SOURCE_DELETE_PENDING` と自動再試行待ちの一覧を表示する |
-| `cleanup` | `[--backlog] [--dry-run]` | `--backlog` で、既に `COMPLETED` になった Part のうち §14.1 が真のものを一括削除する（Phase 7 への移行手順。§21.2） |
-| `doctor` | — | 環境診断（§19.2） |
-| `health` | — | health check（§19.1）。コンテナの healthcheck が使用する |
-| `version` | — | バージョンを表示する |
+**サブコマンドは 5 本だけである。**引数を取るものは無い。
 
-> `cleanup --backlog` が必要な理由: 削除 OFF の期間（Phase 1〜6）に処理した Part は `COMPLETED` で終わるため、Phase 7 で削除を有効化しても通常フローでは削除対象にならない。1 日で本体が満杯になる運用では、この後追い経路が無いと溜まった録音を消せない。`--dry-run` で対象を確認してから実行する。
+| コマンド | 説明 |
+|---|---|
+| `service` | 常駐サービスを起動する（コンテナの既定 CMD） |
+| `status` | 現在の処理状況サマリを表示する。**失敗・滞留を見る唯一の窓口** |
+| `doctor` | 環境診断（§19.2） |
+| `health` | health check（§19.1）。**`compose.yaml` の healthcheck が呼ぶ**ので必須 |
+| `version` | バージョンを表示する |
+
+**v5.0 で削除した 6 本と、その代替:**
+
+| 削除 | 代替 |
+|---|---|
+| `scan` | 走査は Helper が行う（§10.1）。コンテナ側の `/inbox` 走査は常駐ループだけで足り、単発実行の用途が無い |
+| `history` | `events` テーブルを直接読む（下記） |
+| `show` | 同上 |
+| `retry` | **デバイス再接続とサービス起動での `FAILED` 再評価**（§15.2）。人が打つ操作を無くしたので、コマンド自体が不要になった |
+| `pending` | `status` が `SOURCE_DELETE_PENDING` の件数を出す |
+| `cleanup` | Phase 7 への移行で後追いの一括削除が必要になった時点で足す（#38）。**`COMPLETED → SOURCE_DELETING` の遷移は §9.3 に残してある**ので、足すのは入口だけである |
+
+> **`history` / `show` を削っても履歴は失われない。**`events` テーブル（§8.4）が状態遷移を
+> すべて持っているので、必要なときは SQL で読む。**CLI に整形表示を持つと、列を増やすたびに
+> §17.2 の出力例と実装の二重管理になる。**
+>
+> ```bash
+> docker compose exec voicedock sqlite3 -box /data/voicedock.db \
+>   "SELECT ts, entity, entity_id, from_status, to_status, error_code
+>      FROM events ORDER BY id DESC LIMIT 20;"
+> ```
+
+> **`cleanup --backlog` を削った影響**: 削除 OFF の期間（Phase 1〜6）に処理した Part は
+> `COMPLETED` で終わるため、Phase 7 で削除を有効化しても通常フローでは削除対象にならない。
+> **この後追い経路は Phase 7 に入るまで必要にならない**ので、必要になった時点で #38 として足す。
+> Phase 7 の前提（ND-01〜ND-30 と E2E-01〜E2E-12 の全件 PASS。§21.1）が揃うまでは、
+> 存在しないほうが安全である（削除の入口を 1 本に保てる）。
 
 ### 17.2 出力例
 
@@ -3326,9 +3407,9 @@ $ voicedock status
 
 VoiceDock v0.1.0
 ────────────────────────────────────────────────────────
-Helper                : running   (last seen 42s ago, v4.0.0, mount=readOnly)
+Helper                : running   (last seen 42s ago, v4.1.0, mount=readOnly)
 Devices connected     : 1  (DJIMIC3, readOnly)
-Device free space     : 4.2 GiB  (残り約 4.3 時間)
+Device free space     : 4.2 GiB
 Inbox                 : 3 parts pending, 1.1 GiB
 Delete queue          : 0 requested, 0 awaiting result
 Source deletion       : DISABLED  (lock1=false, lock2A=reaper absent, lock2B=readOnly)
@@ -3340,7 +3421,7 @@ Parts
   RAW_SAVED           : 3
   COMPLETED           : 214
   SKIPPED             : 18   (無音)
-  FAILED              : 2    (自動再試行待ち: 2)
+  FAILED              : 2    (次回接続時に再試行)
   SOURCE_DELETE_PENDING: 0
 
 Sessions
@@ -3353,17 +3434,15 @@ Sessions
 Backlog               : 未処理 3.2 時間ぶん
 Staging usage         : 0.1 GiB / 5.0 GiB
 Free disk (/data)     : 58.1 GiB
-Last deep scan        : 2026-08-30T10:03:24+09:00
 ```
 
-```text
-$ voicedock history --limit 3
+**`status` が `FAILED` の内訳も出す**（削除した `history` / `show` / `pending` の役割を引き受ける）。
 
-ID   DATE         PARTS  RECORDED  STATUS      TITLE
-12   2026-08-29   32(-1) 09:41:20  COMPLETED   開発と打ち合わせの一日
-11   2026-08-28   28     08:12:04  COMPLETED   移動と読書の日
-10   2026-08-27   30     09:02:11  FAILED      —
-     └ error: LLM_INVALID_JSON (retry 3/3, 自動再試行 2026-08-31 10:00)
+```text
+Failed parts
+  42   2026-08-29 07:12  TRANSCRIPTION_TIMEOUT   retry 3/3
+  57   2026-08-29 14:03  LLM_INVALID_JSON        retry 3/3
+  → 次にデバイスを接続したときに自動で再試行される（§15.2）
 ```
 
 ### 17.3 終了コード
@@ -3857,33 +3936,23 @@ $ voicedock doctor
 VoiceDock doctor
 ────────────────────────────────────────────────────────
 [✓] Config file          /app/config/config.yaml
-[✓] Config validation    68 keys, 0 errors
+[✓] Config validation    107 keys, 0 errors
 [✓] Database             /data/voicedock.db (schema v1, 261 recordings, 8 sessions, 2104 events, 4.1 MiB)
 [✓] Data volume          /data writable, 58.1 GiB free
-[✓] Staging usage        0.1 GiB / 5.0 GiB
-[✓] Helper               running (last seen 42s ago, v4.0.0)
-[✓] Helper mount mode    readOnly (lock 2-B engaged)
-[✓] Inbox                /inbox  3 parts pending, 1.1 GiB
-[✓] Delete queue         /queue  0 requested, 0 awaiting result
-[✓] Host volumes         3 entries  (reported by Helper)
-                           included : "DJIMIC3"
-                           skipped by INCLUDE_VOLUMES : (none — list is empty)
-                           skipped by EXCLUDE_VOLUMES : "Macintosh HD", "Backup SSD"
-[✓] DJI device           DJIMIC3  readOnly  parts=3  free=4.2 GiB (≈4.3h)
 [✓] Whisper executable   /usr/local/bin/whisper-cli (v1.9.4, VAD: supported)
 [✓] Whisper model        ggml-large-v3-turbo-q5_0.bin (574.0 MiB)
 [✓] VAD model            ggml-silero-v5.1.2.bin (2.2 MiB)
 [✓] ffmpeg / ffprobe     7.1
-[✓] Published ports      none
 [✓] LLM endpoint         http://model-runner.docker.internal/engines/v1
 [✓] LLM response         qwen3-30b-a3b  (4.1s, 12 tokens)
-[✓] Obsidian vault       /obsidian (readable, writable)
-[✓] Obsidian folders     Daily/Voice/Raw, Daily/Voice/Wiki (exist)
-[!] Failed / pending     2 failed (auto-retry queued), 0 delete-pending
+[✓] Obsidian vault       /obsidian (readable, writable, folders exist)
+[✓] Helper               running (last seen 42s ago, v4.1.0, mount=readOnly)
 [!] Source deletion      DISABLED (config=false, mount=ro)
 ────────────────────────────────────────────────────────
-16 checks passed, 0 failed, 2 notices
+12 checks passed, 0 failed, 1 notice
 ```
+
+**コンテナ内は 12 検査、ホスト側（`scripts/doctor.sh`）は 5 検査、合わせて 17 である。**
 
 **行の書式**: `[<記号>] <ラベル（21 桁左詰め）><詳細>`。記号は **`[✓]` 合格 / `[!]` 注意 /
 `[✗]` 失敗 / `[-]` 前提が崩れて実行できなかった（skip）** の 4 種。詳細の続き行は **27 桁**
@@ -3899,34 +3968,34 @@ VoiceDock doctor
 | D-1 | 設定ファイルが存在し、全バリデーション規則（§7.3）を通る | 致命的 |
 | D-2 | DB へ接続でき、スキーマバージョンが最新。`events` 行数と DB サイズを表示 | 致命的 |
 | D-3 | `/data` が書き込み可能、空き容量が `free_space_margin_bytes` 以上 | 致命的 |
-| D-4 | staging 使用量が上限内 | 警告 |
-| D-5 | Helper が報告した Volume 一覧（`state/inventory.json`）。**`INCLUDE_VOLUMES` で対象外にした Volume 名と、`EXCLUDE_VOLUMES` で除外した Volume 名を、理由ごとに分けて必ず列挙する** | 致命的 |
-| D-6 | DJI デバイスの検出状況と**本体の残容量・推定残り録音時間**（未接続は正常）。推定残り録音時間は下記の基準で算出する | 情報 |
 | D-7 | `whisper-cli` が存在し `--help` が成功する。**VAD オプションの有無を表示** | 致命的 |
 | D-8 | Whisper モデルが存在し、サイズが 0 でない | 致命的 |
 | D-9 | VAD モデルが存在する（`vad.enabled` が true のとき） | 致命的 |
 | D-10 | `ffmpeg` / `ffprobe` が存在しバージョンを取得できる | 致命的 |
 | D-11 | `VOICEDOCK_LLM_URL` / `VOICEDOCK_LLM_MODEL` が設定済み | 致命的 |
 | D-12 | **LLM へ実際に短いリクエストを投げて応答を得る**（所要時間を表示） | 致命的 |
-| D-13 | `/obsidian` が読み書き可能（一時ファイルの作成・削除で検証） | 致命的 |
-| D-14 | Raw / Daily の出力フォルダが存在するか作成できる | 致命的 |
-| D-15 | `FAILED` / `SOURCE_DELETE_PENDING` / 自動再試行待ちの件数 | 警告 |
-| D-16 | **自コンテナに公開ポートが無いこと、LLM エンドポイントが `*.docker.internal` であること** | 致命的 |
+| D-13 | `/obsidian` が読み書き可能（一時ファイルの作成・削除で検証）。**Raw / Daily の出力フォルダが存在するか作成できることも同じ行で検証する**（v5.0 で D-14 を統合） | 致命的 |
 | D-17 | **削除モードの状態を必ず表示する。三重ロックの 3 つすべてを個別に表示する**（§14.2） | 有効なら警告表示 |
-| **D-18** | **Helper が稼働している**（`heartbeat.json` が `helper_heartbeat_max_age_seconds` 以内）。`mount_readonly`・Helper のバージョン・`config_error` の有無を表示する。**Helper が報告した `INCLUDE_VOLUMES` / `EXCLUDE_VOLUMES` の実効値を表示する**（設定が意図どおり読めているかの確認。v4.1 で値の二重定義が無くなったため突き合わせは不要になった） | 致命的 |
-| **D-19** | `/inbox` と `/queue` が読み書き可能。**inbox の滞留件数・容量、削除キューの未処理件数と最古の経過時間**を表示する | 警告（滞留が閾値超のとき） |
+| **D-18** | **Helper が稼働している**（`heartbeat.json` が `helper_heartbeat_max_age_seconds` 以内）。`mount_readonly`・Helper のバージョン・`config_error` の有無を表示する | 致命的 |
 
-**推定残り録音時間の算出基準**:
+**v5.0 で削除した D 検査 7 件と、その代替:**
 
-```text
-残り時間 = 本体の空き容量 ÷ (バイトレート × 生成 Variant 数)
-```
+| 削除 | 代替 |
+|---|---|
+| D-4 staging 使用量 | D-3 の `/data` 容量検査に含まれる（staging は `/data` の下。§11.2） |
+| D-5 Volume 一覧の理由別列挙 | **Helper 側の情報。**DH-13 が `helper.conf` の `INCLUDE_VOLUMES` / `EXCLUDE_VOLUMES` を表示する |
+| D-6 残り録音時間の推定 | **削除。**「推定残り録音時間の算出基準」も §19.2 から落とした（下記） |
+| D-14 出力フォルダ | D-13 に統合 |
+| D-15 failed / pending 件数 | `status`（§17.2） |
+| D-16 公開ポートと LLM エンドポイント | **DH-15 に統合。**`docker compose config` の出力を見るのはホスト側の仕事であり、コンテナ内から自分の公開ポートは確認できない |
+| D-19 inbox / queue の滞留 | `status`（§17.2）。**読み書き可否は H-9 が healthcheck で毎回見ている**（§19.1） |
 
-- **バイトレートと Variant 数は、直近に取り込んだ Part の実測から求める。**
-  バイトレートは `source_size_<variant> ÷ duration_seconds`、Variant 数は
-  `source_path_denoised` / `source_path_orig` のうち非 NULL の本数（§8.2）
-- 取り込み実績が 1 件も無い場合は、**安全側に 192,000 B/秒 × 2 Variant（＝ 384,000 B/秒）を仮定する**
-- 形式は設定で変わるため（§5.1）、固定値をハードコードしてはならない
+> **D-6（推定残り録音時間）を消した理由**: `source_size_<variant> ÷ duration_seconds` で
+> バイトレートを実測し、非 NULL の Variant 数を数えて掛ける、という算出基準を持っていた。
+> **`_orig` 固定（§5.3）で「Variant 数」という変数が消え、算出基準の半分が無意味になった。**
+> 残る半分（バイトレートの実測）だけを残しても、本体の空き容量は Helper が
+> `state/heartbeat.json` に書く値の転記であり、**VoiceDock が何かを判断する材料ではない。**
+> 接続頻度の見積りは §5.1 の表で足りる（1.4〜3.6 日）。
 
 削除モードが有効な場合の表示:
 
@@ -3955,22 +4024,27 @@ VoiceDock doctor
 | # | 検査 | 失敗時の扱い |
 |---|---|---|
 | DH-1 | `UseVirtualizationFramework == true`（§3.2） | **致命的**（中止） |
-| DH-2 | `docker model status` が running | 致命的（有効化手順を表示して中止） |
-| DH-3 | `docker compose version --short` が 2.38 以上。**バージョンを数値タプルとして比較する**（実機は 5.5.1。文字列の辞書順比較は将来のメジャー 10 系で誤判定する） | 致命的 |
-| DH-4 | Docker Desktop `AutoStart == true` | 警告 |
-| DH-5 | `.env` が存在し `OBSIDIAN_VAULT` が実在するディレクトリ | 致命的 |
-| DH-6 | `docker` コマンドが利用可能で、エンジンが起動している | 致命的 |
-| DH-7 | `helper.conf` の `MOUNT_MODE` が `ro`（安全ロック 2-B） | `rw` なら警告して確認を求める（§14.2） |
-| DH-8 | `config/config.yaml` が存在する（内容の検証はコンテナ内の D-1 が行う） | 致命的 |
-| DH-9 | Whisper モデルと VAD モデルが named volume に存在する | 無ければ `fetch-models.sh` の実行を案内 |
-| DH-10 | `docker compose config` が成功する（変数解決・構文の検証） | 致命的 |
-| DH-11 | `docker compose config` の出力に `ports:` が含まれない（§14.4 N-13） | 致命的 |
+| DH-10 | `docker compose config` が成功する（変数解決・構文の検証）。**`.env` の `OBSIDIAN_VAULT` が未設定なら `${OBSIDIAN_VAULT:?}` の解決に失敗するのでここで落ちる。解決できた値が実在するディレクトリであることも確認する**（存在しないパスを bind mount すると空ディレクトリが作られ、Vault が空だと誤認する。v5.0 で DH-5 を統合） | 致命的 |
 | **DH-12** | **`com.voicedock.ingest` の LaunchAgent が load されている**（`launchctl print gui/$UID/com.voicedock.ingest`） | 致命的（Helper が動かなければ録音は 1 本も取り込まれない） |
-| **DH-13** | `<VOICEDOCK_HOME>` が存在し `/Users` 配下である。`helper.conf` が存在し、**§7.4 の起動時検証 1〜7 を実行する**。`MOUNT_MODE` / `DELETE_SOURCE_AUDIO` / `INCLUDE_VOLUMES` / `EXCLUDE_VOLUMES` の値を表示する | 致命的 |
-| **DH-14** | **`<VOICEDOCK_HOME>/bin/voicedock-reaper` の有無を表示する**（ロック 2-A の状態） | 存在すれば警告表示 |
-| **DH-15** | `docker compose config` の出力に **`/Volumes` が含まれない**（§14.4 N-3） | 致命的 |
+| **DH-13** | `<VOICEDOCK_HOME>` が存在し `/Users` 配下である。`helper.conf` が存在し、**§7.4 の起動時検証 1〜7 を実行する**。`MOUNT_MODE` / `DELETE_SOURCE_AUDIO` / `INCLUDE_VOLUMES` / `EXCLUDE_VOLUMES` の値を表示する | `MOUNT_MODE=rw` なら警告して確認を求める（安全ロック 2-B。§14.2）。それ以外の違反は致命的 |
+| **DH-15** | `docker compose config` の出力に **`/Volumes` が含まれない**（§14.4 N-3）**かつ `ports:` が含まれない**（§14.4 N-13）。**v5.0 で DH-11 と D-16 を統合した** | 致命的 |
 
-実行順は `doctor.sh` に委ねる（DH-6 → DH-3 → DH-1 → DH-13 → DH-12 の順に前提が積み上がる）。**`doctor.sh` は検査のみを行い、ホスト設定の変更はしない。**
+実行順は `doctor.sh` に委ねる（DH-1 → DH-10 → DH-13 → DH-12 → DH-15 の順に前提が積み上がる）。**`doctor.sh` は検査のみを行い、ホスト設定の変更はしない。**
+
+**v5.0 で削除した DH 検査 10 件と、その代替:**
+
+| 削除 | 代替 |
+|---|---|
+| DH-2 `docker model status` が running | D-12（LLM へ実際にリクエストを投げる）。**疎通を試すほうが状態の照会より確実である** |
+| DH-3 compose のバージョン >= 2.38 | DH-10。古い compose では `docker compose config` が落ちる |
+| DH-4 Docker Desktop `AutoStart` | **削除。**利便性の設定であり、外れていても録音は失われない（次回起動時に取り込まれる） |
+| DH-5 `.env` と `OBSIDIAN_VAULT` | DH-10 に統合 |
+| DH-6 `docker` が利用可能 | DH-10。`docker compose config` が動けば自明である |
+| DH-7 `MOUNT_MODE` が `ro` | DH-13 に統合（同じ `helper.conf` を読む検査を 2 行に分けていた）。**D-17 もロック 2-B の状態を表示する** |
+| DH-8 `config/config.yaml` が存在 | `make up` のガードと D-1。**存在しなければコンテナが終了コード 2 で落ちるので黙って進まない** |
+| DH-9 モデルが named volume に存在 | D-8 / D-9。**コンテナ内から見るほうが正しい**（named volume の実体はホストから素直に見えない） |
+| DH-11 `ports:` が含まれない | DH-15 に統合 |
+| DH-14 reaper の有無（ロック 2-A） | D-17（三重ロックの 3 つすべてを表示する） |
 
 ---
 
@@ -3982,7 +4056,7 @@ VoiceDock doctor
 |---|---|
 | ファイル名パーサ | 正常形・`_orig` 付き・大文字拡張子・不正形・境界値（`MIC000` / `MIC999` / `TX00`） |
 | フォルダ名パーサ | 同上 |
-| Variant ペアリング | 両方あり / denoised のみ / orig のみ / 同名衝突 |
+| Variant の選別（§5.3） | `_orig` あり → 登録 / `_orig` なし → `part_skipped reason=variant_not_orig` / 同名衝突 / **denoised が削除対象に入らないこと** |
 | デバイス判定 | **Helper 層で検証する**（§20.4 と同じ枠組みで `bash helper/voicedock-ingest` を `tmp_path` の偽 `/Volumes` に対して実行）。DJI 形式あり / なし / **`INCLUDE_VOLUMES` が空なら素通り・非空なら一致のみ通す** / **glob として評価されること**（`.*` が全件に一致しない） / **空白を含むボリューム名が 1 パターンとして扱われること** / 深さ制限 |
 | 安定性判定 | **Helper 層で検証する。**バッチ判定 / `STABILITY_FAST_PATH_SECONDS` による即断 / size 変化 / mtime 変化 / 途中で変化して再カウント |
 | セッション分組 | 同一日で結合 / 日境界で分割（23:50 開始 30 分の Part） / デバイス違い / `session_id IS NULL` のみ対象 / 再オープン |
@@ -3991,7 +4065,7 @@ VoiceDock doctor
 | 空き容量計算 | 境界値 |
 | 状態遷移 | 全遷移の可否、不正遷移の拒否、ガード条件、終端状態の判定 |
 | クラッシュリカバリ | 各 `*ING` 状態からの巻き戻し / 過去日の `OPEN` の確定 |
-| リトライ | backoff の回数と待機秒 / **工程通過で `retry_count` がリセットされること** / 自動再試行の対象外コード |
+| リトライ | backoff の回数と待機秒 / **工程通過で `retry_count` がリセットされること** / **再接続の立ち上がりで `FAILED` が `retry_count = 0` で再投入されること** / **inventory が非空のまま続くループでは再投入されないこと**（毎周回の空回りを防ぐ） |
 | JSON 抽出 | 素の JSON / コードフェンス付き / 前後に説明文 / `<think>` 付き / 壊れた JSON |
 | スキーマ生成 | `sections` の on/off がプロンプト・Pydantic スキーマ・レンダリングに一貫して反映される |
 | Pydantic 検証 | 必須欠落 / 型不一致 / `extra` 混入 / 長さ超過 |
@@ -4098,7 +4172,7 @@ fixture の WAV は **実機と同じ 48 kHz / 24 bit PCM / モノラル**（144
 | ND-18 | 削除直前にファイルサイズが変わる | `target_is_identical` が偽 | 元音声が残る。`SOURCE_IDENTITY_MISMATCH` |
 | ND-19 | 削除直前に mtime が変わる | 同上 | 元音声が残る |
 | ND-20 | 対象パスがデバイスのルート外（対象自身が symlink / **経路の途中に symlink（`/Volumes/Macintosh HD` 経由など）**） | パス封じ込めが偽 | 元音声が残る。**他ボリュームのファイルに触れない** |
-| ND-21 | Part を 0 件持つ Session / Variant パスが空 | 空集合を真にしない条件が偽 | 削除が起きない |
+| ND-21 | Part を 0 件持つ Session / `source_path_orig` が `NULL` または空文字 | 空集合・空文字を真にしない条件が偽 | 削除が起きない |
 | ND-22 | `delete_source_audio: false`（`config.yaml` / `helper.conf` のどちらか一方だけでも） | ロック 1 が偽 | 元音声が残る。要求が書かれない、または reaper の検証 1 で拒否 |
 | ND-23 | `MOUNT_MODE=ro`（`heartbeat.json` の `mount_readonly` が真） | ロック 2-B が偽 | 元音声が残る。reaper の検証 2 で拒否。**実機では OS レベルでも不可**（`docs/POC.md` §4.1 で実証済み） |
 | **ND-24** | 要求の `relpath` に `../` を仕込む | 検証 4 が偽 | 元音声が残る。**ボリューム外のファイルに触れない** |
@@ -4137,9 +4211,9 @@ cp config/config.example.yaml config/config.yaml
 make up                      # = docker compose up -d --build
 ```
 
-`doctor.sh` は **初回セットアップ検査と環境診断を兼ねる。検査のみを行い、ホスト設定の変更はしない。**検査項目は §19.2 の DH-1〜DH-11 に一本化した。
+`doctor.sh` は **初回セットアップ検査と環境診断を兼ねる。検査のみを行い、ホスト設定の変更はしない。**検査項目は §19.2 の DH 表（5 件）に一本化した。
 
-起動後に再度 `./scripts/doctor.sh` を実行すると、DH-1〜DH-15 に続けてコンテナ内の D-1〜D-19 が実行される。
+起動後に再度 `./scripts/doctor.sh` を実行すると、ホスト側の DH 5 件に続けてコンテナ内の D 12 件が実行される（合計 17）。
 
 > **`helper/install.sh` を飛ばすと録音は 1 本も取り込まれない。**コンテナは正常に起動して
 > 正常に見え続けるため、この失敗は気づきにくい。DH-12 と H-8 がこれを検出する（§22 R-23）。
@@ -4153,7 +4227,7 @@ make up                      # = docker compose up -d --build
 | **Phase 2** | 文字起こし | whisper.cpp で日本語 transcript 生成。VAD が機能する。**1 日分（16 時間）を 8 時間以内に処理しきることを実測で確認**（未達なら `medium-q5_0` → `small-q5_1` と落とす） |
 | **Phase 3** | LLM | Docker Model Runner へ疎通。JSON スキーマ検証が通る。repair が機能する。**1 日分（約 350,000 文字 / 約 18 チャンク）を 30 分以内に Map-Reduce 処理できる** |
 | **Phase 4** | Obsidian 出力 | Raw / Daily の 2 層が生成される。atomic write と §13.7 の保存検証。Obsidian で正しく表示され、`[[]]` が既存ノートにのみ張られる。**再生成でファイルが増殖しない** |
-| **Phase 5** | 状態管理 | SQLite による再開・リトライ・二重処理防止。§9.4 のクラッシュリカバリ。Docker 再起動で途中から再開する。**工程通過で `retry_count` がリセットされる。`FAILED` が 24 時間後に自動再試行される** |
+| **Phase 5** | 状態管理 | SQLite による再開・リトライ・二重処理防止。§9.4 のクラッシュリカバリ。Docker 再起動で途中から再開する。**工程通過で `retry_count` がリセットされる。`FAILED` がデバイス再接続で再投入される** |
 | **Phase 6** | 終日運用 | 16 時間連続録音が日境界で 1 セッションにまとまり、Daily 1 枚 + Raw 1 枚になる。Timeline から時間帯を辿れる。**無音 Part と失敗 Part があってもセッションが止まらない**（E2E-06〜E2E-09 が PASS） |
 | **Phase 7** | 自動削除 | **§20.4 の ND-01〜ND-30 が全件 PASS** かつ **E2E-01〜E2E-12 が全件 PASS** した後にのみ、三重ロック（§14.2）を解除する |
 | **Phase 8** | 運用 | health / doctor / logs / recovery / 更新手順が揃う |
@@ -4177,15 +4251,15 @@ docker compose up -d        # config.yaml の再読み込み
 ./scripts/doctor.sh
 
 # 4. Phase 1〜6 で処理済みの録音を後追いで削除する
-docker compose exec voicedock voicedock cleanup --backlog --dry-run
-docker compose exec voicedock voicedock cleanup --backlog
+#    ★v5.0 で `cleanup` を削除したため、この経路は未実装である（#38）。
+#      Phase 7 へ移行する時点で必要なら #38 で足す
 ```
 
 > **(a) と (b) は両方必要である**（V-30）。片方だけでは reaper が検証 1 で拒否する。
 > **(c) を忘れると要求はキューに溜まるだけで何も起きない。**これは事故ではなく設計どおりの挙動で、
-> `doctor` の DH-14 が `voicedock-reaper is NOT installed` と表示する。
+> `doctor` の D-17 が `lock 2-A: voicedock-reaper is NOT installed` と表示する。
 
-手順 4 が必要な理由: 削除 OFF の期間に処理した Part は `COMPLETED` で終わっており、通常フローでは削除対象にならない。1 日で本体が満杯になる運用では、この後追い経路が無いと溜まった録音を消せない（§17.1）。
+手順 4 が必要な理由: 削除 OFF の期間に処理した Part は `COMPLETED` で終わっており、通常フローでは削除対象にならない。本体が数日で満杯になる運用では、この後追い経路が無いと溜まった録音を消せない。**v5.0 は入口（`cleanup` コマンド）を削除した**ので、Phase 7 へ移る時点で #38 として足す。`COMPLETED → SOURCE_DELETING` の遷移は §9.3 に残してあるため、必要なのは入口だけである（§17.1）。
 
 ### 21.3 MVP 完成条件と対応箇所
 
@@ -4195,7 +4269,7 @@ docker compose exec voicedock voicedock cleanup --backlog
 | 2 | Mac へ FFmpeg をインストールしなくてよい | §3.3, §18.3 |
 | 3 | VoiceDock は Docker コンテナとして動く | §18.2, §18.3 |
 | 4 | Docker Desktop 起動後に自動起動する | §3.4(2), §18.2 `restart: unless-stopped`, §18.4 |
-| 5 | 他プロジェクトとポートが衝突しない | §14.4 N-13, §18.2, §19.2 D-16 |
+| 5 | 他プロジェクトとポートが衝突しない | §14.4 N-13, §18.2, §19.2 DH-15 |
 | 6 | DJI Mic 3 を自動検出できる | §5.4, §10.1, §10.2 |
 | 7 | 新規 WAV のみ処理できる | §8.2 の UNIQUE インデックス, §10.2, §10.5 |
 | 8 | 取り込みの整合性を検証する | §10.5（変換結果の形式・長さ検証）, §14.1 |
@@ -4231,12 +4305,12 @@ docker compose exec voicedock voicedock cleanup --backlog
 | R-6 | **送信機 2 台使用時の見え方** | Volume が 2 個か 1 個かで走査範囲が変わる | P0-10 で検証。Session は device_id + 日付で分かれるため、Volume が 2 個なら Daily ノートも 2 枚になる |
 | R-7 | **受信機（RX）側ストレージ** | 取り込み対象に含めるべきか未確定 | P0-12 で調査のみ。MVP のスコープ外（§1.6） |
 | R-8 | **`_orig` / denoised の実際の生成有無** | 設定によっては片方しか生成されない | §5.3 でどちらのケースも扱えるよう設計済み。P0-4 / P0-13 で確認 |
-| R-9 | **ディスク使用量** | inbox / staging が溢れると処理が止まる | v4.0 で原本コピーが復活した（§5.6.3）。1 日に流れる量は約 10 GB だが、**inbox の原本は `NORMALIZED` 後に即削除する**ため常駐使用量は数 GB（`import.inbox_retain: normalized`）。`staging_max_bytes: 5 GiB` は異常時の歯止め。滞留は D-19 が検出する |
+| R-9 | **ディスク使用量** | inbox / staging が溢れると処理が止まる | v4.0 で原本コピーが復活した（§5.6.3）。1 日に流れる量は約 10 GB だが、**inbox の原本は `NORMALIZED` 後に即削除する**ため常駐使用量は数 GB（`import.inbox_retain: normalized`）。`staging_max_bytes: 5 GiB` は異常時の歯止め。滞留は `status` が表示し、`/inbox` の読み書き可否は H-9 が見る |
 | R-10 | **原本音声の完全削除**（§1.4 で受容） | 文字起こしに誤りがあっても聞き直せない | §14.1 の厳格な条件、§14.2 の二重ロック、§20.4 の削除禁止テスト群で補う。**Raw ノートにより文字起こし本文は必ず残る** |
 | R-11 | **whisper.cpp のバージョン固定** | 未知の回帰の可能性 | `ARG WHISPER_CPP_REF` で固定。問題があれば 1 つ前の tag へ戻す |
 | R-12 | **Docker Model Runner の API 仕様変更 / モデルタグの変動** | LLM 呼び出しが壊れる | OpenAI 互換部分のみに依存する。タグは 2026-09-12 に Docker Hub で実在を確認済み（`ai/qwen3:30b-a3b-instruct-2507-q4_K_M`）。Model Runner 自体の疎通は #13 と `doctor` の D-12 で検証する |
 | R-13 | **Obsidian の同期中（iCloud / Obsidian Sync）にファイルを書く競合** | 部分的なファイルが同期される | atomic write（§13.6）と `.` 始まりの一時ファイル名で緩和。完全な回避は不可 |
-| R-14 | **DJI 本体の容量**（使用可能 30.0 GB。設定により 22〜58 時間） | 設定によっては 1.4 日で満杯になり録音が止まる | `status` / `doctor` に残容量と推定残り録音時間を表示（§17.2, D-6）。**検証機の現設定（24 bit・`_orig` のみ）では 3.6 日分の余裕がある**が、32 bit float・両 Variant では 1.4 日しか持たない（§5.1）。P0-13 で `_orig` 保存をオフにできるかを確認する |
+| R-14 | **DJI 本体の容量**（使用可能 30.0 GB。設定により 22〜58 時間） | 設定によっては 1.4 日で満杯になり録音が止まる | `status` に本体の残容量を表示する（Helper が `state/heartbeat.json` に書いた値の転記。§17.2）。**推定残り録音時間の算出は v5.0 で D-6 ごと廃止した**（`_orig` 固定で「Variant 数」の変数が消え、接続頻度は §5.1 の表で足りる）。**検証機の現設定（24 bit・`_orig` のみ）では 3.6 日分の余裕がある**が、32 bit float・両 Variant では 1.4 日しか持たない（§5.1）。**さらに v5.0 は denoised を削除しない**（§5.3）ため、denoised が生成される設定では本体が埋まり続ける。P0-13 で `_orig` 保存をオフにできるかを確認する |
 | R-15 | **無音区間の幻覚**（whisper が定型文を生成する既知の挙動） | 要約に実在しない内容が混ざる | VAD で緩和するが完全には消えない。Raw ノートに原文が残るため検証は可能。プロンプトでも「存在しない事実を追加しない」を指示（§12.5） |
 | R-16 | **処理の遅延蓄積** | 1 日 32 Part の直列処理が追いつかないと未処理が溜まる | `status` に「未処理 Part の合計時間」を表示して可視化（§17.2）。閾値超過時は Whisper モデルを下げる |
 | R-17 | **失敗 Part を除外して進む設計** | 1 日のノートが一部欠けたまま確定する | 欠落を隠さず frontmatter（`voicedock_failed_parts`）と本文の警告行に明記する（§13.4）。欠落分の音声は削除されない。復旧後は再オープンで作り直される |
@@ -4248,7 +4322,7 @@ docker compose exec voicedock voicedock cleanup --backlog
 | R-23 | **Helper が停止しても、コンテナは正常に見え続ける** | 録音が 1 本も取り込まれないまま何日も気づかない。**無人稼働では最も起きやすい沈黙** | `heartbeat.json` を **H-8 で unhealthy 条件にする**（§19.1）。`doctor` D-18 と DH-12 でも検査。`status` に Helper の状態を常時表示（§17.2） |
 | R-24 | **削除の判断（コンテナ）と実行（reaper）がテスト境界をまたぐ** | 境界のどちらかだけをテストしても安全性を保証できない | §20.4 を 2 層に分け、境界そのものを狙う ND-24〜ND-30 を追加。reaper を POSIX bash に限定して **CI で実行可能**にした（§14.4 N-19） |
 | R-25 | **`diskutil mount readOnly` による再マウントが失敗する**（他プロセスが使用中など） | ロック 2-B が掛からないまま運用が続く | **失敗は安全側へ倒す。**ingest は取り込みを続行しつつ `heartbeat.json` に `mount_readonly: false` を書き、**reaper が検証 2 で削除を拒否する**（§14.2）。`doctor` D-18 が表示 |
-| R-26 | **Helper（bash）とコンテナ（Python）で §5.4 / §10.3 の規則が二重実装になる** | 食い違うと検出漏れが無言で起きる | **値の二重定義は v4.1 で解消した**（検出系の設定は `helper.conf` にのみ存在する。§7.4）。残るのは**規則の二重実装**だけで、**§5.4 / §10.3 の記述が唯一の規範**。`doctor` D-18 が Helper の実効値を表示し、D-5 が除外理由を列挙する |
+| R-26 | **Helper（bash）とコンテナ（Python）で §5.4 / §10.3 の規則が二重実装になる** | 食い違うと検出漏れが無言で起きる | **値の二重定義は v4.1 で解消した**（検出系の設定は `helper.conf` にのみ存在する。§7.4）。残るのは**規則の二重実装**だけで、**§5.4 / §10.3 の記述が唯一の規範**。`doctor` の DH-13 が `helper.conf` の実効値を表示する |
 
 ---
 
@@ -4268,7 +4342,32 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 ---
 
-## 付録 A. v4.5 から v4.6 への主な変更点
+## 付録 A. v4.6 から v5.0 への主な変更点
+
+**本筋は「USB 接続 → 文字起こし → LLM 要約 → Obsidian へ 2 枚のノート → 元音声を削除」である。**
+v5.0 はこの筋に必須でない付属機能と、v3.x から残っていた残骸を落とした。
+**削除の安全設計（§14.1 の論理式・§14.1.1 の 11 項目検証・§14.2 の三重ロック）は 1 文字も変えていない。**
+
+| 数えたもの | v4.6 | v5.0 |
+|---|---|---|
+| CLI サブコマンド | 11 | **5** |
+| doctor の検査 | D-19 + DH-15 = 34 | **D-12 + DH-5 = 17** |
+| ログのイベント名 | 68 | **28** |
+| `config.yaml` のキー | 110 | **107** |
+| V 規則（有効） | 29 | **28**（V-2 を廃止） |
+| `recordings` の使用中の列 | 30 | **24**（6 列が常に NULL / 0 になる） |
+
+| # | 変更 | 理由 |
+|---|---|---|
+| L-1 | **`_orig` 固定**（§1.2, §2, §5.2, §5.3, §7.2, §10.2, §10.5, §11.1, §14.1, §14.1.1, §20.2） | `docs/POC.md` §6.2 の実測では録音 2 本とも denoised が生成されなかった。**denoised の経路は一度も実物で動かしておらず、それを削除処理の手前に置くほうが危険**である。列 5 つ・分岐 3 つ・設定キー 1 つが消えた。**denoised を「読まずに消す」ことはしない**（§14.1 の根拠が「その音声の文字起こしが Vault に残っていること」なので、読まなかったファイルを消す根拠が無い）。代償として、denoised が生成される設定では本体が埋まり続ける（§22 R-14 に明記した） |
+| L-2 | **自動再試行を「接続時の無条件再評価」へ**（§9.3, §10.0, §15.2, §17.1） | v4.6 は 24 時間タイマー + 3 ラウンド上限 + `voicedock retry` の 3 点構成で、**上限に達した行は原因が直っても人が手を動かすまで永久に戻らなかった。**v5.0 は `FAILED` を「デバイス再接続」と「サービス起動」で `retry_count = 0` にして無条件に再投入する。デバイスを繋ぐのは人の操作なので、それ自体が自然な再試行間隔になる。設定 2 つ・列 1 つ・CLI 1 本が消えた |
+| L-3 | **`auto_retry_exempt` の概念を廃止**（§11.1, §15.2） | v4.6 は「自動再試行の対象外」として設定エラー系・`DUPLICATE_CONTENT`・`NO_SPEECH_DETECTED`・`SOURCE_MISSING` を除外していた。**この 4 系統はどれも `FAILED` にならない**（設定エラーは起動中止、残りは `SKIPPED`。§15.1 の遷移先列）。**`FAILED` だけを再評価する規則のもとでは、除外リストが指すものが存在しない。**`ErrorSpec` が 4 フィールドから 3 フィールドになる |
+| L-4 | **CLI を 11 本から 5 本へ**（§17.1, §17.2） | `history` / `show` は `events` テーブル（§8.4）を SQL で読めば足り、CLI に整形表示を持つと §17.2 の出力例と実装の二重管理になる。`pending` は `status` が引き受ける。`scan` は走査が Helper へ移って用途を失った（v4.1）。`retry` は L-2 で不要になった。`cleanup` は Phase 7 の移行でだけ要るので #38 で足す（`COMPLETED → SOURCE_DELETING` の遷移表は残してある）。**`health` は `compose.yaml` の healthcheck が呼ぶので残す** |
+| L-5 | **doctor を 34 検査から 17 検査へ**（§3.1, §3.2, §6, §8.1, §19.2, §21.1, §21.2, §22） | 削ったのは (a) 表示のための検査（D-5 / D-6 / D-15 / D-19 → `status`）、(b) 他の検査から自明なもの（DH-3 / DH-6 → DH-10、DH-9 → D-8 / D-9、DH-2 → D-12）、(c) 同じ対象を 2 行で見ていたもの（D-14 → D-13、DH-7 → DH-13、DH-11 / D-16 → DH-15）。**Helper の死の検知（H-8 / D-18 / DH-12）と削除モードの表示（D-17）は残した。**前者が抜けると「Helper が止まっているのに新しい録音が無いと解釈して静かに待つ」状態になり（§22 R-23）、後者は Phase 7 の事故防止そのものである。**番号は詰めない**（§7.3 の V 規則と同じ方針） |
+| L-6 | **ログのイベント名を 68 件から 28 件へ**（§16.2, §16.4） | 原則を「1 工程につき完了 1 件 + 失敗 1 件。開始イベントは出さない。状態遷移は `events` テーブルが持つのでログに二重で並べない」と明文化し、細かい分岐は `reason=` / `error_code=` のフィールドへ移した。**うち 9 件（`device_*` 5 件・`deep_scan_*` 3 件・`file_not_stable`）は純粋な v3.x の残骸**で、v4.0 で検出が、v4.1 で走査が Helper へ移ったのに一覧だけ更新されていなかった。**コンテナはデバイスを見ないので、これらを出せるコードは書けない**（§11.1 の `DevicePath`） |
+| L-7 | **スキーマは変えない**（§8.2, §8.3） | `*_denoised` 5 列・`primary_variant`・`auto_retry_rounds` は v5.0 で使わなくなったが、**列は残して「常に NULL / 0」と注記した。**理由は §8.5 が破壊的変更を禁じており（`recordings.id` の同一性に削除可否を賭けているため）、いま列を落とすには `0001_initial.sql` の書き直しが要る。**ストア方式（SQLite かファイルか）を T-52 で決める前に書き直すと、二度作ることになる。**#16（Part 登録）に着手する前に T-52 を決め、そのときに 1 回だけ作り直す |
+
+## 付録 B. v4.5 から v4.6 への主な変更点
 
 v4.6 は、**状態機械の内部整合を取る**改訂である。SPEC を parse して図と表を突き合わせた
 結果として見つかった食い違いを直した。**§14.1 の論理式そのものは変えていない**（参照する
@@ -4283,7 +4382,7 @@ v4.6 は、**状態機械の内部整合を取る**改訂である。SPEC を pa
 
 ---
 
-## 付録 B. v4.4 から v4.5 への主な変更点
+## 付録 C. v4.4 から v4.5 への主な変更点
 
 v4.5 は、**スキーマ v1 を確定させる**改訂である。§8.5 が破壊的変更を禁じているため、
 **v1 に入れ損ねた制約は後から安全に足せない。**§14 の削除設計には触れていない。
@@ -4295,7 +4394,7 @@ v4.5 は、**スキーマ v1 を確定させる**改訂である。§8.5 が破�
 
 ---
 
-## 付録 C. v4.3 から v4.4 への主な変更点
+## 付録 D. v4.3 から v4.4 への主な変更点
 
 v4.4 は、**テスト fixture の形式と組み立て方式を実測へ合わせる**改訂である。
 **規則そのものは 1 つも変えていない。**変更範囲はテスト仕様だけである。
@@ -4309,7 +4408,7 @@ v4.4 は、**テスト fixture の形式と組み立て方式を実測へ合わ�
 
 ---
 
-## 付録 D. v4.2 から v4.3 への主な変更点
+## 付録 E. v4.2 から v4.3 への主な変更点
 
 v4.3 は、**パス封じ込めの API を本文へ明記する**改訂である。実装が §14.1.1 のコードを
 各モジュールでインライン展開する余地を消すことが目的で、**規則そのものは 1 つも変えていない。**
@@ -4324,7 +4423,7 @@ v4.3 は、**パス封じ込めの API を本文へ明記する**改訂である
 
 ---
 
-## 付録 E. v4.1 から v4.2 への主な変更点
+## 付録 F. v4.1 から v4.2 への主な変更点
 
 v4.2 は、**§7.3 の検証規則を実装可能な形へ整え、Helper からコンテナへの報告形式を明文化する**
 改訂である。**§14 の削除設計には一切触れていない。**
@@ -4337,12 +4436,13 @@ v4.2 は、**§7.3 の検証規則を実装可能な形へ整え、Helper から
 | G-4 | **V-32 を新設**（§7.3） | `timezone` は §8.2 / §10.4 / §16 が使う中核の値なのに検証規則が無く、**タイポが実行時の未処理例外**になっていた |
 | G-5 | **§19.2 に行の書式と記号を規定**（§19.2） | 出力例に `[✓]` と `[!]` しか現れず、失敗と skip の記号・ラベル桁・続き行の桁が未定義だった。実装者ごとに揃わない |
 
-> **§19.2 の出力例のサマリ（`16 checks passed`）は v3.x 当時の数字で、例に並ぶ行数と合っていない。**
+> **§19.2 の出力例のサマリは v4.2 時点で v3.x 当時の数字（`16 checks passed`）のままだった。**
+> v5.0 で検査を 17 件へ絞ったとき、例と行数を合わせた（`12 checks passed, 0 failed, 1 notice`）。
 > 例そのものは doctor の総仕上げ（#34）で実出力へ差し替える。
 
 ---
 
-## 付録 F. v4.0 から v4.1 への主な変更点
+## 付録 G. v4.0 から v4.1 への主な変更点
 
 v4.1 は、**走査対象の許可リストを追加し、あわせて v4.0 が残した設定の積み残しを解消する**改訂である。
 **§14 の削除設計には一切触れていない。**変更範囲は検出側だけである。
@@ -4364,7 +4464,7 @@ v4.1 は、**走査対象の許可リストを追加し、あわせて v4.0 が�
 
 ---
 
-## 付録 G. v3.4 から v4.0 への主な変更点
+## 付録 H. v3.4 から v4.0 への主な変更点
 
 v4.0 は、**#2 の実機検証で現行アーキテクチャが成立しないと判明したことを受けた構成変更**である。
 
@@ -4391,7 +4491,7 @@ Obsidian 出力）、状態機械の骨格、設定項目の意味。
 
 ---
 
-## 付録 H. v3.3 から v3.4 への主な変更点
+## 付録 I. v3.3 から v3.4 への主な変更点
 
 v3.4 は、**#2（Phase 0 PoC）で DJI Mic 3 の実機から得た測定値を反映する**ことだけを目的とした改訂である。
 **機能・安全設計・設定項目は 1 つも変えていない。**実測値の出典はすべて `docs/POC.md` §6。
@@ -4412,7 +4512,7 @@ v3.4 は、**#2（Phase 0 PoC）で DJI Mic 3 の実機から得た測定値を�
 
 ---
 
-## 付録 I. v3.2 から v3.3 への主な変更点
+## 付録 J. v3.2 から v3.3 への主な変更点
 
 v3.3 は、**実装に着手する前に、仕様書に残っていた事実誤りと仕様内の不整合を潰す**ことだけを目的とした
 改訂である。**処理の内容・安全設計・設定項目の意味は 1 つも変えていない**（追加は V-27 と
@@ -4437,7 +4537,7 @@ v3.3 は、**実装に着手する前に、仕様書に残っていた事実誤�
 
 ---
 
-## 付録 J. v3.1 から v3.2 への主な変更点
+## 付録 K. v3.1 から v3.2 への主な変更点
 
 v3.2 は、**実装に着手する前に「個人用途に対して過剰な構造」を削る**ことだけを目的とした改訂である。
 **機能・安全設計・設定項目は 1 つも削っていない。**処理の内容が変わる変更は含まれない。
@@ -4463,13 +4563,13 @@ v3.2 は、**実装に着手する前に「個人用途に対して過剰な構�
 | ファイル名 sanitize の縮小（§13.5） | **LLM 生成タグが frontmatter に入る経路を守るため。**制御文字が混ざると §13.7 の W-5 / W-6 が落ち、LLM は同じタグを再生成するのでリトライも効かず、その日の Daily ノートが恒久的に作れなくなる（§1.3 優先順位 2 の違反） |
 | 設定キーの定数化 | `src/` は §18.3 でイメージへ COPY されるため、定数化した値の変更には `--build` が必要になる。設定のままなら「ホストで編集 → 再起動」で済む |
 | `events` テーブルの縮小（§8.4） | §16.1 のログは 10 MB × 3 でローテートするため、不可逆操作の痕跡が数日で消える |
-| 自動再試行機構の廃止（§15.2） | 1 日 32 Part の運用で、失敗のたびに人が `retry` を打つのは現実的でない |
+| ~~自動再試行機構の廃止（§15.2）~~ | **v5.0 で判断を変えた。**機構そのものは残すが、24 時間タイマーとラウンド上限を捨て「**デバイス再接続とサービス起動で `FAILED` を無条件に再投入する**」形へ単純化した。人が `retry` を打たずに済むという要件は満たしたまま、設定 2 つ・列 1 つ・CLI 1 本が消えた（付録 A L-2） |
 | `health` と healthcheck の廃止（§19.1） | 無人稼働が前提のため、`docker ps` で異常が見えることに価値がある |
-| §10.1 の 2 段スキャンの単純化 | P0-15（1 日分 64 ファイルでの走査時間の実測）の結果を見てから判断する |
+| ~~§10.1 の 2 段スキャンの単純化~~ | **v4.1 で走査ごと Helper へ移り、v5.0 で #15 を close して決着した。**コンテナ側の `/inbox` 走査は 1 段（`poll_interval_seconds` の scandir）だけである |
 
 ---
 
-## 付録 K. v3.0 から v3.1 への主な変更点
+## 付録 L. v3.0 から v3.1 への主な変更点
 
 v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間録り続ける」へ変わった**ことを起点に全面改訂したものである。
 
@@ -4506,7 +4606,7 @@ v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間
 
 ---
 
-## 付録 L. 参考資料
+## 付録 M. 参考資料
 
 Docker 公式ドキュメントを実装時の一次資料とする。
 
