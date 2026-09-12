@@ -21,8 +21,6 @@ from tests.helpers import REPO_ROOT
 from tests.spec_sync import spec_retry_reset_statuses, spec_schema_sql
 from voicedock import db
 from voicedock.db import (
-    FAILED_STATUS,
-    RETRY_RESET_STATUSES,
     SCHEMA_VERSION,
     Database,
     EntityType,
@@ -35,6 +33,7 @@ from voicedock.db import (
     truncate,
 )
 from voicedock.log import MAX_VALUE_CHARS
+from voicedock.states import FAILED_STATUS, RETRY_RESET_STATUSES
 
 NOW = datetime(2026, 9, 13, 9, 0, 0)
 
@@ -406,7 +405,10 @@ def test_insert_writes_the_first_event(database: Database) -> None:
 
 
 def test_retry_count_reset_statuses_match_spec() -> None:
-    """`RETRY_RESET_STATUSES` が §15.2 の名指しと一致すること。"""
+    """`RETRY_RESET_STATUSES` が §15.2 の名指しと一致すること。
+
+    定数の出所は `states.py` である（#11 で `db.py` から移した）。
+    """
     assert spec_retry_reset_statuses() == set(RETRY_RESET_STATUSES)
 
 

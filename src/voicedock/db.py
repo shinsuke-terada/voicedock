@@ -13,6 +13,7 @@
    **ノートの ID 42 と DB の ID 42 が別の Part を指しうる**。
 
 `config` を import しない。`busy_timeout_ms` と `tz` は引数で受ける（`paths.py` と同じ方針）。
+**状態名の文字列は持たない。**`states.py` が唯一の出所である（§9）。
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Any, Final, Self
 
 from voicedock.log import MAX_VALUE_CHARS
+from voicedock.states import FAILED_STATUS, RETRY_RESET_STATUSES
 
 SCHEMA_VERSION: Final = 1
 MIGRATIONS_PACKAGE: Final = "voicedock.migrations"
@@ -36,18 +38,6 @@ DEFAULT_BUSY_TIMEOUT_MS: Final = 10000
 
 TRUNCATION_MARKER: Final = "…"
 """切り詰めた印。`MAX_VALUE_CHARS` を含めた長さに収める。"""
-
-FAILED_STATUS: Final = "FAILED"
-
-RETRY_RESET_STATUSES: Final[frozenset[str]] = frozenset(
-    {"NORMALIZED", "TRANSCRIBED", "RAW_SAVED", "MERGED", "ANALYZED", "SAVED"}
-)
-"""§15.2「工程を通過したら `retry_count` を 0 にリセットする」で名指しされた状態。
-
-Part（`NORMALIZED` / `TRANSCRIBED` / `RAW_SAVED`）と Session（`MERGED` / `ANALYZED` /
-`SAVED`）の両方を含む。工程をまたいで累積させると、前段で 2 回失敗した行が後段の
-1 回の失敗で打ち切られてしまう（§15.2）。
-"""
 
 
 class EntityType(StrEnum):
