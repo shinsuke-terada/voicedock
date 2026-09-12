@@ -11,6 +11,7 @@ AST で検査しており、他のモジュールが `Path.unlink()` を書い�
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 from pathlib import Path, PurePosixPath
@@ -32,6 +33,22 @@ StagingPath = NewType("StagingPath", Path)
 
 VaultPath = NewType("VaultPath", Path)
 """`/obsidian` 配下。**削除しない**（`os.replace()` で上書きするだけ）。"""
+
+PartKey = NewType("PartKey", str)
+"""Part の恒久識別子（§8.1）。`<device_id>/<source_folder>/<filename>`。
+
+**`partkey_for()` だけがこれを作る。**呼び出し側で文字列を連結してはならない。
+
+`SessionKey` と別の型にしてあるのは、取り違えを型検査で止めるためである。
+`str` のままだと `get_recording(session_key)` が通ってしまう。
+"""
+
+SessionKey = NewType("SessionKey", str)
+"""Session の恒久識別子（§8.3）。`<device_id>:<YYYYMMDD>`。
+
+算出規則は §8.3 が持つ（`session.py` / #17 が作る）。このモジュールは
+`key_slug()` で受けるだけで、組み立てない。
+"""
 
 # コンテナのマウント点（§18.2 の compose.yaml と一致させる）。
 # 設定ではない。config.yaml から取らない — 設定で緩められる安全柵は柵ではない。
@@ -98,6 +115,74 @@ def is_safe_relpath(rel: PurePosixPath) -> bool:
         if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in part):
             return False
     return True
+
+
+# --- 恒久識別子（§8.1） --------------------------------------------------
+
+
+def partkey_for(device_id: str, rel: DevicePath) -> PartKey:
+    """Part の恒久識別子を作る。`f"{device_id}/{rel}"`（§8.1）。
+
+    **この算出規則を変えることが §8.5 の唯一の禁則である。**返す値はノートの
+    frontmatter（`voicedock_recording_keys`。§13.3）に載り、§14.1 の削除条件は
+    「ノートがこの鍵を含むか」だけを見る。規則を変えると、既に保存したノートの鍵と
+    食い違い、**それ以前に保存した録音が永久に削除対象にならない**（偽に倒れるので
+    削除事故にはならないが、削除が止まる）。
+
+    `tests/unit/test_paths.py::test_partkey_is_pinned` が固定入力に対する結果を
+    バイト単位で固定している。**その値を書き換えるときは上を読んだうえで行うこと。**
+
+    Raises:
+        ValueError: `device_id` が空 / `/` を含む / `.` で始まる、または
+            `is_safe_relpath(rel)` が偽のとき。**鍵を組み立てる前に弾く** —
+            壊れた鍵がノートへ載ってしまうと、あとから直す手段が無い。
+    """
+    if not device_id:
+        raise ValueError("device_id が空です")
+    if "/" in device_id:
+        raise ValueError(
+            f"device_id に '/' を含められません（鍵の区切りと衝突する）: {device_id!r}"
+        )
+    if device_id.startswith("."):
+        raise ValueError(f"device_id が '.' で始まっています: {device_id!r}")
+    if not is_safe_relpath(rel):
+        raise ValueError(f"relpath が健全ではありません（§14.4 N-17）: {rel!r}")
+    return PartKey(f"{device_id}/{rel}")
+
+
+def device_id_of(key: PartKey) -> str:
+    """`partkey` の `device_id` 部分（最初の `/` より前）。"""
+    device_id, separator, _rest = key.partition("/")
+    if not separator:
+        raise ValueError(f"partkey に '/' がありません: {key!r}")
+    return device_id
+
+
+def relpath_of(key: PartKey) -> DevicePath:
+    """`partkey` の relpath 部分（最初の `/` より後）。
+
+    **戻り値は `DevicePath`（`PurePosixPath`）なので `open()` も `stat()` も書けない。**
+    削除要求へ載せるためだけに使う（§14.1.1）。
+    """
+    _device_id, separator, rest = key.partition("/")
+    if not separator:
+        raise ValueError(f"partkey に '/' がありません: {key!r}")
+    return DevicePath(PurePosixPath(rest))
+
+
+def key_slug(key: PartKey | SessionKey) -> str:
+    """鍵をファイル名に使うための派生値。`sha256(key)[:16]`（§11.2）。
+
+    **識別子ではない。**正は `partkey` / `session_key` であり、slug から鍵への対応は
+    DB の `normalized_path` / `transcript_path` / `analysis_path` が持つ。
+
+    なぜ鍵をそのままファイル名にしないか: `device_id` は Volume 名なので空白や任意の
+    文字を含みうる（`NO NAME` / `Macintosh HD`。§5.4）し、`session_key` は `:` を含む。
+    sanitize すると 2 つの鍵が同じ名前に潰れうるので、**衝突を減らすのではなく
+    衝突の検出を §10.5 に置いた**（既存の `staging/<slug>/` の `partkey` が自分と
+    一致することを確かめる）。**確率で安全を担保しない。**
+    """
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
 # --- 削除（§14.4 N-10 が許す 3 本） --------------------------------------
