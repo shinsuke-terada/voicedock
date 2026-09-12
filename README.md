@@ -14,7 +14,7 @@ DJI Mic 3 で録音 → 帰宅 → Mac へ USB 接続 → （以降すべて自�
 
 ## ドキュメント
 
-実装時の規範は **[docs/SPEC.md](docs/SPEC.md)（詳細仕様書 v3.2）** に集約されている。
+実装時の規範は **[docs/SPEC.md](docs/SPEC.md)（詳細仕様書 v3.3）** に集約されている。
 
 前身の方針書は [docs/archive/](docs/archive/) に保存してある。両者が矛盾する場合は `docs/SPEC.md` を優先する。
 
@@ -31,6 +31,8 @@ make up                      # = docker compose up -d --build
 ```
 
 日常操作は `make` にまとめてある（`up` / `down` / `logs` / `status` / `test` / `doctor` / `models`）。
+`make test` はコンテナ内で pytest を実行するため、**ホストに Python を入れる必要はない**。
+依存 lock の再生成は `make lock`（これも使い捨てコンテナで動く）。
 シェルスクリプトは `doctor.sh`（セットアップ検査と環境診断を兼ねる）と `fetch-models.sh` の 2 本だけ。
 
 前提条件とホスト設定の詳細は [docs/SPEC.md §3](docs/SPEC.md) を参照。

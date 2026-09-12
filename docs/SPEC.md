@@ -1,14 +1,15 @@
-# VoiceDock 詳細仕様書 v3.2
+# VoiceDock 詳細仕様書 v3.3
 
 **DJI Mic 3 × ローカル文字起こし × ローカルLLM × Obsidian**
 
 | 項目 | 内容 |
 |---|---|
-| 文書版 | v3.2（実装着手可能版） |
-| 前身文書 | v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
+| 文書版 | v3.3（実装着手可能版 / Phase 0 実測反映） |
+| 前身文書 | v3.2 / v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
 | 作成日 | 2026-09-11 |
+| 改訂日 | 2026-09-12 |
 | 対象環境 | macOS / Apple Silicon |
-| 位置づけ | 本書が実装時の唯一の規範。v3.1 / v3.0 / v2.0 と矛盾する場合は本書を優先する |
+| 位置づけ | 本書が実装時の唯一の規範。v3.2 / v3.1 / v3.0 / v2.0 と矛盾する場合は本書を優先する |
 
 ---
 
@@ -167,14 +168,21 @@ Vault/Daily/Voice/Wiki/20260829/2026-08-29 Voice.md   ← 要約・タスク・T
 | 機種 | Mac16,11 / Apple M4 Pro 14 core | Apple Silicon | ✅ |
 | メモリ | 64 GB | 16 GB 以上（LLM 30B 級を使う場合 32 GB 以上） | ✅ |
 | macOS | 26.6.2 (25G83) | — | ✅ |
-| Docker Engine | 要再取得（§3.5） | — | ⚠️ |
-| Docker Compose | 要再取得（§3.5） | **2.38 以上**（`models` 対応） | ⚠️ |
+| Docker Engine | 29.7.2 | — | ✅ |
+| Docker Compose | 5.5.1（**メジャー 5 系**） | **2.38 以上**（`models` 対応） | ✅ |
 | Docker VM 割当 | 7 CPU / 24 GB / aarch64 | 4 CPU / 8 GB 以上 | ✅ |
-| 仮想化バックエンド | **Apple Virtualization Framework** | **AVF 必須**（§3.2） | ✅ |
-| Docker Model Runner | 無効 | 有効必須 | ⚠️ 要設定 |
-| Docker Desktop AutoStart | `false` | 有効必須 | ⚠️ 要設定 |
+| 仮想化バックエンド | **Apple Virtualization Framework**（`UseVirtualizationFramework = True`） | **AVF 必須**（§3.2） | ✅ |
+| Docker Model Runner | `not running` | 有効必須 | ⚠️ 要設定（§3.4(1)） |
+| Docker Desktop AutoStart | `False` | 有効必須 | ⚠️ 要設定（§3.4(2)） |
 | Obsidian Vault | `/Users/terada/Documents/Obsidian Vault` | 任意 | ⚠️ パスに空白を含む |
 | 起動ディスク空き | 63 GB | 10 GB 以上（§7.3 の上限設計により常駐使用量は 200 MB 未満） | ✅ |
+
+実測日 2026-09-12。取得手順は §3.5。
+
+- **Compose がメジャー 5 系である。**要件「2.38 以上」は満たすが、§18.2 の `models` 長構文が
+  5 系で実際に環境変数を注入するかは未検証であり、**#13（T-13）で確認する**（§22 R-21）。
+- Model Runner の有効化と AutoStart は **ホスト側の一度きりの作業**として §3.4 に残る。
+  `doctor.sh` の DH-2 / DH-4 が実施状況を検査する。
 
 ### 3.2 仮想化バックエンドの制約（必須）
 
@@ -194,6 +202,8 @@ bind source path does not exist: /host_mnt/<volume名>/<path>
 python3 -c "import json;print(json.load(open('$HOME/Library/Group Containers/group.com.docker/settings-store.json')).get('UseVirtualizationFramework'))"
 # => True であること
 ```
+
+実機実測（2026-09-12）: `True`。**§22 R-2 はクローズ。**設定変更による再発を検知するため DH-1 は残す。
 
 GUI では **Settings → General → Virtual Machine Options → Apple Virtualization framework**。
 
@@ -255,14 +265,17 @@ OBSIDIAN_VAULT=/Users/terada/Documents/Obsidian Vault
 OBSIDIAN_VAULT="/Users/terada/Documents/Obsidian Vault"
 ```
 
-### 3.5 バージョン値の再取得（Phase 0 の作業項目）
+### 3.5 バージョン値の実測記録
 
-§3.1 の Docker Engine / Compose のバージョンは、要件「Compose 2.38 以上」との比較を誤らせない形で実測し直して記載する。
+§3.1 の実測は次のコマンドで取得した（2026-09-12）。
 
 ```bash
-docker version --format '{{.Server.Version}}'
-docker compose version --short
+docker version --format '{{.Server.Version}}'   # => 29.7.2
+docker compose version --short                  # => 5.5.1
 ```
+
+**Compose は 5 系である。**DH-3（§19.2）の「2.38 以上」の判定は、`5.5.1` を `2.38` より新しいと
+正しく扱えること。文字列の辞書順比較は将来のメジャー 10 系で誤判定するため使わない。
 
 ---
 
@@ -436,9 +449,11 @@ part_key = (transmitter_id, mic_index, started_at)
 
 Volume 名を固定しない。`/host-volumes` 直下の各エントリについて以下を評価し、**すべて**を満たす場合に DJI デバイスと判定する。
 
-1. ディレクトリであり、読み取り可能である
-2. `RECORDING_FOLDER_RE` に一致するサブディレクトリが 1 個以上存在する、**または** `RECORDING_FILENAME_RE` に一致する `.wav` が 1 個以上存在する
-3. `config.device.exclude_volumes` のいずれのパターンにも一致しない
+1. **エントリ自身がシンボリックリンクでない**（`os.path.islink()` が偽）。macOS には
+   `/Volumes/Macintosh HD -> /` が実在し、辿ると起動ディスク全体が走査対象になる（§22 R-19）
+2. ディレクトリであり、読み取り可能である
+3. `RECORDING_FOLDER_RE` に一致するサブディレクトリが 1 個以上存在する、**または** `RECORDING_FILENAME_RE` に一致する `.wav` が 1 個以上存在する
+4. `config.device.exclude_volumes` のいずれのパターンにも一致しない
 
 **除外パターンは `fnmatch` による glob として評価する（正規表現ではない）。**既定値は §7.2 と同一でなければならない。
 
@@ -511,6 +526,8 @@ voicedock/
 ├── pyproject.toml
 ├── uv.lock                         # 依存の lock（§18.5）
 ├── requirements.lock               # uv export で生成。Docker build が使う（§18.3）
+├── requirements-dev.lock           # dev 依存込み。dev ステージと make test が使う（§17.4, §18.3）
+├── .dockerignore                   # ビルドコンテキストの除外（§18.3）
 ├── .env.example
 ├── .gitignore
 ├── README.md
@@ -579,6 +596,7 @@ voicedock/
 | `cleaner.py` を独立させる | §14.4 N-10 が「デバイス上の削除はこのモジュールのみ」と規定している。ファイルとして分かれていること自体が規約の実体 |
 | `states.py` を独立させる | §9 の状態定義と遷移表はデータであり、`pipeline.py` の制御フローとは変更理由が異なる |
 | `notes.py` / `llm.py` が大きくなる | 400〜600 行を見込む。**実装中に 500 行を超えたら、そのとき初めて分割する**（先に分けない） |
+| `.dockerignore` を置く | 無いと生成 fixture WAV・`tmp/`・`data/`・`.git` が毎ビルドで転送される。除外内容は §18.3 |
 
 ---
 
@@ -825,6 +843,7 @@ database:
 | V-24 | `transcription.executable` が存在し実行可能 | `WHISPER_EXEC_MISSING` |
 | V-25 | `transcription.vad.enabled == true` なら `vad.model` が存在する | `WHISPER_MODEL_MISSING` |
 | V-26 | `cleanup.delete_source_audio == true` の場合、起動ログに警告を出す | 警告のみ（§14.3） |
+| V-27 | `obsidian.raw.granularity == "part"` なら `obsidian.raw.filename_template` に `{part}` を含む | `CONFIG_INVALID_VALUE`（含まないと Part ごとのファイルが同名衝突する） |
 
 ---
 
@@ -1061,7 +1080,7 @@ stateDiagram-v2
 | `SOURCE_DELETE_PENDING` | 削除すべきだがデバイス未接続 / 同定失敗 / 削除失敗。次回接続時に再試行 | — | ✅ |
 | `COMPLETED` | 当該 Part の処理をすべて終えた | 可（§14.1 が真なら） | ✅ |
 | `FAILED` | 失敗。自動再試行（§15.2）または手動 `retry` で復帰可能 | 不可 | ✅ |
-| `SKIPPED` | 既知の重複、または発話が検出されなかった | 不可 | ✅ |
+| `SKIPPED` | 既知の重複、発話が検出されなかった、または取り込み対象の実体が失われた | 不可 | ✅ |
 
 **終端状態**（Session の進行判定に使う）: `RAW_SAVED` / `SOURCE_DELETING` / `SOURCE_DELETE_PENDING` / `COMPLETED` / `FAILED` / `SKIPPED`
 
@@ -1123,6 +1142,7 @@ stateDiagram-v2
 | — | 走査で新規検出 | ファイル名パース成功 ∧ 安定性 OK ∧ partkey 未登録 | `DISCOVERED` | 行 INSERT、ffprobe で duration 取得 |
 | — | 走査で検出 | partkey 登録済み | （遷移なし） | `DEBUG already_known` のみ |
 | `DISCOVERED` | 取り込み | 空き容量 OK ∧ staging 上限内 | `NORMALIZING` | staging ディレクトリ作成 |
+| `DISCOVERED` | 取り込み直前の再確認 | `primary_variant` のファイルが存在しない、または `size == 0` | `SKIPPED` | `SOURCE_MISSING` を記録し `part_skipped` を出力。**デバイス上のファイルには触れない。**自動再試行の対象外 |
 | `NORMALIZING` | 変換成功 | 出力が 16kHz/1ch/s16 ∧ `size > 0` ∧ 長さが入力と ±`duration_tolerance_seconds` | `NORMALIZED` | `sha256_<primary>`・`normalized_path` 更新 |
 | `NORMALIZING` | SHA-256 衝突 | 同一 sha256 の別行が存在 | `SKIPPED` | 出力削除、`DUPLICATE_CONTENT` 記録 |
 | `NORMALIZING` | 失敗 / USB 切断 | — | `FAILED` | **部分出力を削除**。元ファイルは触らない |
@@ -1132,7 +1152,7 @@ stateDiagram-v2
 | `TRANSCRIBING` | タイムアウト | — | `FAILED` | `WHISPER_TIMEOUT`、プロセスグループごと kill |
 | `TRANSCRIBED` | Raw ノート生成 | Vault 到達可 | `RAW_WRITING` | — |
 | `RAW_WRITING` | 保存検証成功 | §13.7 の R-1〜R-6 | `RAW_SAVED` | `raw_output_path`・`raw_output_sha256`（Session 側）を更新 |
-| `RAW_WRITING` | 検証失敗 | — | `FAILED` | 一時ファイル削除。**最終ファイルは差し替えない** |
+| `RAW_WRITING` | 検証失敗 | — | `FAILED` | 一時ファイル削除。**最終ファイルは差し替えない。`FAILED` にするのは今回の再生成を起動した Part（トリガ Part）1 件のみ**とし、同じ Raw ノートに含まれる他の Part は `TRANSCRIBED` のまま据え置いて次回の再生成で再試行する |
 | `RAW_SAVED` | 削除要求 | §14.1 が真 | `SOURCE_DELETING` | — |
 | `RAW_SAVED` | 削除要求 | `delete_source_audio == false` | `COMPLETED` | 元音声を残したまま完了 |
 | `SOURCE_DELETING` | 削除成功 | 全 Variant が存在しないことを再確認 | `COMPLETED` | `source_deleted_at` 更新 |
@@ -1177,7 +1197,7 @@ stateDiagram-v2
 | 確認 | 真なら飛ばす工程 |
 |---|---|
 | `normalized_path` が存在し `size > 0` ∧ 形式が正しい | 取り込み・変換 |
-| `transcript_path` が存在し JSON パース可 ∧ 文字数 OK | 文字起こし |
+| `transcript_path` が存在し **正規化スキーマ（§10.6）としてパース可** ∧ 文字数 OK | 文字起こし |
 | Session の `raw_output_path` が存在し `raw_output_sha256` と一致 | Raw ノート生成 |
 | `analysis_path` が存在しスキーマ検証通過 | LLM 解析 |
 | `output_path` が存在し `output_sha256` と一致 | Daily ノート生成・書き込み |
@@ -1399,18 +1419,24 @@ if du(staging_root) + expected > import.staging_max_bytes:  -> DISK_SPACE_LOW
 
 VAD はタイムスタンプを元の時刻のまま維持するため、Raw ノートの時刻表示に影響しない。
 
-> **実装時に `whisper-cli --help` で VAD 関連オプションの有無と正確な名称を確認すること**（§18.2 で固定するバージョンに依存する）。存在しない場合は `transcription.vad.enabled: false` で動作し、§21.2 Phase 2 の所要時間要件を満たせるか再評価する。
+> **VAD オプションは確認済み。**whisper.cpp `v1.9.4`（commit `7d75b14994ae7f59623e2471445e2355fe506ed2`）の
+> `examples/cli/cli.cpp` に上記 6 フラグが逐語一致で存在する（2026-09-12 確認。§22 R-5 クローズ）。
+> 加えて `--vad-max-speech-duration-s` と `--vad-samples-overlap` も存在し、**必要になった時点で
+> `transcription.vad.max_speech_duration_s` / `samples_overlap` として §7.2 へ追加できる**（現時点では追加しない）。
+> `WHISPER_CPP_REF` を上げる際は、このフラグ群が残っていることを `doctor` の D-7 で確認する。
+> 万一使えなくなった場合は `transcription.vad.enabled: false` で動作するが、§21.2 Phase 2 の
+> 所要時間要件を満たせるか再評価が必要になる。
 
 | 項目 | 規定 |
 |---|---|
-| 出力 | `/data/transcripts/parts/<recording_id>.json` |
+| 出力 | `/data/transcripts/parts/<recording_id>.json`。**whisper の生 JSON ではなく、下記の正規化形式で保存する** |
 | 実行方式 | `subprocess.run(argv_list, ...)`。**`shell=True` および文字列連結は禁止**（§14.4） |
 | スレッド数 | `transcription.threads`。`0` なら `min(os.cpu_count(), 8)` |
 | タイムアウト | `clamp(duration_seconds × timeout_factor, min_timeout_seconds, max_timeout_seconds)` |
 | タイムアウト時 | プロセスグループごと kill → 部分出力削除 → `WHISPER_TIMEOUT` → `FAILED` |
 | 終了コード != 0 | stderr の末尾 1000 文字を `error_message` に記録 → `WHISPER_FAILED` → `FAILED` |
 | 発話なし | 全 segment の text 合計が `min_chars` 未満なら `NO_SPEECH_DETECTED` → **`SKIPPED`**（失敗ではない） |
-| 冪等性 | 出力 JSON が存在しパース可なら再実行しない |
+| 冪等性 | 出力 JSON が存在し、**正規化スキーマとしてパースでき `text` が `min_chars` 以上**なら再実行しない |
 
 **成功後**、`cleanup.delete_normalized_after_transcribe` が `true` なら `audio16k.wav` を削除する。
 
@@ -1431,6 +1457,10 @@ Part transcript の正規化形式:
 
 `segments[].start` / `end` は **Part の先頭からの相対秒**。絶対時刻は `started_at + start` で求める。
 
+**この正規化形式が唯一の永続スキーマである。**whisper-cli が `-oj` で出力した生 JSON は読み込み後に
+この形へ変換し、**生 JSON は残さない**（同じディレクトリへ 2 種類のスキーマが混在すると §9.4 の
+冪等判定がどちらを読むか決まらなくなる）。§9.4 の再開規則もこの正規化スキーマで判定する。
+
 ### 10.7 Raw ノート出力
 
 Part の文字起こしが 1 本終わるたびに、**その日の Raw ノート全体を再生成する**。
@@ -1448,6 +1478,9 @@ atomic write（§13.6）→ 保存検証 R-1〜R-6（§13.7）
 - 1 日 32 回の書き直しになるが、1 回あたり数百 KB であり負荷にならない
 - **この工程が完了して初めて、その Part の音声を削除してよい状態になる**（§14.1）
 - `obsidian.raw.granularity: part` を選んだ場合は Part ごとに 1 ファイルを生成する（挙動は同じ）
+- **失敗の帰属**: Raw ノートはセッション単位で再生成されるが、`RAW_WRITING → FAILED` は Part 状態である。
+  **`FAILED` にするのは再生成を起動したトリガ Part のみ。**同じノートに含まれる他の Part を巻き添えで
+  `FAILED` にすると、1 回の書き込み失敗でその日の全 Part が再試行上限を消費する（§9.3）
 
 ### 10.8 セッション統合
 
@@ -1821,6 +1854,8 @@ Session Transcript（1 日分）
 - Reduce の入力が `max_chars_per_request` を超える場合は、`PartialAnalysis` をさらに束ねて 2 段階 Reduce する
 
 チャンクが 1 個しかない場合は Map-Reduce を使わず `analyze_ja.txt` で単一パス処理する。
+**この場合 Map 中間結果が存在しないため、Timeline は Part / Block の時刻範囲から組み立てる**（§13.4）。
+E2E-01（1 分録音）では必ずこの経路を通る。
 
 ### 12.5 プロンプト
 
@@ -2035,7 +2070,7 @@ VoiceDock の削除条件を整理し、午後の打ち合わせで MVP の範�
 | セクションの有無と順序 | `llm.analysis.order` と `sections.<key>.enabled` に従う（§7.2） |
 | 見出し文字列 | `sections.<key>.heading` |
 | `## Summary` | Reduce 段階の出力 |
-| `## Timeline` | **Map 段階の中間結果を時刻順に並べたもの。追加の LLM 呼び出しは不要。**見出しは Block 境界（`session.block_gap_seconds` 超の無録音区間）で区切る |
+| `## Timeline` | **Map 段階の中間結果を時刻順に並べたもの。追加の LLM 呼び出しは不要。**見出しは Block 境界（`session.block_gap_seconds` 超の無録音区間）で区切る。**単一パス処理（§12.4）で Map 中間結果が無い場合は、セッション全体を Block ごとに 1 ブロックとして扱い、見出しはその Block の時刻範囲、本文は `summary` の各文を箇条書きにしたものとする**（Timeline のためだけに LLM を再度呼ばない） |
 | `## Tasks` | `- [ ] {text}`。`due` があれば ` 📅 {due}` を付加 |
 | 空セクション | 対応する配列が空なら**見出しごと省略する** |
 | 全文 | **載せない**（`wiki.include_transcript` 既定 false）。`## Sources` から Raw ノートへ辿る |
@@ -2205,14 +2240,32 @@ def can_delete_source(part, session, cfg, device) -> bool:
 パスだけを信じて削除してはならない。削除の直前に以下をすべて検証する（1 つでも偽なら `SOURCE_IDENTITY_MISMATCH` → `SOURCE_DELETE_PENDING`）。
 
 ```python
+import os
+import stat
+from pathlib import Path
+
 def target_is_identical(part, variant, device) -> bool:
     target = Path(part.source_path(variant))
+
+    # (1) 絶対パスであること・対象自身が symlink でないこと
+    if not target.is_absolute() or target.is_symlink():
+        return False
+
+    # (2) 経路上の symlink をすべて解決してから封じ込めを判定する（§22 R-19）
+    #     Path.parents は字句的判定であり symlink を解決しない。
+    #     macOS には /Volumes/Macintosh HD -> / が実在するため、
+    #     realpath を挟まないと封じ込めを擦り抜ける経路が理論上残る。
+    resolved = Path(os.path.realpath(target))
+    device_root = Path(os.path.realpath(device.path))
+    if resolved != target:            # 経路の途中に symlink がある = 前提が崩れている
+        return False
+    if device_root not in resolved.parents:
+        return False
+
+    # (3) 同定（サイズ・更新時刻・ファイル名規則・通常ファイル）
     st = target.lstat()
     return (
-        target.is_absolute()
-        and not target.is_symlink()
-        and device.path in target.parents         # 検出済みデバイスのルート配下
-        and RECORDING_FILENAME_RE.match(target.name) is not None
+        RECORDING_FILENAME_RE.match(target.name) is not None
         and stat.S_ISREG(st.st_mode)
         and st.st_size == part.source_size(variant)
         and abs(st.st_mtime - part.source_mtime(variant)) < 2.0
@@ -2221,6 +2274,9 @@ def target_is_identical(part, variant, device) -> bool:
 
 - SHA-256 の再計算はしない（USB 越しに 1 日 11 GB を読み直すことになるため）。パス・サイズ・更新時刻・ファイル名規則の一致で同定する
 - `device.path` 配下であることの検証は必須。§18.2 の bind mount は `/Volumes` ツリー全体であり、**`rw` にすると他のボリューム（Time Machine、外付け SSD）にも書き込めてしまう**ため、パス封じ込めがアプリ側の唯一の防壁になる
+- **`realpath` 解決は必須。**`Path.parents` は字句的な比較しか行わない。`/Volumes/Macintosh HD` が
+  `/` への symlink として実在する以上、字句判定だけでは「デバイス配下」と偽装されたパスを拒否できない
+  （§22 R-19）。§5.4 でボリュームルートの symlink を弾き、ここで経路全体を再確認する二重防壁とする
 
 ### 14.2 二重ロック
 
@@ -2329,6 +2385,7 @@ VoiceDock Container ──HTTP──> Docker Model Runner（ローカル）
 | `DEVICE_UNSUPPORTED` | デバイス | 走査 | 不可 | スキップ |
 | `FILE_NOT_STABLE` | デバイス | 安定性判定 | 可（次回 polling） | 登録保留（失敗ではない） |
 | `DUPLICATE_CONTENT` | 取り込み | SHA-256 衝突 | 不可 | Part `SKIPPED` |
+| `SOURCE_MISSING` | 取り込み | 取り込み直前の再確認 | 不可 | Part `SKIPPED`（失敗ではない）。**デバイス上のファイルには触れない** |
 | `DISK_SPACE_LOW` | 取り込み | 空き容量確認 | 可（次回 polling） | 処理停止。**元音声は削除しない** |
 | `AUDIO_PROBE_FAILED` | 音声 | ffprobe | 可（3 回） | **続行**（`duration_seconds = NULL`、警告のみ） |
 | `IMPORT_FAILED` | 音声 | 読み込み / 変換 / USB 切断 | 可（3 回） | Part `FAILED`。部分出力削除 |
@@ -2367,7 +2424,7 @@ retry:
 - 累積の失敗回数は `events` テーブルから復元する
 - `retry_count` が `max_attempts` に達したら `FAILED` として残す
 - **`FAILED` は `auto_retry_failed_after_hours`（既定 24 時間）経過後に自動で再投入する。**1 日 32 Part の運用で、失敗のたびに人が `retry` を打つのは現実的でないため。`auto_retry_max_rounds`（既定 3）を超えたら以降は自動で触らず、`status` / `doctor` の警告に出し続ける（`retry_exhausted`）
-- **自動再試行の対象外**: 設定エラー系、`DUPLICATE_CONTENT`、`NO_SPEECH_DETECTED`
+- **自動再試行の対象外**: 設定エラー系、`DUPLICATE_CONTENT`、`NO_SPEECH_DETECTED`、`SOURCE_MISSING`
 - `FAILED` からの即時復帰は CLI の `voicedock retry <id>`（`--force` 付きで上限無視）
 - **リトライは最初からやり直さない。**§9.4 の再開規則に従って完了済みステップを飛ばす
 - `SOURCE_DELETE_PENDING` は `max_attempts` の対象外。デバイスが接続されるたびに無期限に再試行する
@@ -2485,7 +2542,7 @@ docker compose exec voicedock voicedock <subcommand> [options]
 ```text
 $ voicedock status
 
-VoiceDock v3.2.0
+VoiceDock v0.1.0
 ────────────────────────────────────────────────────────
 Devices connected     : 1  (DJI_MIC, ro)
 Device free space     : 4.2 GiB  (残り約 3.0 時間)
@@ -2544,14 +2601,36 @@ ID   DATE         PARTS  RECORDED  STATUS      TITLE
 | `scripts/fetch-models.sh` | Whisper モデルと Silero VAD モデルを named volume へ取得（§18.6） |
 
 ```makefile
+UV_IMAGE ?= ghcr.io/astral-sh/uv:0.12.13-python3.12-trixie-slim
+
+.PHONY: up down logs status doctor models test lock
+
 up:      ; docker compose up -d --build
 down:    ; docker compose down
 logs:    ; docker compose logs -f voicedock
 status:  ; docker compose exec voicedock voicedock status
-test:    ; pytest
 doctor:  ; ./scripts/doctor.sh
 models:  ; ./scripts/fetch-models.sh
+
+# テストはコンテナ内で実行する。ホストに Python / pytest を入れない（§3.3）
+test:
+	docker build --target dev -t voicedock:dev .
+	docker run --rm -v "$(CURDIR)/tests:/app/tests:ro" voicedock:dev pytest -q
+
+# lock の生成も使い捨てコンテナで行う。ホストに uv を入れない（§3.3, §18.5）
+lock:
+	docker run --rm -v "$(CURDIR)":/w -w /w $(UV_IMAGE) sh -c '\
+	  uv lock && \
+	  uv export --frozen --no-dev --no-emit-project -o requirements.lock && \
+	  uv export --frozen          --no-emit-project -o requirements-dev.lock'
 ```
+
+**`make test` がホストに Python を要求しないこと。**§3.3 は「ホストへ Python / pip / venv を入れない」と
+規定しており、`test: ; pytest` はこれと両立しない。テストは `Dockerfile` の `dev` ステージ（§18.3）で
+実行する。`tests/` を bind mount するのは、テストを 1 行直すたびにイメージを焼き直さないため。
+
+**`make lock` も同様に使い捨てコンテナで行う。**`uv.lock` と `requirements.lock` /
+`requirements-dev.lock` は生成後にコミットする（§18.5）。`UV_IMAGE` はタグを固定する（§18.1）。
 
 スクリプトはすべて `set -euo pipefail` で始め、パスは `"$VAR"` で引用する（Vault パスに空白を含むため）。
 
@@ -2581,6 +2660,7 @@ services:
   voicedock:
     build:
       context: .
+      target: runtime          # dev ステージ（§18.3）を本番イメージに含めないため必須
       args:
         WHISPER_CPP_REF: v1.9.4
 
@@ -2634,8 +2714,8 @@ services:
 
 models:
   summarizer:
-    # 要約用。実在確認の上で固定すること（§18.5）
-    model: ai/qwen3:30b-a3b-instruct-q4_K_M
+    # 要約用。2026-09-12 に Docker Hub のタグ一覧で実在を確認（約 18.6 GB）
+    model: ai/qwen3:30b-a3b-instruct-2507-q4_K_M
     context_size: 32768
 
 volumes:
@@ -2652,15 +2732,25 @@ volumes:
 | `logging` | 既定のログドライバは無制限に増えるため上限を設ける |
 | `healthcheck` の 120s | 30s だと 1 日 2,880 回 Python を起動することになる。検知の遅れは実用上問題にならない |
 | **`ports:` が無い** | §14.4 N-13。公開ポート 0。他プロジェクトとポートが衝突しない |
+| `target: runtime` | §18.3 の最終ステージは `dev` である。明示しないと `docker compose up --build` が dev 依存入りのイメージを作る |
 
 **LLM への接続**はコンテナ内部 DNS（`model-runner.docker.internal`）経由で行う。Docker Desktop がホスト側に開ける TCP ポート（12434）は使用しない。
 
 **LLM モデル**: 1 日 35 万文字を 18 チャンク程度で処理する。MoE（Mixture-of-Experts）の 30B クラスは、30B 相当の品質を保ちながら推論時の実効パラメータが小さく、Apple Silicon の Metal で実用的な速度が出る。
 
 - メモリ試算: LLM 約 18 GB（ホスト側）+ Docker VM 24 GB = 42 GB < 64 GB
-- フォールバック段: MoE 30B → 密 14B → 4B（速度不足時）／品質不足なら密 32B
-- **thinking 系のタグを選ばない。**選ぶ場合は §12.3 の JSON 抽出に `<think>…</think>` 除去が必要になる
-- **タグは実装時に `docker model pull` で実在を確認してから固定する**（カタログのタグは変動する）
+- フォールバック段（いずれも 2026-09-12 に Docker Hub で実在を確認したタグ）:
+
+  | 段 | タグ | 概算サイズ | 切り替える条件 |
+  |---|---|---|---|
+  | 既定 | `ai/qwen3:30b-a3b-instruct-2507-q4_K_M` | 18.6 GB | — |
+  | 速度不足 1 | `ai/qwen3:14b-q4_K_M` | 9.0 GB | Phase 3 の「18 チャンクを 30 分以内」に届かない |
+  | 速度不足 2 | `ai/qwen3:4b-instruct-2507-q4_K_M` | 2.5 GB | 上記でも届かない |
+  | 品質不足 | `ai/qwen3:32b-q4_K_M` | 19.8 GB | 速度は足りるが要約品質が不足する |
+
+- **thinking 系のタグ（`30b-a3b-thinking-2507-*` など）を選ばない。**選ぶと §12.3 の JSON 抽出が `<think>…</think>` の除去に依存する
+- **Compose がメジャー 5 系である**ため、`models` 長構文が実際に `VOICEDOCK_LLM_URL` / `VOICEDOCK_LLM_MODEL` を注入するかは **#13（T-13）で確認する**（§22 R-21）
+- タグの実在確認は `docker model pull` でも再確認する（カタログのタグは変動する。§22 R-12）
 
 ### 18.3 `Dockerfile`
 
@@ -2692,7 +2782,7 @@ RUN cmake -B build \
 # ============================================================
 # Stage 2: runtime
 # ============================================================
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-bookworm AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg ca-certificates tini \
@@ -2728,6 +2818,19 @@ ENV PYTHONUNBUFFERED=1 \
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "-m", "voicedock.main", "service"]
+
+# ============================================================
+# Stage 3: dev（テスト実行専用。本番イメージには含めない）
+# ============================================================
+FROM runtime AS dev
+
+USER root
+COPY requirements-dev.lock ./
+RUN pip install --no-cache-dir -r requirements-dev.lock \
+    && rm -rf /root/.cache
+USER voicedock
+
+CMD ["pytest", "-q"]
 ```
 
 **ビルド上の注意:**
@@ -2740,6 +2843,39 @@ CMD ["python", "-m", "voicedock.main", "service"]
 | `tini` | `whisper-cli` のゾンビプロセス回収と、シグナルの正しい伝播のため |
 | `ldd` チェック | 静的リンクが崩れた場合にビルド時点で気づけるようにする |
 | non-root | uid 1000。bind mount のパーミッションは P0-9 で検証する（§5.5） |
+| `requirements-dev.lock` | `uv export --frozen --no-emit-project -o requirements-dev.lock` で生成しコミットする。`dev` ステージと `make test` が使う |
+| ステージ名 `runtime` | `dev` が最終ステージになるため、`compose.yaml` の `build.target` で `runtime` を明示する（§18.2）。明示を忘れると本番イメージに pytest が入る |
+| `dev` の `CMD` | `ENTRYPOINT` は `runtime` から継承される（`tini`）。`tests/` はイメージへ COPY せず bind mount する（§17.4） |
+
+**`.dockerignore`**（§6）:
+
+```gitignore
+.git
+.github
+docs/
+tmp/
+data/
+models/
+tests/
+poc/
+.env
+config/config.yaml
+**/__pycache__/
+*.py[cod]
+*.db
+*.db-wal
+*.db-shm
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.DS_Store
+```
+
+`tests/` を除外するのは、`dev` ステージがテストを bind mount で受け取るためである（§17.4）。
+生成 fixture WAV（§20.2）をビルドコンテキストへ乗せない効果もある。
 
 ### 18.4 常駐方式
 
@@ -2764,7 +2900,8 @@ restart: unless-stopped により VoiceDock コンテナ起動
 | `debian:bookworm-slim` / `python:3.12-slim-bookworm` | 本番運用時は digest（`@sha256:...`）へ置換する |
 | whisper.cpp | `ARG WHISPER_CPP_REF=v1.9.4`（tag 固定） |
 | LLM | Compose の `models.summarizer.model`（tag 固定。実在確認必須） |
-| Python 依存 | `uv.lock` と、そこから生成した `requirements.lock` をコミットする |
+| Python 依存 | `uv.lock` と、そこから生成した `requirements.lock` / `requirements-dev.lock` をコミットする |
+| lock 生成環境 | `UV_IMAGE`（§17.4）。既定 `ghcr.io/astral-sh/uv:0.12.13-python3.12-trixie-slim`。**タグを固定する** |
 
 **`latest` / `master` / `main` への無条件依存を禁止する。**更新は手動 PR としてのみ行う。
 
@@ -2781,9 +2918,9 @@ set -euo pipefail
 MODEL="${1:-large-v3-turbo-q5_0}"
 VAD_MODEL="silero-v5.1.2"
 
-# TODO(Phase 0): whisper.cpp の models/download-vad-model.sh が参照する URL を
-#                実機で確認し、ここへ固定する（§22 R-5）
-VAD_URL="${VAD_URL:?VAD モデルの取得元 URL を設定してください}"
+# whisper.cpp v1.9.4 の models/download-vad-model.sh が参照する先。
+# 2026-09-12 に HTTP 200 を確認済み（§22 R-5 クローズ）
+VAD_URL="${VAD_URL:-https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-${VAD_MODEL}.bin}"
 
 docker run --rm --user 0:0 \
   -v voicedock-models:/models/whisper \
@@ -2800,7 +2937,18 @@ docker run --rm --user 0:0 \
   '
 ```
 
-> **VAD モデルの取得元 URL は実装時に確定する。**whisper.cpp リポジトリの `models/download-vad-model.sh` が参照している先を確認して固定すること。取得できない場合は `transcription.vad.enabled: false` で動作するが、§21.2 Phase 2 の所要時間要件を満たせるか再評価が必要になる。
+**取得元（2026-09-12 にいずれも HTTP 200 を確認）:**
+
+| 種別 | 既定 | URL |
+|---|---|---|
+| Whisper 本体 | `large-v3-turbo-q5_0` | `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin` |
+| VAD | `silero-v5.1.2` | `https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin` |
+| VAD（代替） | `silero-v6.2.0` | `https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin` |
+
+VAD モデルは whisper.cpp `v1.9.4` の `models/download-vad-model.sh` が参照する
+`https://huggingface.co/ggml-org/whisper-vad` と同一である（同スクリプトの
+`models="silero-v5.1.2 silero-v6.2.0"`）。代替へ切り替える場合は `VAD_MODEL=silero-v6.2.0` を渡し、
+`config.transcription.vad.model` のパスも合わせる。
 
 | Whisper モデル | 概算サイズ | 用途 |
 |---|---|---|
@@ -2901,7 +3049,7 @@ VoiceDock doctor
 |---|---|---|
 | DH-1 | `UseVirtualizationFramework == true`（§3.2） | **致命的**（中止） |
 | DH-2 | `docker model status` が running | 致命的（有効化手順を表示して中止） |
-| DH-3 | `docker compose version` が 2.38 以上 | 致命的 |
+| DH-3 | `docker compose version --short` が 2.38 以上。**バージョンを数値タプルとして比較する**（実機は 5.5.1。文字列の辞書順比較は将来のメジャー 10 系で誤判定する） | 致命的 |
 | DH-4 | Docker Desktop `AutoStart == true` | 警告 |
 | DH-5 | `.env` が存在し `OBSIDIAN_VAULT` が実在するディレクトリ | 致命的 |
 | DH-6 | `docker` コマンドが利用可能で、エンジンが起動している | 致命的 |
@@ -3012,7 +3160,7 @@ fixture の WAV は **実際に 48 kHz / 32 bit float** で生成し、変換が
 | ND-17 | セッション内に進行中の Part が残っている | 全 Part 終端条件が偽 | **セッション内のどの Part も削除されない** |
 | ND-18 | 削除直前にファイルサイズが変わる | `target_is_identical` が偽 | 元音声が残る。`SOURCE_IDENTITY_MISMATCH` |
 | ND-19 | 削除直前に mtime が変わる | 同上 | 元音声が残る |
-| ND-20 | 対象パスがデバイスのルート外（シンボリックリンク等） | パス封じ込めが偽 | 元音声が残る。**他ボリュームのファイルに触れない** |
+| ND-20 | 対象パスがデバイスのルート外（対象自身が symlink / **経路の途中に symlink（`/Volumes/Macintosh HD` 経由など）**） | パス封じ込めが偽 | 元音声が残る。**他ボリュームのファイルに触れない** |
 | ND-21 | Part を 0 件持つ Session / Variant パスが空 | 空集合を真にしない条件が偽 | 削除が起きない |
 | ND-22 | `delete_source_audio: false` | ロック 1 が偽 | 元音声が残る |
 | ND-23 | `DJI_MOUNT_MODE=ro` | ロック 2 が偽 | 元音声が残る（OS レベルで不可） |
@@ -3117,23 +3265,26 @@ docker compose exec voicedock voicedock cleanup --backlog
 | # | 項目 | 影響 | 対応 |
 |---|---|---|---|
 | R-1 | **`/Volumes` のホットプラグ伝播**（コンテナ起動後にマウントされたデバイスが `/host-volumes` に現れるか） | 現れない場合、本アーキテクチャの前提が崩れる | Phase 0 の P0-6 で最優先検証。失敗時は §5.6 案 A |
-| R-2 | **仮想化バックエンドの取り違え** | Docker VMM では外付けボリュームの bind mount が失敗する（docker/for-mac#7480） | §3.2 を必須前提として明記。`doctor.sh` で検査（DH-1） |
+| R-2 | **仮想化バックエンドの取り違え** | Docker VMM では外付けボリュームの bind mount が失敗する（docker/for-mac#7480） | **クローズ**（2026-09-12 実測で `UseVirtualizationFramework = True`）。設定変更による再発を検知するため `doctor.sh` DH-1 は残す |
 | R-3 | **bind mount のパーミッション**（non-root uid 1000 で exFAT/FAT32 のファイルを読めるか、削除できるか） | 読めない / 消せない | P0-9 / P0-8 で検証。必要なら uid を調整する |
 | R-4 | **whisper.cpp の CPU 実行速度** | 1 日分の処理が 8 時間を超えると翌日分に追いつけず遅延が累積する | Phase 2 で実測。VAD が最大の対策。未達なら `medium-q5_0` → `small-q5_1`。恒久対策は §23 の Mac ネイティブ化 |
-| R-5 | **whisper.cpp の VAD サポート**（オプション名・VAD モデルの取得元） | VAD が使えないと処理時間が数倍になり、無音区間の幻覚も残る | 実装時に `whisper-cli --help` で確認（§10.6, §18.6）。使えない場合は Phase 2 の所要時間要件を再評価 |
+| R-5 | **whisper.cpp の VAD サポート**（オプション名・VAD モデルの取得元） | VAD が使えないと処理時間が数倍になり、無音区間の幻覚も残る | **クローズ**（2026-09-12。v1.9.4 に §10.6 の 6 フラグが逐語一致で存在。VAD モデル URL は HTTP 200）。`WHISPER_CPP_REF` を上げる際は D-7 で再確認する |
 | R-6 | **送信機 2 台使用時の見え方** | Volume が 2 個か 1 個かで走査範囲が変わる | P0-10 で検証。Session は device_id + 日付で分かれるため、Volume が 2 個なら Daily ノートも 2 枚になる |
 | R-7 | **受信機（RX）側ストレージ** | 取り込み対象に含めるべきか未確定 | P0-12 で調査のみ。MVP のスコープ外（§1.6） |
 | R-8 | **`_orig` / denoised の実際の生成有無** | 設定によっては片方しか生成されない | §5.3 でどちらのケースも扱えるよう設計済み。P0-4 / P0-13 で確認 |
 | R-9 | **ディスク使用量** | staging が溢れると処理が止まる | 原本をコピーしない設計（§10.5）により 1 日 1.8 GB が流れるのみで、常駐使用量は 200 MB 未満。`staging_max_bytes: 5 GiB` は異常時の歯止め |
 | R-10 | **原本音声の完全削除**（§1.4 で受容） | 文字起こしに誤りがあっても聞き直せない | §14.1 の厳格な条件、§14.2 の二重ロック、§20.4 の削除禁止テスト群で補う。**Raw ノートにより文字起こし本文は必ず残る** |
 | R-11 | **whisper.cpp のバージョン固定** | 未知の回帰の可能性 | `ARG WHISPER_CPP_REF` で固定。問題があれば 1 つ前の tag へ戻す |
-| R-12 | **Docker Model Runner の API 仕様変更 / モデルタグの変動** | LLM 呼び出しが壊れる | OpenAI 互換部分のみに依存する。タグは `docker model pull` で実在確認してから固定。`doctor` の D-12 で疎通を常時検証 |
+| R-12 | **Docker Model Runner の API 仕様変更 / モデルタグの変動** | LLM 呼び出しが壊れる | OpenAI 互換部分のみに依存する。タグは 2026-09-12 に Docker Hub で実在を確認済み（`ai/qwen3:30b-a3b-instruct-2507-q4_K_M`）。Model Runner 自体の疎通は #13 と `doctor` の D-12 で検証する |
 | R-13 | **Obsidian の同期中（iCloud / Obsidian Sync）にファイルを書く競合** | 部分的なファイルが同期される | atomic write（§13.6）と `.` 始まりの一時ファイル名で緩和。完全な回避は不可 |
 | R-14 | **DJI 本体の容量**（32 GB ＝ 両 Variant で約 23 時間） | 毎日接続しないと本体が満杯になり録音が止まる | `status` / `doctor` に残容量と推定残り録音時間を表示（§17.2, D-6）。P0-13 で `_orig` 保存をオフにできれば録音可能時間が倍になる |
 | R-15 | **無音区間の幻覚**（whisper が定型文を生成する既知の挙動） | 要約に実在しない内容が混ざる | VAD で緩和するが完全には消えない。Raw ノートに原文が残るため検証は可能。プロンプトでも「存在しない事実を追加しない」を指示（§12.5） |
 | R-16 | **処理の遅延蓄積** | 1 日 32 Part の直列処理が追いつかないと未処理が溜まる | `status` に「未処理 Part の合計時間」を表示して可視化（§17.2）。閾値超過時は Whisper モデルを下げる |
 | R-17 | **失敗 Part を除外して進む設計** | 1 日のノートが一部欠けたまま確定する | 欠落を隠さず frontmatter（`voicedock_failed_parts`）と本文の警告行に明記する（§13.4）。欠落分の音声は削除されない。復旧後は再オープンで作り直される |
 | R-18 | **Daily ノートの手動編集との競合** | ユーザーがノートを編集すると `output_sha256` が不一致になり、削除が止まる（安全側）。再オープン時には編集内容が上書きされる | 削除は止まるだけで害はない。編集を保持したい場合は別ノートへ切り出す運用とする。§23 で追記マージを検討 |
+| R-19 | **`/Volumes/Macintosh HD` が `/` への symlink**（実機で実在を確認） | `Path.parents` は字句的判定のため、パス封じ込めを擦り抜ける経路が理論上残る | §14.1.1 を `realpath` 解決後の判定へ改訂（**本版で対応済**）。§5.4 でボリュームルートが symlink なら走査対象から外す。ND-20 で検証 |
+| R-20 | **DJI 以外のマウント済みボリューム**（実機の `/Volumes` には `Macintosh HD` のほか、時期によって `PATLABOR`・`NO NAME` などが現れる） | 走査対象に混ざる。名前が回によって変わるため固定の除外リストでは守れない | §5.4 の判定（DJI 形式のフォルダ／ファイルの実在を要求）で除外されるはず。`device.exclude_volumes` の既定へ追加すべきかは **#2 で判断する** |
+| R-21 | **Compose がメジャー 5 系**（5.5.1）であり、`models` 長構文による環境変数注入の実挙動が未確認 | LLM 接続が立ち上がらない | **#13 で検証**し、`VOICEDOCK_LLM_URL` の実際の形（`/engines/v1` の有無など）を `docs/POC.md` へ記録する |
 
 ---
 
@@ -3152,7 +3303,32 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 ---
 
-## 付録 A. v3.1 からの主な変更点
+## 付録 A. v3.2 から v3.3 への主な変更点
+
+v3.3 は、**実装に着手する前に、仕様書に残っていた事実誤りと仕様内の不整合を潰す**ことだけを目的とした
+改訂である。**処理の内容・安全設計・設定項目の意味は 1 つも変えていない**（追加は V-27 と
+`SOURCE_MISSING` の 2 件のみ）。
+
+| # | 変更 | 理由 |
+|---|---|---|
+| C-1 | **LLM モデルタグを `ai/qwen3:30b-a3b-instruct-2507-q4_K_M` へ修正**（§18.2） | 旧タグ `30b-a3b-instruct-q4_K_M` は Docker Hub に存在しない。このままでは Phase 3 以降すべての `make up` が壊れる。フォールバック段も実在タグへ更新した |
+| C-2 | **VAD モデル URL を既定値として固定**（§18.6） | `TODO(Phase 0)` と `VAD_URL:?` のままではモデル取得が実行できなかった。v1.9.4 の `download-vad-model.sh` と同一の URL を確認（HTTP 200） |
+| C-3 | **VAD オプションを「確認済み」に更新**（§10.6, §22 R-5） | v1.9.4 に §10.6 の 6 フラグが逐語一致で存在する。追加 2 フラグ（`--vad-max-speech-duration-s` / `--vad-samples-overlap`）の存在も記録した |
+| C-4 | **§3.1 の実測値を確定**（Engine 29.7.2 / Compose 5.5.1） | `⚠ 要再取得` を残したままでは DH-3 の判定基準が決まらない。**Compose がメジャー 5 系**であることを明記し、`models` 要素の実挙動確認を #13 へ委ねた（R-21） |
+| C-5 | **パス封じ込めを `realpath` 解決後の判定へ改訂**（§14.1.1, §5.4, R-19） | `/Volumes/Macintosh HD` は `/` への symlink として実在する。`Path.parents` は字句的判定であり symlink を解決しないため、封じ込めを擦り抜ける経路が理論上残っていた |
+| C-6 | **`make test` をコンテナ内 pytest 実行へ**（§17.4, §18.3） | `test: ; pytest` は §3.3「ホストへ Python を入れない」と両立せず、**テストを走らせる手段が存在しなかった**。`Dockerfile` に `dev` ステージを足し、`compose.yaml` の `build.target: runtime` を必須とした。lock 生成も使い捨てコンテナへ |
+| C-7 | **単一パス時の Timeline 生成元を規定**（§12.4, §13.4） | 「チャンク 1 個なら単一パス」と「Timeline は Map 中間結果から」が両立しておらず、**E2E-01（1 分録音）で必ず踏む**穴だった |
+| C-8 | **Part transcript を正規化形式に一本化**（§10.6, §9.4） | 生 JSON と正規化形式のどちらを保存するか曖昧で、§9.4 の冪等判定がどちらのスキーマを読むか決まらなかった |
+| C-9 | **Raw ノート失敗の帰属規則を追加**（§9.3, §10.7） | `RAW_WRITING → FAILED` は Part 状態だが、Raw ノートはセッション単位で再生成される。どの Part を `FAILED` にするか未定で、全 Part を巻き添えにすると 1 回の失敗で全 Part の再試行上限を消費した |
+| C-10 | **`DISCOVERED → SKIPPED` を遷移表へ追記し `SOURCE_MISSING` を新設**（§9.1, §9.3, §15.1, §15.2） | §9.1 の図にだけ存在し、遷移表に無かった。`FAILED` にすると自動再試行が無限に空回りするため `SKIPPED`（非失敗・削除対象外）とした |
+| C-11 | **V-27 を追加**（§7.3） | `obsidian.raw.granularity: part` のとき `filename_template` に `{part}` が無いと、Part ごとのファイルが同名衝突して上書きし合う |
+| C-12 | **`.dockerignore` と `requirements-dev.lock` を構成へ追加**（§6, §18.3） | 前者が無いと生成 fixture WAV・`tmp/`・`.git` が毎ビルド転送される。後者は C-6 の `dev` ステージが要求する |
+| C-13 | **§22 に R-19 / R-20 / R-21 を追加、R-2 / R-5 をクローズ** | 実測で潰れたリスクと、実測によって新たに判明したリスクを反映した |
+| C-14 | **§17.2 の版表示例を `v0.1.0` へ** | 文書版（v3.3）とアプリ版は別物である。未リリースの実態に合わせた |
+
+---
+
+## 付録 B. v3.1 から v3.2 への主な変更点
 
 v3.2 は、**実装に着手する前に「個人用途に対して過剰な構造」を削る**ことだけを目的とした改訂である。
 **機能・安全設計・設定項目は 1 つも削っていない。**処理の内容が変わる変更は含まれない。
@@ -3184,7 +3360,7 @@ v3.2 は、**実装に着手する前に「個人用途に対して過剰な構�
 
 ---
 
-## 付録 B. v3.0 から v3.1 への主な変更点
+## 付録 C. v3.0 から v3.1 への主な変更点
 
 v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間録り続ける」へ変わった**ことを起点に全面改訂したものである。
 
@@ -3221,7 +3397,7 @@ v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間
 
 ---
 
-## 付録 C. 参考資料
+## 付録 D. 参考資料
 
 Docker 公式ドキュメントを実装時の一次資料とする。
 
