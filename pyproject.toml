@@ -62,3 +62,10 @@ files = ["src", "tests"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
+# 外部の道具が要るテストの印。tests/conftest.py が利用可能性を見て自動 skip する。
+# CI は uv イメージで走るため ffmpeg も whisper-cli も無い（§18.5）。
+markers = [
+    "needs_ffmpeg: ffmpeg / ffprobe が要る（CI には無い。make test で走る）",
+    "needs_whisper: whisper-cli の実体が要る",
+    "needs_llm: LLM への実リクエストが要る（VOICEDOCK_LLM_URL が必要）",
+]

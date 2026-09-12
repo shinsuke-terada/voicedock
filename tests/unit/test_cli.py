@@ -8,7 +8,7 @@ import signal
 import pytest
 import yaml
 
-from tests.unit.test_config import complete_tree
+from tests.helpers import complete_tree
 from voicedock import __version__
 from voicedock.cli import IMPLEMENTED, SUBCOMMANDS
 from voicedock.errors import EXIT_CONFIG, EXIT_ERROR, EXIT_OK
