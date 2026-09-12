@@ -25,13 +25,15 @@ logs:   ; docker compose logs -f voicedock
 status: ; docker compose exec voicedock voicedock status
 
 # テストはコンテナ内で実行する。ホストに Python / pytest を入れない（SPEC §3.3, §17.4）
-# docs/ と config/ も渡す。SPEC と実装の整合をテストで固定するため（§17.4, tests/spec_sync.py）
+# docs/ と config/ と compose.yaml も渡す。仕様・設定・マウント点と実装の整合を
+# テストで固定するため（§17.4, tests/spec_sync.py, tests/unit/test_paths.py）
 test:
 	docker build --target dev -t voicedock:dev .
 	docker run --rm \
 	  -v "$(CURDIR)/tests:/app/tests:ro" \
 	  -v "$(CURDIR)/docs:/app/docs:ro" \
 	  -v "$(CURDIR)/config:/app/config:ro" \
+	  -v "$(CURDIR)/compose.yaml:/app/compose.yaml:ro" \
 	  voicedock:dev pytest -q
 
 # Lint と型検査も使い捨てコンテナで行う。ホストに ruff / mypy を入れない（§3.3）
