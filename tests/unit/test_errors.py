@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from tests.spec_sync import (
     spec_error_categories,
     spec_error_codes,
+    spec_error_next_states,
     spec_exit_codes,
     spec_startup_aborting_codes,
 )
@@ -39,8 +42,9 @@ CATEGORY_BY_SPEC_TEXT = {
     "DB": Category.DB,
 }
 
-# §15.2 の「自動再試行の対象外」
-AUTO_RETRY_EXEMPT = {
+# v4.6 の §15.2 が「自動再試行の対象外」として名指ししていた 6 件。
+# v5.0 でこの概念は廃止したが、**廃止できた前提を固定するために名前を残す**（付録 A L-3）。
+FORMERLY_AUTO_RETRY_EXEMPT = {
     ErrorCode.CONFIG_UNKNOWN_KEY,
     ErrorCode.CONFIG_INVALID_VALUE,
     ErrorCode.CONFIG_LOCK_MISMATCH,
@@ -107,25 +111,45 @@ def test_is_retryable_matches_spec_column() -> None:
         assert errors.is_retryable(ErrorCode(code)) is retry_text.startswith("可"), code
 
 
-def test_auto_retry_exempt_list() -> None:
-    """§15.2 が名指しする 6 件だけが対象外であること。"""
-    actual = {c for c in ErrorCode if errors.ERRORS[c].auto_retry_exempt}
-    assert actual == AUTO_RETRY_EXEMPT
+def test_error_spec_has_no_auto_retry_exemption() -> None:
+    """`ErrorSpec` が 3 フィールドであること（v5.0 で `auto_retry_exempt` を廃止）。
+
+    フィールドが戻るのは「§15.2 が時間で待つ設計に戻った」ことを意味する。
+    """
+    assert [f.name for f in dataclasses.fields(errors.ErrorSpec)] == [
+        "category",
+        "retry",
+        "aborts_startup",
+    ]
+    assert not hasattr(errors, "is_auto_retryable")
 
 
-def test_llm_invalid_json_is_auto_requeued() -> None:
-    """即時リトライは不可だが、24 時間後の自動再投入は行う（§15.2）。
+def test_llm_invalid_json_recovers_on_reconnect() -> None:
+    """即時リトライは不可だが、`FAILED` に残るので再評価で復帰する（§15.2）。
 
-    即時リトライの可否と自動再投入の可否は別の軸である。`retry` 列で自動再投入を
-    判定すると、LLM の一時的な出力崩れから永久に復帰できなくなる。
+    v4.6 はこれを「対象外リストに入っていないから 24 時間後に再投入される」と説明していた。
+    v5.0 は `FAILED` を無条件に再評価するので、**説明すべき例外が無くなった。**
     """
     assert errors.is_retryable(ErrorCode.LLM_INVALID_JSON) is False
-    assert errors.is_auto_retryable(ErrorCode.LLM_INVALID_JSON) is True
+    assert "FAILED" in spec_error_next_states()["LLM_INVALID_JSON"]
 
 
-def test_is_auto_retryable_excludes_only_the_exempt_list() -> None:
-    for code in ErrorCode:
-        assert errors.is_auto_retryable(code) is (code not in AUTO_RETRY_EXEMPT), code
+def test_formerly_exempt_codes_never_reach_failed() -> None:
+    """**`auto_retry_exempt` を廃止できた前提そのものを固定する**（付録 A L-3）。
+
+    v5.0 の §15.2 は「`FAILED` を無条件に再評価する」だけで、除外リストを持たない。
+    それが成り立つのは、v4.6 が除外していた 6 件がどれも **`FAILED` に来ない**
+    （設定系は起動中止、残りは Part `SKIPPED`）からである。
+
+    将来 §15.1 でこのどれかの遷移先を `FAILED` に変えたら、**その時点で
+    「直らない失敗を接続ごとに永久に再試行する」経路ができる。**このテストが
+    そこで落ち、除外の概念を戻す判断を強制する。
+    """
+    next_states = spec_error_next_states()
+    for code in FORMERLY_AUTO_RETRY_EXEMPT:
+        target = next_states[code.value]
+        assert "FAILED" not in target, (code, target)
+        assert "起動中止" in target or "SKIPPED" in target, (code, target)
 
 
 def test_aborts_startup_matches_spec() -> None:

@@ -37,30 +37,26 @@ _LEVEL_ORDER: Final[Mapping[str, int]] = {
 # SPEC §16.4 の行の区切りを保つため整形を止める（照合しやすさのため）
 # fmt: off
 _EVENT_ORDER: Final[tuple[str, ...]] = (
-    "service_started", "service_stopping", "recovery_completed", "config_warning",
-    "device_detected", "device_lost", "device_unreadable", "device_excluded",
-    "helper_heartbeat_stale", "helper_recovered", "remount_readonly_failed",
-    "inbox_part_found", "inbox_meta_missing", "inbox_source_deleted", "source_hash_mismatch",
-    "delete_requested", "delete_result_received", "delete_timeout", "delete_queue_failed",
-    "deep_scan_started", "deep_scan_completed", "deep_scan_skipped",
-    "part_discovered", "part_skipped", "unparsable_filename", "file_not_stable",
-    "normalize_started", "normalize_completed", "normalize_failed", "duplicate_content",
-    "transcription_started", "transcription_completed", "transcription_failed",
-    "transcription_timeout", "no_speech_detected",
-    "raw_note_saved", "raw_note_write_failed", "raw_note_verify_failed",
-    "session_opened", "session_ready", "session_reopened", "session_merged",
-    "session_merge_failed", "session_empty",
-    "llm_started", "llm_completed", "llm_invalid_json", "llm_repair_attempted",
-    "llm_unavailable",
-    "wikilink_index_built", "wikilink_skipped",
-    "obsidian_saved", "obsidian_write_failed", "obsidian_verify_failed",
-    "source_delete_started", "source_deleted", "source_delete_failed",
-    "source_identity_mismatch", "source_delete_pending", "source_delete_skipped",
-    "staging_deleted", "staging_delete_failed",
-    "session_completed", "part_completed",
-    "disk_space_low", "retry_scheduled", "auto_retry_queued", "retry_exhausted",
+    "service_started", "service_stopping", "config_warning", "recovery_completed",
+    "helper_heartbeat_stale", "helper_recovered",
+    "part_discovered", "part_skipped", "unparsable_filename",
+    "normalize_completed", "normalize_failed",
+    "transcription_completed", "transcription_failed",
+    "raw_note_saved", "raw_note_failed",
+    "session_merged", "session_merge_failed", "session_empty", "session_reopened",
+    "llm_completed", "llm_failed",
+    "obsidian_saved", "obsidian_failed",
+    "delete_requested", "source_deleted", "source_delete_skipped", "source_delete_pending",
+    "disk_space_low",
 )
-"""SPEC §16.4 の並び。`tests/unit/test_log.py` が SPEC と行の並びまで突き合わせる。"""
+"""SPEC §16.4 の並び（28 件）。`tests/unit/test_log.py` が SPEC と行の並びまで突き合わせる。
+
+**新しいイベント名を足す前に §16.4 の原則を読むこと。**1 工程につき完了 1 件と失敗 1 件だけを
+置き、開始イベントは出さない。状態遷移は `events` テーブルが持つのでログへ二重に並べない。
+細かい分岐は名前を増やさず `reason=` / `error_code=` で表す。v4.6 の 68 件には
+**v4.0 / v4.1 で Helper へ移った処理のイベントが 9 件残っていた**（`device_*` / `deep_scan_*` /
+`file_not_stable`）。名前が増えるのは簡単で、消えないことがこの事故の原因である。
+"""
 # fmt: on
 
 EVENTS: Final[frozenset[str]] = frozenset(_EVENT_ORDER)

@@ -82,12 +82,50 @@ def spec_startup_aborting_codes() -> set[str]:
     return {code for code, next_state in rows if "起動中止" in next_state}
 
 
+def spec_error_next_states() -> dict[str, str]:
+    """§15.1 の表から「エラーコード → 遷移先列の原文」を返す。"""
+    rows = re.findall(
+        r"^\| `([A-Z][A-Z_]*)` \| [^|]*? \| [^|]*? \| [^|]*? \| ([^|]*?) \|",
+        _section("15.1"),
+        re.M,
+    )
+    if not rows:
+        pytest.fail("SPEC §15.1 の遷移先列を読み取れませんでした")
+    return {code: next_state.strip() for code, next_state in rows}
+
+
 def spec_event_names() -> list[str]:
     """§16.4 のコードブロックからイベント名を出現順に返す。"""
     m = re.search(r"```text\n(.*?)\n```", _section("16.4"), re.S)
     if m is None:
         pytest.fail("SPEC §16.4 のコードブロックを読み取れませんでした")
     return [name.strip() for name in re.split(r"[/\n]", m.group(1)) if name.strip()]
+
+
+def spec_subcommands() -> list[str]:
+    """§17.1 の 1 つめの表（残すサブコマンド）から名前を出現順に返す。
+
+    **v5.0 まで `tests/unit/test_cli.py` はこの一覧を直書きしていた。**SPEC の表に
+    サブコマンドを 1 行足しても何も落ちず、実装と食い違ったまま通ってしまう穴があった。
+    """
+    head, sep, _tail = _section("17.1").partition("**v5.0 で削除した")
+    if not sep:
+        pytest.fail("SPEC §17.1 の「残す」表と「削除した」表の境目が見つかりません")
+    found = re.findall(r"^\| `([a-z][a-z-]*)` \| ", head, re.M)
+    if not found:
+        pytest.fail("SPEC §17.1 のサブコマンド表を読み取れませんでした")
+    return found
+
+
+def spec_removed_subcommands() -> list[str]:
+    """§17.1 の 2 つめの表（v5.0 で削除したサブコマンド）から名前を出現順に返す。"""
+    _head, sep, tail = _section("17.1").partition("**v5.0 で削除した")
+    if not sep:
+        pytest.fail("SPEC §17.1 の「残す」表と「削除した」表の境目が見つかりません")
+    found = re.findall(r"^\| `([a-z][a-z-]*)` \| ", tail, re.M)
+    if not found:
+        pytest.fail("SPEC §17.1 の削除済みサブコマンド表を読み取れませんでした")
+    return found
 
 
 def spec_exit_codes() -> dict[int, str]:
