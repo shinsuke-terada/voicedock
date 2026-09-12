@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Final
 
 import pytest
 import yaml
@@ -170,3 +171,97 @@ def spec_retry_reset_statuses() -> set[str]:
     if matched is None:
         pytest.fail("SPEC §15.2 の retry_count リセット規則を読み取れませんでした")
     return set(re.findall(r"`([A-Z_]+)`", matched.group(1)))
+
+
+# --- §9 の状態機械 -------------------------------------------------------
+
+_TRANSITION_SKIP_SOURCES: Final = frozenset({"現状態", "---", "—", "各工程通過"})
+
+
+def spec_states(section: str) -> list[str]:
+    """§9.1 / §9.2 の状態表から状態名を出現順に返す。"""
+    found = re.findall(r"^\| `([A-Z_]+)` \|", _section(section), re.M)
+    if not found:
+        pytest.fail(f"SPEC §{section} の状態表を読み取れませんでした")
+    return found
+
+
+def spec_mermaid_edges(section: str) -> set[tuple[str, str]]:
+    """§9.1 / §9.2 の mermaid 図の辺。`[*] -->`（初期状態）は含めない。"""
+    m = re.search(r"```mermaid\n(.*?)\n```", _section(section), re.S)
+    if m is None:
+        pytest.fail(f"SPEC §{section} の mermaid を読み取れませんでした")
+    return {
+        (source, target)
+        for source, target in re.findall(
+            r"^\s*(\[\*\]|[A-Z_]+)\s*-->\s*([A-Z_]+)", m.group(1), re.M
+        )
+        if source != "[*]"
+    }
+
+
+def spec_initial_state(section: str) -> str:
+    """`[*] --> X` の X。"""
+    m = re.search(r"```mermaid\n(.*?)\n```", _section(section), re.S)
+    if m is None:
+        pytest.fail(f"SPEC §{section} の mermaid を読み取れませんでした")
+    found: list[str] = re.findall(r"^\s*\[\*\]\s*-->\s*([A-Z_]+)", m.group(1), re.M)
+    if len(found) != 1:
+        pytest.fail(f"SPEC §{section} の初期状態が 1 つに定まりません: {found}")
+    return found[0]
+
+
+def spec_transition_edges(entity: str) -> set[tuple[str, str]]:
+    """§9.3 の遷移表を辺集合へ正規化する。
+
+    `entity` は `"part"` または `"session"`。次の行は辺にしない。
+
+    - 現状態が `—`（行の作成）または `各工程通過`（`retry_count` の注記）
+    - 次状態が `（遷移なし）`
+    - 次状態が `X のまま`（§9.3 の注記どおり**遷移ではない**）
+
+    現状態の `` `A` / `B` `` は両方へ展開し、次状態の `直前の進行中状態（...）` は
+    括弧内の状態名へ展開する。
+    """
+    body = _section("9.3")
+    if "**Session:**" not in body:
+        pytest.fail("SPEC §9.3 の Part / Session の境目が見つかりません")
+    part_chunk, session_chunk = body.split("**Session:**", 1)
+    chunk = {"part": part_chunk, "session": session_chunk}[entity]
+
+    edges: set[tuple[str, str]] = set()
+    for source, _event, _guard, target, _effect in re.findall(
+        r"^\| (.+?) \| (.+?) \| (.+?) \| (.+?) \| (.+?) \|$", chunk, re.M
+    ):
+        if source in _TRANSITION_SKIP_SOURCES or target == "（遷移なし）" or "のまま" in target:
+            continue
+        for start in re.findall(r"`([A-Z_]+)`", source):
+            for end in re.findall(r"`([A-Z_]+)`", target):
+                edges.add((start, end))
+    if not edges:
+        pytest.fail(f"SPEC §9.3 の {entity} 表を読み取れませんでした")
+    return edges
+
+
+def spec_recovery_map() -> list[tuple[str, str]]:
+    """§9.4 の巻き戻し表（`A -> B` のコードブロック）。"""
+    m = re.search(r"```text\n((?:\w+\s+->\s+\w+.*\n)+)```", _section("9.4"))
+    if m is None:
+        pytest.fail("SPEC §9.4 の巻き戻し表を読み取れませんでした")
+    return re.findall(r"^(\w+)\s+->\s+(\w+)", m.group(1), re.M)
+
+
+def spec_status_tuple(name: str) -> list[str]:
+    """§14.1 のコードブロックにある `NAME = (...)` の中身。"""
+    m = re.search(rf"^{re.escape(name)} = \((.*?)\)$", _section("14.1"), re.S | re.M)
+    if m is None:
+        pytest.fail(f"SPEC §14.1 に {name} が見つかりません")
+    return re.findall(r'"([A-Z_]+)"', m.group(1))
+
+
+def spec_part_terminal_paragraph() -> set[str]:
+    """§9.1 の「**終端状態**（Session の進行判定に使う）」の段落から状態名を取る。"""
+    m = re.search(r"\*\*終端状態\*\*[^:：]*[:：]\s*(.+)", _section("9.1"))
+    if m is None:
+        pytest.fail("SPEC §9.1 の終端状態の段落を読み取れませんでした")
+    return set(re.findall(r"`([A-Z_]+)`", m.group(1)))
