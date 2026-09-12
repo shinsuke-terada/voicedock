@@ -1,0 +1,2 @@
+# このディレクトリは compose の bind mount 先として存在する必要がある。
+# config.example.yaml の中身は #9 が作る（SPEC §7.2）。

@@ -7,6 +7,7 @@ config 読み込みを前倒しすると環境変数の直読みが混入する�
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 
 from voicedock import __version__
@@ -35,7 +36,7 @@ SUBCOMMANDS: dict[str, str] = {
     "version": "バージョンを表示する",
 }
 
-IMPLEMENTED: frozenset[str] = frozenset({"version"})
+IMPLEMENTED: frozenset[str] = frozenset({"service", "version"})
 
 UNIMPLEMENTED_MESSAGE = "voicedock: サブコマンド '{name}' は未実装です（SPEC §17.1）。"
 
@@ -79,5 +80,27 @@ def dispatch(args: argparse.Namespace) -> int:
         print(__version__)
         return EXIT_OK
 
+    if command == "service":
+        return _service()
+
     print(UNIMPLEMENTED_MESSAGE.format(name=command), file=sys.stderr)
     return EXIT_ERROR
+
+
+def _service() -> int:
+    """常駐サービス。
+
+    TODO(#19): SPEC §10.0 の worker_loop() に置き換える。
+    現時点ではパイプラインが存在しないため、何も処理せずコンテナを常駐させるだけである。
+
+    即座に終了すると compose の `restart: unless-stopped` によりクラッシュループになり、
+    `docker compose exec` による確認が一切できなくなる。そのため待機する。
+    実装するときは、この関数の中身だけを差し替えること。
+    """
+    print(
+        "voicedock: service は未実装です（SPEC §10.0 / #19）。"
+        "パイプラインは何も処理しません。コンテナを常駐させるためだけに待機します。",
+        flush=True,
+    )
+    signal.pause()  # SIGTERM は tini が転送する（§18.3）
+    return EXIT_OK

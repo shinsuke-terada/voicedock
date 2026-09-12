@@ -5,7 +5,23 @@ UV_IMAGE ?= ghcr.io/astral-sh/uv:0.12.13-python3.12-trixie-slim
 UV_RUN = docker run --rm -v "$(CURDIR)":/w -w /w \
            -e UV_PROJECT_ENVIRONMENT=/tmp/.venv $(UV_IMAGE) sh -c
 
-.PHONY: test lint fmt lock
+.PHONY: up down logs status test lint fmt lock
+
+# bind mount 先を用意する。本来は helper/install.sh の仕事だが、それまでは make up が面倒を見る
+VOICEDOCK_HOME_DIRS = inbox queue state
+
+up:
+	@test -f .env || { echo "ERROR: .env がありません。cp .env.example .env してください"; exit 1; }
+	@set -a; . ./.env; set +a; \
+	  test -n "$$VOICEDOCK_HOME" || { echo "ERROR: .env の VOICEDOCK_HOME が空です"; exit 1; }; \
+	  for d in $(VOICEDOCK_HOME_DIRS); do mkdir -p "$$VOICEDOCK_HOME/$$d"; done
+	docker compose up -d --build
+
+down:   ; docker compose down
+logs:   ; docker compose logs -f voicedock
+
+# voicedock status は #33 まで未実装。終了コード 1 を返すが、ターゲットは隠さない
+status: ; docker compose exec voicedock voicedock status
 
 # テストはコンテナ内で実行する。ホストに Python / pytest を入れない（SPEC §3.3, §17.4）
 test:
