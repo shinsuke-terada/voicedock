@@ -1,0 +1,7 @@
+# SPEC §7.3 V-7 の違反。config.example.yaml へ patch を深くマージして使う。
+rule: V-7
+code: CONFIG_INVALID_VALUE
+key: session.group_by
+patch:
+  session:
+    group_by: week

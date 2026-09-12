@@ -1,0 +1,7 @@
+# SPEC §7.3 V-4 の違反。config.example.yaml へ patch を深くマージして使う。
+rule: V-4
+code: CONFIG_INVALID_VALUE
+key: device.poll_interval_seconds
+patch:
+  device:
+    poll_interval_seconds: 0

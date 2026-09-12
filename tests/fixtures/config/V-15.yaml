@@ -1,0 +1,9 @@
+# SPEC §7.3 V-15 の違反。config.example.yaml へ patch を深くマージして使う。
+# Literal で落ちるため RawConfig の after validator（V-27）は走らない
+rule: V-15
+code: CONFIG_INVALID_VALUE
+key: obsidian.raw.granularity
+patch:
+  obsidian:
+    raw:
+      granularity: hour

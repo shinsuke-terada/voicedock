@@ -1,0 +1,7 @@
+# SPEC §7.3 V-2 の違反。config.example.yaml へ patch を深くマージして使う。
+rule: V-2
+code: CONFIG_INVALID_VALUE
+key: audio.transcribe_variant
+patch:
+  audio:
+    transcribe_variant: both

@@ -1,11 +1,11 @@
-# VoiceDock 詳細仕様書 v4.1
+# VoiceDock 詳細仕様書 v4.2
 
 **DJI Mic 3 × ローカル文字起こし × ローカルLLM × Obsidian**
 
 | 項目 | 内容 |
 |---|---|
-| 文書版 | **v4.1（ホスト側 Helper アーキテクチャ / 検出設定の一本化）** |
-| 前身文書 | v4.0 / v3.4 / v3.3 / v3.2 / v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
+| 文書版 | **v4.2（設定検証の実装整合 / Helper 報告スキーマの明文化）** |
+| 前身文書 | v4.1 / v4.0 / v3.4 / v3.3 / v3.2 / v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
 | 作成日 | 2026-09-11 |
 | 改訂日 | 2026-09-12 |
 | 実測記録 | `docs/POC.md`（Phase 0 の実測値と判断。本書と食い違う場合は POC.md を正とする） |
@@ -732,7 +732,7 @@ superfloppy のいずれも）は VirtioFS でも完全に動作した。
 
 | # | 失うもの | 埋め合わせ |
 |---|---|---|
-| 1 | **原本コピー工程が復活する。**v3.1 が意図して廃止した（付録 E の A-4） | inbox の原本は `NORMALIZED` の検証後に即削除する。常駐使用量は数 GB に収まる（§10.5） |
+| 1 | **原本コピー工程が復活する。**v3.1 が意図して廃止した（付録 F の A-4） | inbox の原本は `NORMALIZED` の検証後に即削除する。常駐使用量は数 GB に収まる（§10.5） |
 | 2 | ホストの書き込みが 1 日 1.8 GB → **約 10 GB** へ増える | 同上。SSD 寿命より「工程と状態が 1 つ増える」ことのほうが本質的なコスト |
 | 3 | **削除の実行がコンテナの外へ出る。**§20.4 のテスト境界をまたぐ | §14.2 を三重ロックへ。reaper に**独立検証**を持たせ、§20.4 を 2 層に分けて ND-24〜ND-28 を追加する |
 | 4 | 「Mac へインストールするのは Docker Desktop と Obsidian だけ」が崩れる（§3.3） | Helper は base system だけで動く bash スクリプト 2 本。中身をユーザーが読める |
@@ -1099,14 +1099,21 @@ database:
 | V-25 | `transcription.vad.enabled == true` なら `vad.model` が存在する | `WHISPER_MODEL_MISSING` |
 | V-26 | `cleanup.delete_source_audio == true` の場合、起動ログに警告を出す | 警告のみ（§14.3） |
 | V-27 | `obsidian.raw.granularity == "part"` なら `obsidian.raw.filename_template` に `{part}` を含む | `CONFIG_INVALID_VALUE`（含まないと Part ごとのファイルが同名衝突する） |
-| V-28 | `.env` の `VOICEDOCK_HOME` が設定され、実在し、**`/Users` 配下である** | `CONFIG_INVALID_VALUE`（VirtioFS が扱えるのはローカルディスク上のパスのみ。§5.6） |
+| V-28 | ~~`.env` の `VOICEDOCK_HOME` が設定され、実在し、**`/Users` 配下である**~~ **v4.2 で廃止**（ホスト側の検査。コンテナはホストのパスを見ないため構造的に検証できない。**DH-13 が同内容を含む**） | — |
 | V-29 | `import.inbox_retain` が `normalized` / `raw_saved` のいずれか | `CONFIG_INVALID_VALUE` |
-| V-30 | `cleanup.delete_source_audio == true` のとき、**`helper.conf` の `delete_source_audio` も `true`** | `CONFIG_LOCK_MISMATCH`（片方だけの解除は事故。§14.2） |
+| V-30 | `cleanup.delete_source_audio == true` のとき、**`state/heartbeat.json` の `delete_source_audio` も `true`**（§7.5）。**`false` と確定した場合のみ違反**とする。heartbeat が無い / 古い / 当該フィールドを持たない場合は**警告のみで起動は続ける** | `CONFIG_LOCK_MISMATCH`（片方だけの解除は事故。§14.2） |
 | V-31 | `import.helper_heartbeat_max_age_seconds >= 60` | `CONFIG_INVALID_VALUE` |
+| V-32 | `timezone` が `zoneinfo.ZoneInfo` で解決できる | `CONFIG_INVALID_VALUE`（§8.2 / §10.4 / §16 が使う中核の値。タイポは実行時の未処理例外になる） |
 
 > **廃止した規則の番号は詰めない。**V-7 以降を繰り上げると本文中の参照がすべてずれる。
 > **`INCLUDE_VOLUMES` / `EXCLUDE_VOLUMES` に対する V 規則は作らない。**V-* は `config.py` が
 > `config.yaml` を検証する規則であり、`helper.conf` は対象外である（検証は §7.4 と DH-13 が担う）。
+
+> **コンテナは `helper.conf` を読まない。**V-30 が参照するのは Helper が `state/heartbeat.json` へ
+> 写した値である（§7.5）。**`helper.conf` を直読みしてはならない**（§7 の系統境界）。
+> なお §14.1.1 の reaper 検証 1 が `helper.conf` を独立に読むため、**ロック 1 の安全性は V-30 が
+> 無くても成立している。**V-30 は「片方だけ解除して、削除されないまま黙って運用が続く」ことを
+> ユーザへ知らせるための規則である。だから**起動を止めるのは食い違いが確定したときだけ**でよい。
 
 ### 7.4 `<VOICEDOCK_HOME>/helper.conf`
 
@@ -1196,6 +1203,51 @@ declare -p INCLUDE_VOLUMES 2>/dev/null | grep -q '^declare -a'
 > `./config:/app/config:ro` でコンテナへ bind mount されるが、**Helper は Docker が止まっていても
 > 動く**必要がある（Docker Desktop の起動前にデバイスが挿されうる）。YAML を bash で読むのも
 > 現実的でない。**取り込みが Docker の状態に依存しないこと**を設計として優先した。
+
+### 7.5 `<VOICEDOCK_HOME>/state/` — Helper からコンテナへの一方向報告
+
+`state/` は **`/state:ro`** でマウントする（§18.2）。**コンテナは書き込めない。**
+コンテナが自分に都合よく書き換えて削除判断を通す経路を作らないためである（§14.4）。
+
+`state/heartbeat.json`:
+
+```json
+{
+  "schema": 1,
+  "updated_at": "2026-08-30T07:00:12+09:00",
+  "helper_version": "4.2.0",
+  "mount_mode": "ro",
+  "mount_readonly": true,
+  "delete_source_audio": false,
+  "reaper_installed": false,
+  "include_volumes": [],
+  "exclude_volumes": ["Macintosh HD", "com.apple.TimeMachine.*", ".*"],
+  "config_error": null
+}
+```
+
+| キー | 型 | 読む主体 | 用途 |
+|---|---|---|---|
+| `schema` | int | — | 形式の版。増えたときに古いコンテナが黙って誤読しないようにする |
+| `updated_at` | ISO8601（オフセット付き） | H-8 / D-18 | Helper の生存。**ファイルの mtime は使わない**（bind mount 越しの mtime を信用しない） |
+| `helper_version` | str | D-18 | 版の表示 |
+| `mount_mode` | `"ro"` \| `"rw"` | D-17 | 安全ロック 2-B の**設定値**（`helper.conf` の `MOUNT_MODE`） |
+| `mount_readonly` | bool | D-18 / reaper 検証 2 | 安全ロック 2-B が**実際にかかったか**（§14.2。再マウント失敗時は `false`） |
+| `delete_source_audio` | bool | **V-30** / D-17 | 安全ロック 1 の Helper 側の値（`helper.conf` の `DELETE_SOURCE_AUDIO`） |
+| `reaper_installed` | bool | D-17 | 安全ロック 2-A。**コンテナはホストの `bin/` を見られない**ため Helper が報告する |
+| `include_volumes` | list[str] | D-18 | 実効値の表示（§7.4） |
+| `exclude_volumes` | list[str] | D-18 | 同上 |
+| `config_error` | str \| null | H-8 / D-18 | `helper.conf` の起動時検証（§7.4）の違反内容。正常なら `null` |
+
+**コンテナ側は未知のキーを無視して読む。**`config.yaml` が未知キーを拒否する（V-1）のと非対称だが、
+`config.yaml` は**人が書く**のでタイポが問題になり、`heartbeat.json` は**Helper が書く**ので
+フィールドが増えてもコンテナが壊れないことが優先される。
+
+**壊れた JSON・欠落したキーは「不明」として扱い、例外にしてはならない。**Helper の書き込み途中を
+読む可能性があるためである。**不明は常に安全側へ倒す**（＝削除しない / 警告する）。
+
+`state/inventory.json`（D-5 が使う Volume 一覧）の形式は**まだ規定していない。**Helper 実装の
+チケットで定める。
 
 ---
 
@@ -2792,7 +2844,7 @@ def can_delete_source(part, session, cfg, device) -> bool:
 > **要求は絶対パスを持たない。**`relpath`（ボリュームルートからの相対パス）だけを載せる。
 > reaper は `device_id` と名前が一致する**現在マウント中のボリューム**に対してのみ解決する。
 > これにより **「要求がボリューム外のパスを指名すること」自体が構造的に不可能**になる。
-> v3.x は DB に絶対パスを持ち、それを信じて削除していた（付録 E の A-13）。v4.0 はその余地を消した。
+> v3.x は DB に絶対パスを持ち、それを信じて削除していた（付録 F の A-13）。v4.0 はその余地を消した。
 
 **reaper の検証（11 項目）。1 つでも偽なら削除せず、結果に `SOURCE_IDENTITY_MISMATCH` を書く。**
 
@@ -3144,7 +3196,7 @@ make logs
 ### 16.4 イベント名一覧
 
 ```text
-service_started / service_stopping / recovery_completed
+service_started / service_stopping / recovery_completed / config_warning
 device_detected / device_lost / device_unreadable / device_excluded
 helper_heartbeat_stale / helper_recovered / remount_readonly_failed
 inbox_part_found / inbox_meta_missing / inbox_source_deleted / source_hash_mismatch
@@ -3287,6 +3339,7 @@ test:
 	docker run --rm \
 	  -v "$(CURDIR)/tests:/app/tests:ro" \
 	  -v "$(CURDIR)/docs:/app/docs:ro" \
+	  -v "$(CURDIR)/config:/app/config:ro" \
 	  voicedock:dev pytest -q
 
 # Lint と型検査も使い捨てコンテナで行う。ホストに ruff / mypy を入れない（§3.3）
@@ -3317,6 +3370,8 @@ lock:
 **`docs/SPEC.md` を parse して突き合わせる**（`tests/spec_sync.py`）。SPEC に 1 行足して実装を
 忘れる、あるいは実装だけ増やして SPEC に書き忘れる、という事故が即座に落ちる。
 **SPEC が見つからない場合は skip せず fail する。**黙って通すと整合テストが無いのと同じになる。
+`config/` を渡すのは、`config/config.example.yaml` が §7.2 の YAML ブロックの完全な写しで
+あることを突き合わせるためである（§7.2 に既定値を足して写し忘れる事故を落とす）。
 
 **`make lock` も同様に使い捨てコンテナで行う。**`uv.lock` と `requirements.lock` /
 `requirements-dev.lock` は生成後にコミットする（§18.5）。`UV_IMAGE` はタグを固定する（§18.1）。
@@ -3754,6 +3809,15 @@ VoiceDock doctor
 16 checks passed, 0 failed, 2 notices
 ```
 
+**行の書式**: `[<記号>] <ラベル（21 桁左詰め）><詳細>`。記号は **`[✓]` 合格 / `[!]` 注意 /
+`[✗]` 失敗 / `[-]` 前提が崩れて実行できなかった（skip）** の 4 種。詳細の続き行は **27 桁**
+インデントする。区切り線は `─` を **56 個**。末尾のサマリは表示した行を状態別に数える
+（`[-]` は数えない。既に数えた失敗の結果だから）。
+
+**コンテナが設定エラーで起動できないとき**（終了コード 2）は `restart: unless-stopped` により
+再起動を繰り返すため `docker compose exec` が使えない。この場合は
+**`docker compose run --rm voicedock voicedock doctor`** で単発起動して診断する。
+
 | # | 検査 | 失敗時の扱い |
 |---|---|---|
 | D-1 | 設定ファイルが存在し、全バリデーション規則（§7.3）を通る | 致命的 |
@@ -4121,7 +4185,25 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 ---
 
-## 付録 A. v4.0 から v4.1 への主な変更点
+## 付録 A. v4.1 から v4.2 への主な変更点
+
+v4.2 は、**§7.3 の検証規則を実装可能な形へ整え、Helper からコンテナへの報告形式を明文化する**
+改訂である。**§14 の削除設計には一切触れていない。**
+
+| # | 変更 | 理由 |
+|---|---|---|
+| G-1 | **V-28 を廃止**（§7.3） | ホスト側の検査であり、**コンテナはホストのパスを見ない**ため構造的に検証できない（見えるのは `/inbox` `/queue` `/state`）。DH-13 が「`<VOICEDOCK_HOME>` が存在し `/Users` 配下である」を同内容で含む。**番号は詰めない** |
+| G-2 | **V-30 を `state/heartbeat.json` 経由へ**（§7.3, §7.5） | **コンテナは `helper.conf` を読まない**（§7.4）。実装できない規則が表に残っていた。あわせて、食い違いが**確定**したときだけ起動中止とし、heartbeat が無い / 古いときは**警告に留める**（Helper が復帰するまでクラッシュループさせない） |
+| G-3 | **§7.5 を新設**（`state/heartbeat.json` のスキーマ） | H-8 / D-17 / D-18 / V-30 / reaper 検証 2 の**5 箇所から参照されているのに、形式がどこにも定義されていなかった**。`delete_source_audio` と `reaper_installed` はコンテナがホストを見られないため Helper が報告するしかない |
+| G-4 | **V-32 を新設**（§7.3） | `timezone` は §8.2 / §10.4 / §16 が使う中核の値なのに検証規則が無く、**タイポが実行時の未処理例外**になっていた |
+| G-5 | **§19.2 に行の書式と記号を規定**（§19.2） | 出力例に `[✓]` と `[!]` しか現れず、失敗と skip の記号・ラベル桁・続き行の桁が未定義だった。実装者ごとに揃わない |
+
+> **§19.2 の出力例のサマリ（`16 checks passed`）は v3.x 当時の数字で、例に並ぶ行数と合っていない。**
+> 例そのものは doctor の総仕上げ（#34）で実出力へ差し替える。
+
+---
+
+## 付録 B. v4.0 から v4.1 への主な変更点
 
 v4.1 は、**走査対象の許可リストを追加し、あわせて v4.0 が残した設定の積み残しを解消する**改訂である。
 **§14 の削除設計には一切触れていない。**変更範囲は検出側だけである。
@@ -4143,7 +4225,7 @@ v4.1 は、**走査対象の許可リストを追加し、あわせて v4.0 が�
 
 ---
 
-## 付録 B. v3.4 から v4.0 への主な変更点
+## 付録 C. v3.4 から v4.0 への主な変更点
 
 v4.0 は、**#2 の実機検証で現行アーキテクチャが成立しないと判明したことを受けた構成変更**である。
 
@@ -4170,7 +4252,7 @@ Obsidian 出力）、状態機械の骨格、設定項目の意味。
 
 ---
 
-## 付録 C. v3.3 から v3.4 への主な変更点
+## 付録 D. v3.3 から v3.4 への主な変更点
 
 v3.4 は、**#2（Phase 0 PoC）で DJI Mic 3 の実機から得た測定値を反映する**ことだけを目的とした改訂である。
 **機能・安全設計・設定項目は 1 つも変えていない。**実測値の出典はすべて `docs/POC.md` §6。
@@ -4191,7 +4273,7 @@ v3.4 は、**#2（Phase 0 PoC）で DJI Mic 3 の実機から得た測定値を�
 
 ---
 
-## 付録 D. v3.2 から v3.3 への主な変更点
+## 付録 E. v3.2 から v3.3 への主な変更点
 
 v3.3 は、**実装に着手する前に、仕様書に残っていた事実誤りと仕様内の不整合を潰す**ことだけを目的とした
 改訂である。**処理の内容・安全設計・設定項目の意味は 1 つも変えていない**（追加は V-27 と
@@ -4216,7 +4298,7 @@ v3.3 は、**実装に着手する前に、仕様書に残っていた事実誤�
 
 ---
 
-## 付録 E. v3.1 から v3.2 への主な変更点
+## 付録 F. v3.1 から v3.2 への主な変更点
 
 v3.2 は、**実装に着手する前に「個人用途に対して過剰な構造」を削る**ことだけを目的とした改訂である。
 **機能・安全設計・設定項目は 1 つも削っていない。**処理の内容が変わる変更は含まれない。
@@ -4248,7 +4330,7 @@ v3.2 は、**実装に着手する前に「個人用途に対して過剰な構�
 
 ---
 
-## 付録 F. v3.0 から v3.1 への主な変更点
+## 付録 G. v3.0 から v3.1 への主な変更点
 
 v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間録り続ける」へ変わった**ことを起点に全面改訂したものである。
 
@@ -4285,7 +4367,7 @@ v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間
 
 ---
 
-## 付録 G. 参考資料
+## 付録 H. 参考資料
 
 Docker 公式ドキュメントを実装時の一次資料とする。
 

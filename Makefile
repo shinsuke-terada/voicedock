@@ -12,6 +12,7 @@ VOICEDOCK_HOME_DIRS = inbox queue state
 
 up:
 	@test -f .env || { echo "ERROR: .env がありません。cp .env.example .env してください"; exit 1; }
+	@test -f config/config.yaml || { echo "ERROR: config/config.yaml がありません。cp config/config.example.yaml config/config.yaml してください"; exit 1; }
 	@set -a; . ./.env; set +a; \
 	  test -n "$$VOICEDOCK_HOME" || { echo "ERROR: .env の VOICEDOCK_HOME が空です"; exit 1; }; \
 	  for d in $(VOICEDOCK_HOME_DIRS); do mkdir -p "$$VOICEDOCK_HOME/$$d"; done
@@ -24,12 +25,13 @@ logs:   ; docker compose logs -f voicedock
 status: ; docker compose exec voicedock voicedock status
 
 # テストはコンテナ内で実行する。ホストに Python / pytest を入れない（SPEC §3.3, §17.4）
-# docs/ も渡す。SPEC と実装の整合をテストで固定するため（§17.4, tests/spec_sync.py）
+# docs/ と config/ も渡す。SPEC と実装の整合をテストで固定するため（§17.4, tests/spec_sync.py）
 test:
 	docker build --target dev -t voicedock:dev .
 	docker run --rm \
 	  -v "$(CURDIR)/tests:/app/tests:ro" \
 	  -v "$(CURDIR)/docs:/app/docs:ro" \
+	  -v "$(CURDIR)/config:/app/config:ro" \
 	  voicedock:dev pytest -q
 
 # Lint と型検査も使い捨てコンテナで行う。ホストに ruff / mypy を入れない（§3.3）

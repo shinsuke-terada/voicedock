@@ -1,7 +1,8 @@
 """CLI のパーサ定義とディスパッチ（SPEC §17.1, §17.3）。
 
-このモジュールは設定を読まない。SPEC §7 は「設定の出所を二重にしない」と規定しており、
-config 読み込みを前倒しすると環境変数の直読みが混入する。設定は #9（config.py）が担う。
+設定の読み込みは `config.py` に任せ、**このモジュールは環境変数を読まない。**
+SPEC §7 は「設定の出所を二重にしない」と規定しており、ここで env を直読みすると
+`config.yaml` と出所が二重になる。
 """
 
 from __future__ import annotations
@@ -10,11 +11,12 @@ import argparse
 import signal
 import sys
 
-from voicedock import __version__
-from voicedock.errors import EXIT_ERROR, EXIT_OK
+from voicedock import __version__, doctor
+from voicedock.config import ConfigError, load_config, logger_for, startup_notices
+from voicedock.errors import EXIT_CONFIG, EXIT_ERROR, EXIT_OK
 
 # --- サブコマンド（SPEC §17.1） ------------------------------------------
-# 実装済みは version のみ。残りは --help に並べ、呼ばれたら EXIT_ERROR を返す。
+# 未実装のものも --help に並べ、呼ばれたら EXIT_ERROR を返す（IMPLEMENTED が唯一の出所）。
 SUBCOMMANDS: dict[str, str] = {
     "service": "常駐サービスを起動する（コンテナの既定 CMD）",
     "scan": "走査を 1 回だけ実行して結果を表示する",
@@ -29,7 +31,7 @@ SUBCOMMANDS: dict[str, str] = {
     "version": "バージョンを表示する",
 }
 
-IMPLEMENTED: frozenset[str] = frozenset({"service", "version"})
+IMPLEMENTED: frozenset[str] = frozenset({"doctor", "service", "version"})
 
 UNIMPLEMENTED_MESSAGE = "voicedock: サブコマンド '{name}' は未実装です（SPEC §17.1）。"
 
@@ -73,6 +75,9 @@ def dispatch(args: argparse.Namespace) -> int:
         print(__version__)
         return EXIT_OK
 
+    if command == "doctor":
+        return doctor.run()
+
     if command == "service":
         return _service()
 
@@ -84,12 +89,30 @@ def _service() -> int:
     """常駐サービス。
 
     TODO(#19): SPEC §10.0 の worker_loop() に置き換える。
-    現時点ではパイプラインが存在しないため、何も処理せずコンテナを常駐させるだけである。
+    現時点ではパイプラインが存在しないため、設定を検証したあと常駐するだけである。
 
     即座に終了すると compose の `restart: unless-stopped` によりクラッシュループになり、
     `docker compose exec` による確認が一切できなくなる。そのため待機する。
-    実装するときは、この関数の中身だけを差し替えること。
+    実装するときは、待機している箇所だけを差し替えること。
     """
+    try:
+        cfg = load_config()
+    except ConfigError as e:
+        # 設定が読めていない時点では logging.format / level / timezone が分からず、
+        # 構造化ログを組み立てられない。stderr のプレーンテキストで出す。
+        print(
+            f"voicedock: 設定エラー（SPEC §7.3）。起動を中止します: {e.path}",
+            file=sys.stderr,
+        )
+        for violation in e.violations:
+            print(f"  {violation.render()}", file=sys.stderr)
+        return EXIT_CONFIG
+
+    log = logger_for(cfg)
+    for notice in startup_notices(cfg):
+        log.warning("config_warning", rule=notice.rule, message=notice.message)
+    log.info("service_started", version=__version__)
+
     print(
         "voicedock: service は未実装です（SPEC §10.0 / #19）。"
         "パイプラインは何も処理しません。コンテナを常駐させるためだけに待機します。",
