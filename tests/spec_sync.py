@@ -143,3 +143,30 @@ def spec_validation_rules() -> dict[str, str]:
     if not rules:
         pytest.fail("SPEC §7.3 の表を読み取れませんでした")
     return rules
+
+
+def spec_schema_sql() -> list[str]:
+    """§8.2 / §8.3 / §8.4 / §8.5 の ```sql ブロックを出現順に返す。
+
+    これを空の DB へ流したものが**スキーマの正**である。マイグレーションで作った構造と
+    `PRAGMA` レベルで突き合わせることで、SPEC に列を足して写し忘れる事故が落ちる。
+    """
+    blocks: list[str] = []
+    for section in ("8.2", "8.3", "8.4", "8.5"):
+        found = re.findall(r"```sql\n(.*?)\n```", _section(section), re.S)
+        if not found:
+            pytest.fail(f"SPEC §{section} の sql ブロックを読み取れませんでした")
+        blocks += found
+    return blocks
+
+
+def spec_retry_reset_statuses() -> set[str]:
+    """§15.2 の「工程を通過したら 0 にリセットする」で名指しされた状態。"""
+    matched = re.search(
+        r"`retry_count` は「現在の工程での連続失敗回数」を意味する.*?（(.*?)への遷移時）",
+        _section("15.2"),
+        re.S,
+    )
+    if matched is None:
+        pytest.fail("SPEC §15.2 の retry_count リセット規則を読み取れませんでした")
+    return set(re.findall(r"`([A-Z_]+)`", matched.group(1)))

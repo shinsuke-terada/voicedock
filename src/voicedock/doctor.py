@@ -1,14 +1,18 @@
 """環境診断（SPEC §19.2）。
 
-**検査は 1 チケット 1 行ずつ増える。**本チケットは D-1（設定）だけを実装し、
-レジストリの枠組みを先に置く。「新しい PR をマージしたら doctor の行が 1 本増える」ことを
-毎回の動作確認手段にするためである。
+**検査は 1 チケット 1 行ずつ増える。**「新しい PR をマージしたら doctor の行が 1 本増える」
+ことを毎回の動作確認手段にしている。現在は D-1（設定）/ D-2（DB）/ D-3（データ領域）。
+
+**診断は副作用を持ってはならない。**D-2 は `migrate=False` で接続する — doctor が
+スキーマを作ってしまうと「DB が無い」ことを「DB が無い」と報告できなくなる。
 
 出力の書式は §19.2 に規定がある。記号・ラベル桁・続き行の桁をここで一箇所に持つ。
 """
 
 from __future__ import annotations
 
+import shutil
+import sqlite3
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -16,6 +20,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import IO, Any, Final
 
+from voicedock import db, paths
 from voicedock.config import (
     ConfigError,
     ConfigUnreadable,
@@ -121,8 +126,80 @@ def check_config(ctx: Context) -> list[Row]:
     return rows
 
 
+MIB: Final = 1024 * 1024
+GIB: Final = 1024 * 1024 * 1024
+
+
+def check_database(ctx: Context) -> list[Row]:
+    """D-2: DB へ接続でき、スキーマ版が最新であること。件数とサイズを表示する。"""
+    path = Path(ctx.config.database.path)
+    if not path.is_file():
+        return [Row(Status.FAIL, "Database", f"{path}  （ありません）")]
+    try:
+        # migrate=False。**doctor はスキーマを作らない**
+        with db.connect(
+            path,
+            busy_timeout_ms=ctx.config.database.busy_timeout_ms,
+            tz=ctx.config.tz,
+            migrate=False,
+        ) as database:
+            version = database.schema_version()
+            if version != db.SCHEMA_VERSION:
+                return [
+                    Row(
+                        Status.FAIL,
+                        "Database",
+                        f"{path}  （schema v{version} は未対応。v{db.SCHEMA_VERSION} を期待）",
+                    )
+                ]
+            counts = database.counts()
+    except (sqlite3.Error, RuntimeError) as e:
+        return [Row(Status.FAIL, "Database", f"{path}  （{e}）")]
+
+    return [
+        Row(
+            Status.OK,
+            "Database",
+            f"{path} (schema v{version}, {counts.recordings} recordings, "
+            f"{counts.sessions} sessions, {counts.events} events, "
+            f"{counts.size_bytes / MIB:.1f} MiB)",
+        )
+    ]
+
+
+def check_data_volume(ctx: Context) -> list[Row]:
+    """D-3: `/data` が書き込み可能で、空き容量が `free_space_margin_bytes` 以上あること。"""
+    root = paths.DATA_ROOT
+    if not root.is_dir():
+        return [Row(Status.FAIL, "Data volume", f"{root}  （ありません）")]
+
+    # 削除は paths.safe_unlink_tmp を通す（§14.4 N-10）。`.` 始まり + `.tmp` の名前に
+    # するのは、その関数が一時ファイルだけを消せるようにしているからである（§13.6）
+    probe = root / ".voicedock-doctor-probe.tmp"
+    try:
+        probe.write_bytes(b"\0")
+        paths.safe_unlink_tmp(probe)
+    except OSError as e:
+        return [Row(Status.FAIL, "Data volume", f"{root}  （書き込めません: {e}）")]
+
+    free = shutil.disk_usage(root).free
+    margin = ctx.config.import_.free_space_margin_bytes
+    if free < margin:
+        return [
+            Row(
+                Status.FAIL,
+                "Data volume",
+                f"{root} writable, {free / GIB:.1f} GiB free "
+                f"（free_space_margin_bytes の {margin / GIB:.1f} GiB を下回る）",
+            )
+        ]
+    return [Row(Status.OK, "Data volume", f"{root} writable, {free / GIB:.1f} GiB free")]
+
+
 CHECKS: Final[tuple[Check, ...]] = (
     Check(id="D-1", fatal=True, labels=("Config file", "Config validation"), run=check_config),
+    Check(id="D-2", fatal=True, labels=("Database",), run=check_database),
+    Check(id="D-3", fatal=True, labels=("Data volume",), run=check_data_volume),
 )
 
 
