@@ -1,16 +1,22 @@
-# VoiceDock 詳細仕様書 v3.4
+# VoiceDock 詳細仕様書 v4.0
 
 **DJI Mic 3 × ローカル文字起こし × ローカルLLM × Obsidian**
 
 | 項目 | 内容 |
 |---|---|
-| 文書版 | v3.4（実装着手可能版 / Phase 0 実機実測反映） |
-| 前身文書 | v3.3 / v3.2 / v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
+| 文書版 | **v4.0（ホスト側 Helper アーキテクチャ）** |
+| 前身文書 | v3.4 / v3.3 / v3.2 / v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
 | 作成日 | 2026-09-11 |
 | 改訂日 | 2026-09-12 |
 | 実測記録 | `docs/POC.md`（Phase 0 の実測値と判断。本書と食い違う場合は POC.md を正とする） |
 | 対象環境 | macOS / Apple Silicon |
-| 位置づけ | 本書が実装時の唯一の規範。v3.3 / v3.2 / v3.1 / v3.0 / v2.0 と矛盾する場合は本書を優先する |
+| 位置づけ | 本書が実装時の唯一の規範。v3.x / v2.0 と矛盾する場合は本書を優先する |
+
+> **v4.0 は構成の変更を含む。**v3.x は「`/Volumes` をコンテナへ bind mount する」前提だったが、
+> #2 の実機検証で **Docker Desktop の VirtioFS が物理 USB を読めない**ことが確定した（`docs/POC.md` §2）。
+> v4.0 では**デバイスの読み書きをホスト側の Helper に移し、コンテナは `/Volumes` をマウントしない。**
+> 根拠と否定した選択肢は §5.6、失うものは §5.6.3 にある。
+> **§14.1 の削除条件（本書の中核）は 1 文字も変えていない。**
 
 ---
 
@@ -58,19 +64,24 @@ DJI Mic 3 で録音 → 帰宅 → Mac へ USB 接続 → （以降すべて自�
 
 ### 1.2 利用者から見た流れ
 
-| # | 起きること | 目安 |
-|---|---|---|
-| 1 | USB 接続を検出する（5 秒間隔の監視） | 〜5 秒 |
-| 2 | 未処理の録音を特定する（既処理はファイル名で即スキップ） | 即時 |
-| 3 | 書き込み中でないことを確認する（安定性判定） | 通常 0 秒 |
-| 4 | 同じ日の録音を 1 セッションにまとめる | 即時 |
-| 5 | デバイスから直接 16 kHz へ変換する（原本はコピーしない） | 1 日分で 5〜10 分 |
-| 6 | ローカル Whisper で日本語に文字起こしする（無音は VAD で飛ばす） | 発話量に比例 |
-| 7 | **その日の Raw ノート（文字起こし生データ）を Vault へ書く** | 即時 |
-| 8 | ローカル LLM が 1 日分を要約・分類する | 20〜30 分 |
-| 9 | その日の Daily ノート（整理済み 1 枚）を Vault へ書く | 即時 |
-| 10 | 保存内容を機械的に検証する | 即時 |
-| 11 | 検証に成功した録音のみ DJI 本体から削除する（既定は無効） | — |
+| # | 起きること | 実行主体 | 目安 |
+|---|---|---|---|
+| 1 | USB 接続を検出する（launchd の `StartOnMount` + 定期実行） | **Helper**（ホスト） | 〜5 秒 |
+| 2 | 未処理の録音を特定する（既処理はファイル名で即スキップ） | **Helper** | 即時 |
+| 3 | 書き込み中でないことを確認する（安定性判定） | **Helper** | 通常 0 秒 |
+| 4 | 未取り込みの録音を inbox へコピーする | **Helper** | 1 日分で 2〜3 分 |
+| 5 | 同じ日の録音を 1 セッションにまとめる | コンテナ | 即時 |
+| 5b | inbox から 16 kHz へ変換し、**変換後に inbox の原本を消す** | コンテナ | 1 日分で 5〜10 分 |
+| 6 | ローカル Whisper で日本語に文字起こしする（無音は VAD で飛ばす） | コンテナ | 発話量に比例 |
+| 7 | **その日の Raw ノート（文字起こし生データ）を Vault へ書く** | コンテナ | 即時 |
+| 8 | ローカル LLM が 1 日分を要約・分類する | コンテナ | 20〜30 分 |
+| 9 | その日の Daily ノート（整理済み 1 枚）を Vault へ書く | コンテナ | 即時 |
+| 10 | 保存内容を機械的に検証する | コンテナ | 即時 |
+| 11 | 検証に成功した録音の削除を要求する（既定は無効） | コンテナ | — |
+| 12 | 要求を独立に再検証して DJI 本体から削除する（既定は無効） | **Helper**（reaper） | — |
+
+**ユーザーの操作は「録音・USB 接続・Obsidian を見る」の 3 つだけである。**Helper はホスト上で
+launchd により常駐し、ユーザーが意識することはない（§4.1）。
 
 出力は 1 日あたり 2 枚のノートに集約される。
 
@@ -143,7 +154,7 @@ Vault/Daily/Voice/Wiki/20260829/2026-08-29 Voice.md   ← 要約・タスク・T
 
 | 用語 | 定義 |
 |---|---|
-| **Device（デバイス）** | macOS にマウントされた DJI Mic 3 のストレージ 1 個。`/host-volumes/<volume名>` に対応 |
+| **Device（デバイス）** | macOS にマウントされた DJI Mic 3 のストレージ 1 個。ホストの `/Volumes/<volume名>` に対応する。**コンテナからは到達できない**（§5.6） |
 | **Part（パート）** | DJI Mic 3 が 30 分ごとに分割生成した録音 1 本の論理単位。`recordings` テーブルの 1 行に対応する |
 | **Variant（バリアント）** | 同一パートのファイル実体。`orig`（原音）と `denoised`（ノイズ除去済み）の最大 2 個。1 パートは 1 個以上のバリアントを持つ |
 | **Session（セッション）** | **同一デバイス・同一日付（`config.timezone`）の Part の集合。**Obsidian の Daily ノート 1 枚に 1 対 1 対応する。`sessions` テーブルの 1 行 |
@@ -216,11 +227,19 @@ GUI では **Settings → General → Virtual Machine Options → Apple Virtuali
 |---|---|
 | Docker Desktop | Python / pip / venv |
 | Obsidian | FFmpeg |
-| Git（任意） | whisper.cpp / llama.cpp |
-| | SQLite ツール類 |
+| **VoiceDock Helper**（bash スクリプト + LaunchAgent） | whisper.cpp / llama.cpp |
+| Git（任意） | SQLite ツール類 |
 | | AI 用 Python パッケージ |
 
-後者はすべて Docker コンテナ内に閉じ込める。
+右列はすべて Docker コンテナ内に閉じ込める。
+
+> **Helper がホスト側に必要な理由**: Docker Desktop のファイル共有層（VirtioFS）は**物理 USB
+> マスストレージを読めない**（`docs/POC.md` §2）。したがってデバイスの読み取りだけはホスト側で
+> 行うほかない。詳細と、この結論に至るまでに否定した選択肢は §5.6 にある。
+>
+> **Helper は macOS の base system だけで動く。**`/bin/bash` / `/bin/realpath` / `stat` /
+> `diskutil` / `launchctl` / `shasum` のみを使い、**Python も Homebrew も要求しない。**
+> 配布物はテキストのスクリプト 2 本と `plist` 1 本だけで、中身をユーザーが読んで確認できる。
 
 ### 3.4 ホスト設定手順
 
@@ -278,6 +297,31 @@ diskutil rename "/Volumes/NO NAME" DJIMIC3
 
 **FAT32 のボリュームラベルは 11 文字以内の英数字にすること。**改名は初回の一度だけでよい。
 
+**(6) VoiceDock Helper をインストールする**
+
+Helper はデバイスの読み取りを担うホスト側の常駐プロセスである（§4.1）。これが無いと録音は
+1 本も取り込まれない。
+
+```bash
+./helper/install.sh
+```
+
+`install.sh` が行うのは次の 3 つだけで、いずれも**ユーザーのホームディレクトリ配下**に閉じている。
+
+| 処理 | 内容 |
+|---|---|
+| 1 | `<VOICEDOCK_HOME>`（既定 `~/VoiceDock`）に `inbox/` `queue/` `state/` と `helper.conf` を作る |
+| 2 | `helper/voicedock-ingest` を `<VOICEDOCK_HOME>/bin/` へコピーする |
+| 3 | `~/Library/LaunchAgents/com.voicedock.ingest.plist` を配置し `launchctl bootstrap` する |
+
+**`voicedock-reaper`（削除を実行する唯一のプログラム）はインストールしない。**
+これが安全ロック 2-A である（§14.2）。Phase 7 で初めて `./helper/install.sh --with-reaper` を実行する。
+
+```bash
+./helper/install.sh --status     # 稼働確認
+./helper/install.sh --uninstall  # LaunchAgent の撤去
+```
+
 ### 3.5 バージョン値の実測記録
 
 §3.1 の実測は次のコマンドで取得した（2026-09-12）。
@@ -296,16 +340,28 @@ docker compose version --short                  # => 5.5.1
 
 ### 4.1 全体構成
 
+**コンテナは `/Volumes` を一切マウントしない。**デバイスに触れるのはホスト上の Helper だけである。
+この構成に至った理由は §5.6。
+
 ```mermaid
 flowchart TD
     A[DJI Mic 3 送信機] -->|USB-C| B[macOS]
     B --> C["/Volumes/&lt;DJI&gt;"]
-    C -->|bind mount ro| D[VoiceDock Container]
+
+    subgraph HOST[ホスト / launchd 常駐]
+        V[voicedock-ingest<br/>検出・安定性判定・コピー・SHA-256]
+        W[voicedock-reaper<br/>独立検証して削除<br/>Phase 7 でのみ配置]
+    end
+
+    C -->|読み取りのみ| V
+    V -->|コピー + .meta.json| X["&lt;VOICEDOCK_HOME&gt;/inbox"]
+    V -->|heartbeat / inventory| Y["&lt;VOICEDOCK_HOME&gt;/state"]
+    X -->|bind mount rw| D
+    Y -->|bind mount ro| D
 
     subgraph D[VoiceDock Container]
-        E[Device Monitor<br/>5秒 軽量polling] --> F[Scanner<br/>ファイル名解析・安定性判定]
-        F --> G[Session Grouper<br/>日単位]
-        G --> H[Ingest<br/>ストリーム読み + SHA-256<br/>→ ffmpeg 16kHz/mono/s16]
+        F[Inbox Scanner<br/>.meta.json 読み取り] --> G[Session Grouper<br/>日単位]
+        G --> H[Normalize<br/>SHA-256 照合 + ffmpeg<br/>→ 16kHz/mono/s16<br/>→ inbox の原本を削除]
         H --> I[Transcriber<br/>whisper.cpp CPU + VAD]
         I --> J[Raw Renderer<br/>その日の生データ 1枚]
         J --> K[Session Merger]
@@ -313,7 +369,7 @@ flowchart TD
         L --> M[Daily Renderer]
         M --> N[Writer<br/>atomic write]
         N --> O[Verifier]
-        O --> P[Cleaner]
+        O --> P[Cleaner<br/>§14.1 を評価し要求を書くだけ]
         Q[(SQLite<br/>/data/voicedock.db)]
     end
 
@@ -322,15 +378,43 @@ flowchart TD
     S --> L
     J -->|bind mount rw| T[Obsidian Vault]
     N -->|bind mount rw| T
-    P -.->|削除 二重ロック + パス検証| C
+    P -->|削除要求| Z["&lt;VOICEDOCK_HOME&gt;/queue"]
+    Z --> W
+    W -.->|三重ロック + 独立検証| C
+    W -->|結果| Z
 ```
+
+**`<VOICEDOCK_HOME>` の構成**（既定 `~/VoiceDock`。`.env` の `VOICEDOCK_HOME` で変更する）:
+
+```text
+<VOICEDOCK_HOME>/
+├── helper.conf              # Helper の設定（shell が source する KEY=VALUE）
+├── bin/
+│   ├── voicedock-ingest     # 取り込み。install.sh が常に置く
+│   └── voicedock-reaper     # 削除。Phase 7 でのみ置く（安全ロック 2-A）
+├── inbox/                   # Helper が書く / コンテナが読み、変換後に消す
+│   └── <device_id>/<source_folder>/<name>.wav + <name>.wav.meta.json
+├── queue/
+│   ├── delete/              # コンテナが書く / reaper が読む
+│   └── result/              # reaper が書く / コンテナが読む
+└── state/
+    ├── heartbeat.json       # Helper の生存・mount_readonly・版
+    ├── inventory.json       # デバイス上の現在のファイル一覧
+    └── processed.log        # 処理済み request_id（リプレイ防止）
+```
+
+**なぜ `<VOICEDOCK_HOME>` を `/Users` 配下に置くのか**: VirtioFS が正常に扱えるのは
+ローカルディスク上のパスだけであり、`/Users` 配下の bind mount は問題なく動作する
+（`docs/POC.md` §2.4 の対照実験）。
 
 ### 4.2 コンポーネント責務
 
 | コンポーネント | 配置 | 責務 |
 |---|---|---|
-| macOS | ホスト | DJI ストレージのマウント、`/Volumes` と Vault の提供、Docker Desktop 起動 |
-| VoiceDock Container | Docker | 検出・変換・文字起こし・解析要求・Markdown 生成・検証・削除・状態管理 |
+| macOS | ホスト | DJI ストレージのマウント、Vault の提供、Docker Desktop と launchd の起動 |
+| **`voicedock-ingest`** | **ホスト / launchd** | デバイス検出・安定性判定・inbox へのコピー・SHA-256 算出・readOnly 再マウント（ロック 2-B）・heartbeat と inventory の更新。**デバイスへ書き込まない。削除しない** |
+| **`voicedock-reaper`** | **ホスト / launchd**（Phase 7 でのみ配置） | 削除要求の**独立検証**と実行。**デバイス上のファイルを削除する唯一のプログラム**（§14.4 N-16）。コンテナの判断を信用しない |
+| VoiceDock Container | Docker | 変換・文字起こし・解析要求・Markdown 生成・検証・**削除の判断**・状態管理。**デバイスには一切到達できない** |
 | Docker Model Runner | Docker Desktop | 要約 LLM のダウンロード・起動・推論。Apple Silicon では llama.cpp バックエンドで Metal を使用 |
 | SQLite | named volume | 全状態の単一の真実。`/data/voicedock.db` |
 | Obsidian | ホスト | Vault の閲覧のみ。VoiceDock は Obsidian の API / Plugin に一切依存しない |
@@ -355,10 +439,15 @@ macOS の Docker Desktop は Linux VM 上でコンテナを動かすため、**�
           TX_MIC001_.../TX01_MIC002_20260829_071204_orig.wav ← Part 1 (orig)
           TX_MIC001_.../TX01_MIC003_20260829_074210.wav      ← Part 2 (denoised)
           …（1 日 32 Part）
-             │ scan（ffprobe で duration 取得・安定性判定）
+             │ ★Helper: 安定性判定 → コピー（読みながら SHA-256）→ .meta.json
+             ▼
+[Inbox]   <VOICEDOCK_HOME>/inbox/DJIMIC3/TX_MIC001_.../TX01_MIC002_20260829_071204.wav
+                                                    + 同名 .meta.json（relpath/size/mtime/sha256）
+             │ scan（.meta.json 読み取り・ffprobe で duration 取得）
              ▼
 [DB]      recordings 行 × N（Part 単位） + sessions 行 × 1（その日）
-             │ ストリーム読み（SHA-256 を算出）→ ffmpeg（原本はコピーしない）
+             │ inbox からストリーム読み（SHA-256 を再計算し .meta.json と照合）→ ffmpeg
+             │ NORMALIZED 到達後に inbox の原本を削除する
              ▼
 [Staging] /data/staging/<recording_id>/audio16k.wav        ← 30 分で約 58 MB
              │ whisper-cli（VAD 有効）
@@ -373,9 +462,18 @@ macOS の Docker Desktop は Linux VM 上でコンテナを動かすため、**�
              │ render → atomic write → verify
              ▼
 [Vault]   Daily/Voice/Wiki/20260829/2026-08-29 Voice.md
-             │ 検証成功 かつ 二重ロック解除 かつ パス同定成功のときのみ
+             │ 検証成功 かつ 三重ロック解除のときのみ、削除要求を書く（§14.1 の判断はここ）
              ▼
-[Device]  Part 全 Variant を削除 → COMPLETED
+[Queue]   <VOICEDOCK_HOME>/queue/delete/<request_id>.json   ← relpath のみ。絶対パスを持たない
+             │ ★reaper: コンテナの判断を信用せず 11 項目を独立検証（§14.1.1）
+             ▼
+[Device]  Part 全 Variant を削除 → 不在を確認
+             │ 結果を書く
+             ▼
+[Queue]   <VOICEDOCK_HOME>/queue/result/<request_id>.json
+             │ コンテナが読む。inventory.json でも独立に不在を確認できる
+             ▼
+[DB]      COMPLETED
 ```
 
 ---
@@ -472,7 +570,9 @@ part_key = (transmitter_id, mic_index, started_at)
 
 ### 5.4 デバイス判定
 
-Volume 名を固定しない。`/host-volumes` 直下の各エントリについて以下を評価し、**すべて**を満たす場合に DJI デバイスと判定する。
+**この判定は `voicedock-ingest`（ホスト）が行う**（§4.2）。コンテナはデバイスを見ない。
+
+Volume 名を固定しない。ホストの `/Volumes` 直下の各エントリについて以下を評価し、**すべて**を満たす場合に DJI デバイスと判定する。
 
 1. **エントリ自身がシンボリックリンクでない**（`os.path.islink()` が偽）。macOS には
    `/Volumes/Macintosh HD -> /` が実在し、辿ると起動ディスク全体が走査対象になる（§22 R-19）
@@ -483,8 +583,15 @@ Volume 名を固定しない。`/host-volumes` 直下の各エントリについ
 **除外パターンは `fnmatch` による glob として評価する（正規表現ではない）。**既定値は §7.2 と同一でなければならない。
 
 ```python
+# コンテナ側の規範実装（同じ規則を helper/voicedock-ingest が bash で実装する）
 excluded = any(fnmatch.fnmatch(name, pat) for pat in cfg.device.exclude_volumes)
 ```
+
+> **規則の二重実装について**: §5.4 と §10.3 の規則は、コンテナ（Python）ではなく
+> **Helper（bash）が実行する**。両者で食い違うと検出漏れが無言で起きるため、
+> **本節の規則が唯一の規範であり、Helper の実装はこれに従う。**
+> `doctor` の D-18 は Helper が報告した `inventory.json` とコンテナ側の期待を突き合わせ、
+> 食い違いを検出する（§19.2）。
 
 > `.*` を正規表現として解釈すると全 Volume 名に一致し、DJI が 1 台も検出されないまま無言で停止する。この症状は P0-6（ホットプラグ伝播の失敗）と区別がつかないため、`doctor` は除外された Volume 名を必ず列挙する（§19.2 D-5）。
 
@@ -514,7 +621,7 @@ excluded = any(fnmatch.fnmatch(name, pat) for pat in cfg.device.exclude_volumes)
 | P0-3 | フォルダ・ファイル名が §5.1 の規則と一致する | 必須 | パーサ修正 |
 | P0-4 | `_orig` と非 `_orig` の両方が実際に生成されるか | 必須 | §5.3 の分岐調整 |
 | P0-5 | ホストから WAV を読み取れる | 必須 | — |
-| P0-6 | **コンテナ起動後にデバイスを接続して `/host-volumes` に現れる**（ホットプラグ伝播） | **最重要** | §5.6 の代替へ切替 |
+| P0-6 | **Helper 起動後にデバイスを接続して検出される**（ホットプラグ伝播）。v3.x では「コンテナの `/host-volumes` に現れるか」だった | **最重要** | §5.6 案 A（本版で移行済み） |
 | P0-7 | コンテナから WAV を読み取れる | 必須 | File sharing 設定 |
 | P0-8 | コンテナから WAV を削除できる（`rw` マウント時、使い捨てファイルで検証） | Phase 7 前に必須 | 自動削除を諦める |
 | P0-9 | コンテナ内でのファイル所有者・パーミッション（non-root で読めるか） | 必須 | §18.3 の uid 調整 |
@@ -525,31 +632,86 @@ excluded = any(fnmatch.fnmatch(name, pat) for pat in cfg.device.exclude_volumes)
 | P0-14 | **バッテリー交換・充電で録音が中断したときのファイルの分かれ方** | 必須 | Block 判定（§13.4）の実挙動確認 |
 | P0-15 | **1 日分（64 ファイル）を置いた状態での走査時間の実測** | 必須 | §10.2 / §10.3 のパラメータ調整 |
 
+> **v4.0 での読み替え**: P0-6（ホットプラグ伝播）と P0-7 / P0-8 / P0-9（コンテナからの
+> 読み取り・削除・権限）は、**「コンテナから」ではなく「Helper から」**に読み替える。
+> §5.6 の通りコンテナはデバイスに到達しない。
+> #2 の実測（`docs/POC.md` §3）では、**ホストからの読み取り・ホットプラグ検知とも PASS** している。
+
 **測定値と PASS / FAIL の判断は `docs/POC.md` に記録する。**SPEC には設計を書き、実測は POC.md に残す。
 両者が食い違う場合は **POC.md の実測値を正とし、SPEC を直すチケットを起票する。**
 
 P0-6 の検証手順:
 
 ```bash
-# 1. デバイス未接続の状態でコンテナを起動
-docker compose up -d
-docker compose exec voicedock ls -la /host-volumes
+# v4.0 の検証手順（Helper 経由）
+# 1. デバイス未接続の状態で Helper と コンテナを起動
+./helper/install.sh && make up
+cat "$VOICEDOCK_HOME/state/inventory.json"
 
 # 2. この状態で DJI Mic 3 を USB 接続する
+#    launchd の StartOnMount が voicedock-ingest を起動する
 
-# 3. コンテナを再起動せずに再確認
-docker compose exec voicedock ls -la /host-volumes
-# => 新しい Volume が現れれば PASS
+# 3. 何も再起動せずに再確認
+cat "$VOICEDOCK_HOME/state/inventory.json"
+ls -la "$VOICEDOCK_HOME/inbox"
+# => 新しい Volume と取り込まれたファイルが現れれば PASS
 ```
 
-### 5.6 代替アーキテクチャ（P0-1 または P0-6 が失敗した場合のみ）
+> v3.x の手順（`docker compose exec voicedock ls -la /host-volumes`）は **v4.0 では意味を持たない。**
+> コンテナは `/Volumes` をマウントしないため（§18.2）。#2 での実測経過は `docs/POC.md` §3.1。
 
-| 失敗ケース | 代替 |
-|---|---|
-| P0-1 失敗（通常の Volume として公開されない） | `/Volumes` 監視方式は成立しない。Mac 側に最小限の「取り込み Helper」を置き、Helper がホスト共有ディレクトリへコピーし、コンテナはそのディレクトリだけを監視する構成へ切り替える |
-| P0-6 失敗（ホットプラグが伝播しない） | 案 A: ホスト側 `launchd` の `StartOnMount` で接続を検知し `docker compose restart voicedock` を実行する。案 B: Volume パスを `.env` で固定し、個別パスを bind mount する。**案 A を第一候補とする** |
+### 5.6 なぜホスト側 Helper なのか（採用した設計の根拠）
 
-いずれの代替も MVP の範囲外であり、発生した時点で別途設計する。
+**v3.x までは「`/Volumes` をコンテナへ bind mount する」構成だった。#2 の実機検証でこれが
+成立しないことが確定し、v4.0 でホスト側 Helper へ移行した。**測定の全経過は `docs/POC.md` §2。
+
+#### 5.6.1 何が成立しなかったか
+
+**Docker Desktop 4.90.0 の VirtioFS（既定のファイル共有実装）は、物理 USB マスストレージを
+bind mount 越しに読めない。**
+
+```text
+ls -ld /x        : drwx------ 1 root root 0 /x        ← ディレクトリだと主張する
+stat -c '%F' /x  : directory                           ← statx も成功する
+ls -la /x        : cannot open directory '/x': Not a directory   ← opendir が ENOTDIR
+cat /x/<既知のファイル> | wc -c : 0
+```
+
+`--user 0:0`（root）でも同じ。**さらに悪いことに、最初の試行は Docker Desktop の実行基盤ごと
+固めた。**コンテナ内の `timeout(1)` でも中断できず、bind mount を使わないコンテナすら起動
+しなくなり、Docker Desktop の再起動でしか回復しなかった（`docs/POC.md` §2.3）。
+**無人常駐を前提とするアプリにとって、検出も復旧もできない失敗モードである。**
+
+#### 5.6.2 否定した選択肢
+
+| 案 | 判定 | 根拠 |
+|---|---|---|
+| **案 B: 個別パスを bind mount する** | ❌ **不可** | サブディレクトリの bind mount は**コンテナ起動前に**失敗する（`failed to fulfil mount request: ... not a directory`） |
+| **案 C: 共有実装を gRPC FUSE にする** | ❌ 採らない | 読めるようになるが、**Docker Desktop 全体のグローバル設定**であり、同じ Mac の他プロジェクトの bind mount が **2〜6 倍遅くなる**（`docs/POC.md` §7 に実測表）。常駐アプリのために恒久的にその代償を課すことになる |
+| 案 D: 仮想化バックエンドを Docker VMM にする | ❌ 不可 | §3.2 の通り、Docker VMM は `/Volumes` 配下の bind mount が別の理由で失敗する（docker/for-mac#7480） |
+| **案 A: ホスト側 Helper**（採用） | ✅ | Docker の共有設定に一切依存しない。デバイスを読むのはホストのプロセスだけになる |
+
+原因は消去法で 1 点に絞った。**FSKit でも FAT32 でもパーティション構造でも権限でもなく、
+「物理 USB デバイスであること」**が引き金である。ディスクイメージ（exFAT / FAT32 /
+superfloppy のいずれも）は VirtioFS でも完全に動作した。
+
+> **この事実は、ディスクイメージによる代替検証では絶対に見つからなかった。**#2 は当初
+> 「実機を待たずに DMG で検証する」計画だったが、実機と同時に測ったことで発覚した。
+> **DMG の成功は USB マスストレージの成功をまったく保証しない**（`docs/POC.md` §2.5）。
+
+#### 5.6.3 この設計で失うもの（受け入れる）
+
+| # | 失うもの | 埋め合わせ |
+|---|---|---|
+| 1 | **原本コピー工程が復活する。**v3.1 が意図して廃止した（付録 E の A-4） | inbox の原本は `NORMALIZED` の検証後に即削除する。常駐使用量は数 GB に収まる（§10.5） |
+| 2 | ホストの書き込みが 1 日 1.8 GB → **約 10 GB** へ増える | 同上。SSD 寿命より「工程と状態が 1 つ増える」ことのほうが本質的なコスト |
+| 3 | **削除の実行がコンテナの外へ出る。**§20.4 のテスト境界をまたぐ | §14.2 を三重ロックへ。reaper に**独立検証**を持たせ、§20.4 を 2 層に分けて ND-24〜ND-28 を追加する |
+| 4 | 「Mac へインストールするのは Docker Desktop と Obsidian だけ」が崩れる（§3.3） | Helper は base system だけで動く bash スクリプト 2 本。中身をユーザーが読める |
+
+#### 5.6.4 将来この設計を畳む条件
+
+Docker Desktop が物理 USB マスストレージを既定の共有実装で扱えるようになれば、**Helper を
+廃止して v3.x の構成へ戻せる。**その判断材料として、`docs/POC.md` §2 の再測定手順を残してある（§23）。
 
 ---
 
@@ -612,6 +774,12 @@ voicedock/
 │   ├── reduce_ja.txt               # Reduce 段階プロンプト（テンプレート）
 │   └── repair_json.txt             # JSON 修復プロンプト
 │
+├── helper/                         # ホスト側で動く。Docker に依存しない（§4.1, §5.6）
+│   ├── voicedock-ingest            # 検出・安定性判定・inbox へのコピー・SHA-256（§10.1-10.3）
+│   ├── voicedock-reaper            # 削除。**Phase 7 でのみインストールする**（§14.2 ロック 2-A）
+│   ├── install.sh                  # LaunchAgent の配置・状態表示・撤去（§3.4(6)）
+│   └── com.voicedock.ingest.plist  # LaunchAgent 定義（StartOnMount + StartInterval）
+│
 ├── poc/                            # Phase 0 PoC の使い捨てスクリプト。src/ から import しない
 │   ├── mkimg.sh                    # DJI のストレージを模したディスクイメージの作成・attach・detach
 │   └── tmo                         # ホスト側の有界タイムアウト（§19.2 / docs/POC.md §2.3）
@@ -642,6 +810,8 @@ voicedock/
 | `notes.py` / `llm.py` が大きくなる | 400〜600 行を見込む。**実装中に 500 行を超えたら、そのとき初めて分割する**（先に分けない） |
 | `.dockerignore` を置く | 無いと生成 fixture WAV・`tmp/`・`data/`・`.git` が毎ビルドで転送される。除外内容は §18.3 |
 | `poc/` を `tests/` と分ける | PoC は「一度測って判断したら捨てる」もので、CI で回し続ける `tests/` とは寿命が違う。macOS ホストの `hdiutil` / `diskutil` に依存するため CI では実行できない。`src/` から import しないことをディレクトリで表す |
+| `helper/` を `scripts/` と分ける | `scripts/` は `docker compose` のラッパであり、**コンテナが動いている前提**に立つ。`helper/` は **Docker に一切依存せず、Docker が止まっていても動く**常駐プロセスである。寿命も配布経路も違う（`helper/` は `<VOICEDOCK_HOME>/bin/` へコピーして使う） |
+| `voicedock-reaper` を `voicedock-ingest` と分ける | **安全ロック 2-A の実体**（§14.2）。「削除を実行できるコードがホスト上に存在しない」という状態を、ファイルが 1 本無いことで表す。1 本にまとめると、この状態を作れない |
 
 ---
 
@@ -649,10 +819,11 @@ voicedock/
 
 設定は 2 系統に分ける。**この境界を越えない。**
 
-| 系統 | ファイル | 内容 | Git 管理 |
-|---|---|---|---|
-| ホスト固有・環境依存 | `.env` | Vault の絶対パス、マウントモード、タイムゾーン | **しない** |
-| アプリ挙動のすべて | `config/config.yaml` | 保存先、ファイル名、要約項目、しきい値、モデル | **しない**（`config.example.yaml` のみ管理） |
+| 系統 | ファイル | 内容 | 読む主体 | Git 管理 |
+|---|---|---|---|---|
+| ホスト固有・環境依存 | `.env` | Vault の絶対パス、`VOICEDOCK_HOME`、タイムゾーン | Compose | **しない** |
+| **Helper の挙動** | **`<VOICEDOCK_HOME>/helper.conf`** | **マウントモード、除外ボリューム、削除の可否** | **Helper（bash）** | **しない**（`helper/helper.example.conf` のみ管理） |
+| アプリ挙動のすべて | `config/config.yaml` | 保存先、ファイル名、要約項目、しきい値、モデル | コンテナ | **しない**（`config.example.yaml` のみ管理） |
 
 - `config/config.yaml` は `./config:/app/config:ro` で bind mount されるため、**ホスト側でテキスト編集してコンテナを再起動するだけで反映される**
 - **環境変数による個別キーの上書き機構は提供しない。**設定の出所が二重になり、どちらが効いているか追えなくなるため
@@ -665,15 +836,19 @@ voicedock/
 # Obsidian Vault の絶対パス。引用符を付けないこと（§3.4）
 OBSIDIAN_VAULT=/Users/USERNAME/Documents/Obsidian Vault
 
-# DJI ストレージのマウントモード。ro | rw
-# 既定は必ず ro。実機試験完了後にのみ rw へ変更する（§14.2）
-DJI_MOUNT_MODE=ro
+# Helper とコンテナが共有する作業領域（§4.1）。/Users 配下であること
+VOICEDOCK_HOME=/Users/USERNAME/VoiceDock
 
 # タイムゾーン
 TZ=Asia/Tokyo
 ```
 
-`DJI_MOUNT_MODE` を `rw` に変更した場合、`docker compose up -d` でコンテナの再生成が必要（bind mount のモードは再生成しないと変わらない）。
+> **v3.x の `DJI_MOUNT_MODE` は廃止した。**コンテナは `/Volumes` をマウントしなくなったため、
+> bind mount のモードという概念そのものが無い。相当する安全ロックは
+> **`helper.conf` の `mount_mode`**（§7.4、§14.2 ロック 2-B）へ移った。
+>
+> `VOICEDOCK_HOME` は **`/Users` 配下でなければならない**（V-28）。VirtioFS が正常に扱えるのは
+> ローカルディスク上のパスだけである（§5.6）。
 
 ### 7.2 `config/config.yaml` 全キー
 
@@ -686,7 +861,7 @@ timezone: Asia/Tokyo
 
 # --- デバイス検出 -------------------------------------------
 device:
-  root: /host-volumes            # コンテナ内の監視ルート
+  root: /inbox                   # コンテナが監視するルート（Helper が原本を置く場所。§4.1）
   poll_interval_seconds: 5       # 軽量チェック（Volume の増減のみ）の間隔
   deep_scan_interval_seconds: 600  # 既知デバイスを深く走査する最小間隔
   rescan_on_mount_change: true   # 新しい Volume を見つけたら即座に深い走査
@@ -718,6 +893,7 @@ audio:
 
 # --- 取り込み -----------------------------------------------
 import:
+  inbox_root: /inbox                       # Helper が原本を置く場所（§4.1）
   staging_root: /data/staging
   # 空き容量の必要量: 変換後の見込みサイズ × multiplier + margin（§10.5）
   free_space_multiplier: 2.0
@@ -725,6 +901,12 @@ import:
   # staging 全体の上限。原本を置かないため異常時の歯止めとしてのみ機能する
   staging_max_bytes: 5368709120            # 5 GiB
   hash_chunk_bytes: 1048576                # 1 MiB
+  # inbox の原本をいつ消すか（§10.5）。normalized | raw_saved
+  #   normalized: 16 kHz 変換の検証後に即削除（既定。inbox の常駐使用量を数 GB に抑える）
+  #   raw_saved : Raw ノートの保存検証まで保持（変換やり直しに強いが 1 日 8〜22 GB 滞留する）
+  inbox_retain: normalized
+  # Helper のハートビートがこの秒数より古ければ HELPER_UNAVAILABLE（§19.1 H-8）
+  helper_heartbeat_max_age_seconds: 300
 
 # --- セッション分組（§10.4） ---------------------------------
 session:
@@ -827,13 +1009,17 @@ obsidian:
 cleanup:
   # 【安全ロック 1】DJI 側の元音声を削除するか。既定 false
   delete_source_audio: false
-  # 【安全ロック 2 は .env の DJI_MOUNT_MODE=ro】
+  # 【安全ロック 2-A / 2-B は helper.conf 側にある（§7.4, §14.2）】
   # 文字起こし後に 16 kHz 音声を削除するか（容量節約）
   delete_normalized_after_transcribe: true
   # Part transcript JSON の保持日数。再生成に必要なため 0（無期限）固定
   retain_transcript_days: 0
   # 削除条件が偽だったときの再評価間隔（§9.3）
   delete_evaluation_backoff_seconds: [60, 300, 900, 3600]
+  # 削除キューの配置（§14.3）
+  queue_root: /queue
+  # reaper の結果がこの秒数以内に来なければ SOURCE_DELETE_PENDING へ落とす（§10.12）
+  delete_result_timeout_seconds: 3600
 
 # --- リトライ（§15.2） ---------------------------------------
 retry:
@@ -889,6 +1075,55 @@ database:
 | V-25 | `transcription.vad.enabled == true` なら `vad.model` が存在する | `WHISPER_MODEL_MISSING` |
 | V-26 | `cleanup.delete_source_audio == true` の場合、起動ログに警告を出す | 警告のみ（§14.3） |
 | V-27 | `obsidian.raw.granularity == "part"` なら `obsidian.raw.filename_template` に `{part}` を含む | `CONFIG_INVALID_VALUE`（含まないと Part ごとのファイルが同名衝突する） |
+| V-28 | `.env` の `VOICEDOCK_HOME` が設定され、実在し、**`/Users` 配下である** | `CONFIG_INVALID_VALUE`（VirtioFS が扱えるのはローカルディスク上のパスのみ。§5.6） |
+| V-29 | `import.inbox_retain` が `normalized` / `raw_saved` のいずれか | `CONFIG_INVALID_VALUE` |
+| V-30 | `cleanup.delete_source_audio == true` のとき、**`helper.conf` の `delete_source_audio` も `true`** | `CONFIG_LOCK_MISMATCH`（片方だけの解除は事故。§14.2） |
+| V-31 | `import.helper_heartbeat_max_age_seconds >= 60` | `CONFIG_INVALID_VALUE` |
+
+### 7.4 `<VOICEDOCK_HOME>/helper.conf`
+
+Helper（bash）が `source` する KEY=VALUE 形式。**コンテナはこのファイルを読まない**が、
+Helper が `state/heartbeat.json` へ写した値をコンテナが参照する（§19.1 H-8）。
+
+`helper/helper.example.conf`:
+
+```sh
+# 取り込み対象の探索ルート。通常は変更しない
+VOLUMES_ROOT=/Volumes
+
+# 除外するボリューム名（glob。空白区切り）。config.yaml の device.exclude_volumes と同一にすること
+EXCLUDE_VOLUMES="Macintosh HD Time Machine*"
+
+# 【安全ロック 2-B】デバイスのマウントモード。ro | rw
+#   ro: 接続を検知したら diskutil mount readOnly で再マウントし直す（既定）
+#       mount(8) の rdonly は "even the super-user may not write it"
+#   rw: 再マウントしない。Phase 7 以降のみ（§14.2）
+MOUNT_MODE=ro
+
+# 【安全ロック 1】デバイス上の原本を削除してよいか。既定 false
+#   config.yaml の cleanup.delete_source_audio と両方 true でなければ削除しない（V-30）
+DELETE_SOURCE_AUDIO=false
+
+# 取り込み先。.env の VOICEDOCK_HOME と一致させること
+VOICEDOCK_HOME="$HOME/VoiceDock"
+
+# 安定性判定（§10.3）。config.yaml の device.* と同一にすること
+STABILITY_FAST_PATH_SECONDS=60
+STABILITY_INTERVAL_SECONDS=3
+STABILITY_CHECKS=2
+
+# 走査の深さ上限（§5.4）
+MAX_SCAN_DEPTH=3
+```
+
+**`helper.conf` と `config.yaml` で重複するキー**（`exclude_volumes` / 安定性判定 / 削除の可否）は、
+**§5.4 / §10.3 / §14.2 の規定が唯一の規範**であり、両ファイルはそれに従う。
+食い違いは `doctor` の D-18 が検出する（§19.2）。
+
+> **なぜ 1 つの設定ファイルにまとめないのか**: `config.yaml` は
+> `./config:/app/config:ro` でコンテナへ bind mount されるが、**Helper は Docker が止まっていても
+> 動く**必要がある（Docker Desktop の起動前にデバイスが挿されうる）。YAML を bash で読むのも
+> 現実的でない。**取り込みが Docker の状態に依存しないこと**を設計として優先した。
 
 ---
 
@@ -926,7 +1161,8 @@ CREATE TABLE recordings (
     ended_at              TEXT,               -- started_at + duration_seconds
 
     -- Variant（最大 2）。削除時の同定に使う（§14.1）
-    source_path_denoised  TEXT,
+    -- ★v4.0: ボリュームルートからの相対パスを格納する。絶対パスを持たない（§14.1.1）
+    source_path_denoised  TEXT,               -- 'TX_MIC001_.../TX01_..._.wav'
     source_path_orig      TEXT,
     source_size_denoised  INTEGER,
     source_size_orig      INTEGER,
@@ -935,10 +1171,13 @@ CREATE TABLE recordings (
     -- 読み込むのは primary_variant のみ。もう一方の sha256 は NULL のまま
     sha256_denoised       TEXT,
     sha256_orig           TEXT,
+    -- Helper がコピー時に算出した値。コンテナが再計算して照合する（§10.5）
+    sha256_helper         TEXT,
 
     primary_variant       TEXT,               -- 'denoised' | 'orig'
 
     -- 作業成果物
+    inbox_path            TEXT,               -- /inbox/<device_id>/<folder>/<name>.wav
     staging_dir           TEXT,
     normalized_path       TEXT,               -- /data/staging/<id>/audio16k.wav
     transcript_path       TEXT,               -- /data/transcripts/parts/<id>.json
@@ -978,6 +1217,11 @@ CREATE INDEX idx_recordings_started  ON recordings (started_at);
 - `idx_recordings_partkey` が高速な事前判定。走査のたびに SHA-256 を計算しない（USB 越しの全読み込みを避ける）
 - `sha256_*` の部分 UNIQUE インデックスが二重処理の最終防壁。ハッシュは §10.5 の変換時にストリームで算出するため、追加の読み込みコストはゼロ
 - `source_size_*` と `source_mtime_*` は削除直前の同定に使う（§14.1）。**記録した値と一致しないファイルは削除しない**
+- **`source_path_*` は絶対パスではなく、ボリュームルートからの相対パスである。**削除要求（§14.1.1）に
+  絶対パスを載せないための設計であり、**要求がボリューム外を指名すること自体を構造的に不可能にする**
+- `sha256_helper` は Helper がコピーしながら算出した値。コンテナは inbox から読み直して再計算し、
+  一致しなければ `SOURCE_HASH_MISMATCH` → `FAILED` とする（§10.5）。**コピー破損を検出する唯一の経路**
+- `inbox_path` は `NORMALIZED` 到達後に削除される（`import.inbox_retain`）。削除後も列は残す（監査用）
 - **工程ごとの監査タイムスタンプ列は持たない。**§14.1 の削除条件（ノートの実体と ID で判定）も §9.4 の再開規則（パスと sha256 で判定）もこれらを 1 つも参照しない。工程別の所要時間は §16.2 のログ（`elapsed_s` / `rtf` / `speech_ratio`）で追える。**`FAILED` からの経過時間（§15.2 の自動再試行）は `updated_at` を基準にする**
 
 ### 8.3 `sessions`（1 デバイス・1 日）
@@ -1114,15 +1358,15 @@ stateDiagram-v2
 
 | 状態 | 意味 | 元音声削除可否 | 終端 |
 |---|---|---|---|
-| `DISCOVERED` | 検出・DB 登録済み。安定性判定通過済み | 不可 | — |
-| `NORMALIZING` | デバイスから読みながら 16 kHz へ変換中 | 不可 | — |
-| `NORMALIZED` | 16kHz/mono/s16 の音声を生成し検証済み | 不可 | — |
+| `DISCOVERED` | **Helper が inbox へ原本を届け終え**、DB 登録済み。安定性判定は Helper が通過させている（§10.3） | 不可 | — |
+| `NORMALIZING` | **inbox から**読みながら 16 kHz へ変換中 | 不可 | — |
+| `NORMALIZED` | 16kHz/mono/s16 の音声を生成し検証済み。**inbox の原本はここで削除される**（`import.inbox_retain`） | 不可 | — |
 | `TRANSCRIBING` | whisper.cpp 実行中 | 不可 | — |
 | `TRANSCRIBED` | Part transcript が確定 | 不可 | — |
 | `RAW_WRITING` | その日の Raw ノートを生成・検証中 | 不可 | — |
 | `RAW_SAVED` | **文字起こし本文が Vault に保存され検証された。ここで元音声への依存が切れる** | Session が SAVED なら可 | ✅ |
-| `SOURCE_DELETING` | DJI 側ファイル削除中 | — | ✅ |
-| `SOURCE_DELETE_PENDING` | 削除すべきだがデバイス未接続 / 同定失敗 / 削除失敗。次回接続時に再試行 | — | ✅ |
+| `SOURCE_DELETING` | **削除要求をキューへ投入済み。reaper の結果を待っている**（§10.12） | — | ✅ |
+| `SOURCE_DELETE_PENDING` | 削除すべきだがデバイス未接続 / 同定失敗 / 削除失敗 / **結果がタイムアウト**。次回接続時に再試行 | — | ✅ |
 | `COMPLETED` | 当該 Part の処理をすべて終えた | 可（§14.1 が真なら） | ✅ |
 | `FAILED` | 失敗。自動再試行（§15.2）または手動 `retry` で復帰可能 | 不可 | ✅ |
 | `SKIPPED` | 既知の重複、発話が検出されなかった、または取り込み対象の実体が失われた | 不可 | ✅ |
@@ -1184,11 +1428,12 @@ stateDiagram-v2
 
 | 現状態 | イベント | ガード条件 | 次状態 | 副作用 |
 |---|---|---|---|---|
-| — | 走査で新規検出 | ファイル名パース成功 ∧ 安定性 OK ∧ partkey 未登録 | `DISCOVERED` | 行 INSERT、ffprobe で duration 取得 |
+| — | **inbox の走査で新規検出** | `.meta.json` が揃っている ∧ ファイル名パース成功 ∧ partkey 未登録 | `DISCOVERED` | 行 INSERT、ffprobe で duration 取得（**inbox のファイルから**） |
 | — | 走査で検出 | partkey 登録済み | （遷移なし） | `DEBUG already_known` のみ |
 | `DISCOVERED` | 取り込み | 空き容量 OK ∧ staging 上限内 | `NORMALIZING` | staging ディレクトリ作成 |
 | `DISCOVERED` | 取り込み直前の再確認 | `primary_variant` のファイルが存在しない、または `size == 0` | `SKIPPED` | `SOURCE_MISSING` を記録し `part_skipped` を出力。**デバイス上のファイルには触れない。**自動再試行の対象外 |
-| `NORMALIZING` | 変換成功 | 出力が 16kHz/1ch/s16 ∧ `size > 0` ∧ 長さが入力と ±`duration_tolerance_seconds` | `NORMALIZED` | `sha256_<primary>`・`normalized_path` 更新 |
+| `NORMALIZING` | 変換成功 | 出力が 16kHz/1ch/s16 ∧ `size > 0` ∧ 長さが入力と ±`duration_tolerance_seconds` ∧ **再計算した SHA-256 が `sha256_helper` と一致** | `NORMALIZED` | `sha256_<primary>`・`normalized_path` 更新。**`inbox_retain == normalized` なら inbox の原本を削除** |
+| `NORMALIZING` | **ハッシュ不一致** | 再計算値 ≠ `sha256_helper` | `FAILED` | `SOURCE_HASH_MISMATCH`。出力削除。**inbox の原本も残す**（再コピーの判断材料） |
 | `NORMALIZING` | SHA-256 衝突 | 同一 sha256 の別行が存在 | `SKIPPED` | 出力削除、`DUPLICATE_CONTENT` 記録 |
 | `NORMALIZING` | 失敗 / USB 切断 | — | `FAILED` | **部分出力を削除**。元ファイルは触らない |
 | `NORMALIZED` | 文字起こし | — | `TRANSCRIBING` | — |
@@ -1198,10 +1443,10 @@ stateDiagram-v2
 | `TRANSCRIBED` | Raw ノート生成 | Vault 到達可 | `RAW_WRITING` | — |
 | `RAW_WRITING` | 保存検証成功 | §13.7 の R-1〜R-6 | `RAW_SAVED` | `raw_output_path`・`raw_output_sha256`（Session 側）を更新 |
 | `RAW_WRITING` | 検証失敗 | — | `FAILED` | 一時ファイル削除。**最終ファイルは差し替えない。`FAILED` にするのは今回の再生成を起動した Part（トリガ Part）1 件のみ**とし、同じ Raw ノートに含まれる他の Part は `TRANSCRIBED` のまま据え置いて次回の再生成で再試行する |
-| `RAW_SAVED` | 削除要求 | §14.1 が真 | `SOURCE_DELETING` | — |
+| `RAW_SAVED` | 削除要求 | §14.1 が真 | `SOURCE_DELETING` | **`queue/delete/<request_id>.json` を書く**（§14.1.1）。デバイスには触れない |
 | `RAW_SAVED` | 削除要求 | `delete_source_audio == false` | `COMPLETED` | 元音声を残したまま完了 |
-| `SOURCE_DELETING` | 削除成功 | 全 Variant が存在しないことを再確認 | `COMPLETED` | `source_deleted_at` 更新 |
-| `SOURCE_DELETING` | デバイス未接続 / 同定失敗 / 失敗 | — | `SOURCE_DELETE_PENDING` | ノートは残す |
+| `SOURCE_DELETING` | **reaper の結果が成功** | `queue/result/` の結果が全 Variant 削除済み ∧ `state/inventory.json` でも不在 | `COMPLETED` | `source_deleted_at` 更新 |
+| `SOURCE_DELETING` | デバイス未接続 / 同定失敗 / 失敗 / **`delete_result_timeout_seconds` 超過** | — | `SOURCE_DELETE_PENDING` | ノートは残す。要求はキューに残したままにしない（`request_id` を変えて再投入する） |
 | `SOURCE_DELETE_PENDING` | デバイス再接続 | §14.1 が真 | `SOURCE_DELETING` | — |
 | `COMPLETED` | 削除の後追い | §14.1 が真（Phase 7 移行・§17.1 `cleanup --backlog`） | `SOURCE_DELETING` | — |
 | `FAILED` | `retry` / 自動再試行 | `retry_count < max_attempts` または `--force` | 直前の進行中状態 | `retry_count += 1` |
@@ -1294,22 +1539,39 @@ def worker_loop() -> None:
 
 処理順は `recordings.started_at` 昇順（古い録音から）。
 
-### 10.1 Device Monitor（2 段構成）
+### 10.1 Device Monitor（ホスト側 Helper）
 
-毎周期で深い走査をすると、1 日 64 ファイルに対して `stat` を繰り返し CPU を無駄に使う。頻度を 2 段に分ける。
+**v4.0 ではこの工程はコンテナではなく `voicedock-ingest`（ホスト）が担う**（§4.2, §5.6）。
 
-| 頻度 | 内容 |
-|---|---|
-| `poll_interval_seconds`（5 秒） | `/host-volumes` 直下を **1 階層 `scandir` するだけ**。再帰なし・`stat` なし。Volume の増減のみ検出 |
-| Volume 増加を検出した直後 | 当該デバイスへ深い走査を即座に 1 回（`rescan_on_mount_change`） |
-| `deep_scan_interval_seconds`（600 秒） | 既知デバイスの深い走査の最小間隔 |
-| `skip_unchanged_dirs` | ディレクトリの mtime が前回走査時と同じなら中へ入らない |
+**起動契機は launchd の 2 つだけで、ポーリングループは持たない。**
 
-`PermissionError` / `OSError` は `WARN device_unreadable` を出して当該 Volume をスキップし、ループは継続する（1 個の不良ボリュームで全体を止めない）。
+| 契機 | plist キー | 内容 |
+|---|---|---|
+| ボリュームのマウント | `StartOnMount` | macOS が任意のボリュームをマウントするたびに起動される |
+| 定期実行 | `StartInterval`（既定 300 秒） | 取りこぼしの回収、`heartbeat.json` の更新、`SOURCE_DELETE_PENDING` の再試行契機 |
 
-**要件**: デバイス未接続時のアイドル CPU 使用率は 1% 未満、接続時の定常状態でも 2% 未満であること（§21.2 Phase 1）。
+v3.x の「5 秒ポーリング」は不要になった。**launchd がマウントを通知するため、常駐ループを
+持たずに済み、未接続時の CPU は文字通り 0% になる**（§21.2 Phase 1 の要件を自動的に満たす）。
+
+1 回の起動で行うこと:
+
+```text
+1. helper.conf を読む
+2. VOLUMES_ROOT 直下を 1 階層走査し、§5.4 の規則で DJI デバイスを判定する
+3. MOUNT_MODE=ro なら diskutil unmount → diskutil mount readOnly（§14.2 ロック 2-B）
+4. §10.2 の規則で Part 候補を列挙する（深さ上限 MAX_SCAN_DEPTH）
+5. §10.3 の安定性判定を通ったファイルを inbox へコピーする
+6. state/heartbeat.json と state/inventory.json を更新する
+7. 多重起動を避けるため flock 相当の排他を取る（同名ディレクトリの mkdir で代用）
+```
+
+読み取りエラーは当該ボリュームをスキップして続行する（1 個の不良ボリュームで全体を止めない）。
+**エラーは `state/heartbeat.json` に記録し、コンテナの `doctor` D-18 が拾う**（§19.2）。
 
 ### 10.2 走査と Part 列挙
+
+**走査は Helper（ホスト）が行い、パースと Part 化はコンテナが `.meta.json` から行う。**
+下表の規則は両者に共通の規範である（§5.4 の注記）。
 
 ```text
 device
@@ -1319,6 +1581,32 @@ device
                  └─ part_key = (transmitter_id, mic_index, started_at)
                       └─ variant を orig / denoised に振り分け
 ```
+
+**Helper が inbox へ書くもの**（1 ファイルにつき 2 つ。`.meta.json` を**後に** rename することで、
+コンテナが中途半端な状態を拾わないようにする）:
+
+```text
+<VOICEDOCK_HOME>/inbox/<device_id>/<source_folder>/<name>.wav
+<VOICEDOCK_HOME>/inbox/<device_id>/<source_folder>/<name>.wav.meta.json
+```
+
+```json
+{
+  "schema": 1,
+  "device_id": "DJIMIC3",
+  "relpath": "TX_MIC001_20260829_071201/TX01_MIC002_20260829_071204_orig.wav",
+  "size": 345600000,
+  "mtime": 1787000000.0,
+  "sha256": "90e3d77f...",
+  "copied_at": "2026-09-12T18:00:00+09:00",
+  "helper_version": "4.0.0"
+}
+```
+
+- **`relpath` はボリュームルートからの相対パス。**絶対パスを一切書かない（§14.1.1）
+- **コンテナは `.meta.json` が存在する `.wav` だけを Part 候補とする。**`.wav` だけがある状態は
+  「コピー中」または「Helper が途中で落ちた」ことを意味するので無視し、次回の走査に委ねる
+- `sha256` は Helper がコピーしながら算出した値。コンテナが再計算して照合する（§10.5）
 
 | 判定 | 処理 |
 |---|---|
@@ -1340,6 +1628,9 @@ device
 
 ### 10.3 ファイル安定性判定
 
+**この判定は Helper（ホスト）が行う。**コンテナが見る inbox のファイルは、すべてこの判定を
+通過済みである。
+
 録音中・書き込み中の WAV を処理しないための判定。**ファイル単位で直列に待つと 1 走査パスで数分止まるため、バッチで行う。**
 
 ```text
@@ -1353,7 +1644,10 @@ device
 - 待機時間は合計 `stability_interval_seconds × stability_checks` であり、ファイル数に比例しない
 - 不一致が出たファイルは成立回数を 0 に戻す
 - 成立しなかったファイルは当該走査パスでは登録せず、次回に再評価する（`FILE_NOT_STABLE` は失敗ではなく「保留」）
-- 全 Variant について判定し、**すべてが安定した場合のみ** Part を登録する
+- 全 Variant について判定し、**すべてが安定した場合のみ** inbox へコピーする
+- **コピー自体もアトミックに行う。**`<name>.wav.partial` へ書いてから `mv`（同一ファイルシステム内の
+  `rename(2)`）で確定し、その後に `.meta.json` を同じ手順で置く。
+  **コンテナが中途半端なファイルを読む経路を無くす**
 
 ### 10.4 セッション分組（1 日 = 1 セッション）
 
@@ -1383,21 +1677,24 @@ def session_key_for(part: Part, cfg) -> str:
 
 `duration_seconds` が NULL の Part は、Block 境界の判定で「境界あり」として扱う（確信が持てない場合は分ける）。
 
-### 10.5 取り込みと正規化（デバイスから直接変換）
+### 10.5 取り込みと正規化（inbox から変換）
 
-**原本を staging へコピーしない。**デバイス上のファイルを読みながらハッシュを計算し、そのまま ffmpeg へ流して 16 kHz WAV を生成する。
+**コンテナはデバイスに到達できない**（§5.6）。Helper が inbox へ置いた原本を読みながらハッシュを
+計算し、そのまま ffmpeg へ流して 16 kHz WAV を生成する。**staging へ原本をコピーしない**点は
+v3.x と同じである。
 
 > whisper.cpp の WAV リーダは 16 kHz / モノラル / 16 bit PCM しか受け付けない。DJI Mic 3 は 48 kHz / 24 bit または 32 bit float で記録するため、この変換なしでは必ず失敗する。
 
-**(1) ffprobe による形式取得**（走査時に実行）
+**(1) ffprobe による形式取得**（inbox の走査時に実行）
 
 ```bash
 ffprobe -v error -select_streams a:0 \
         -show_entries format=duration:stream=sample_rate,channels,sample_fmt,codec_name \
-        -of json <device上のファイル>
+        -of json <inbox のファイル>
 ```
 
-ヘッダのみ読むため USB 越しでも安価。取得した `duration` を `recordings.duration_seconds` に保存し、`ended_at = started_at + duration` を計算する。
+**v4.0 では inbox（ローカルディスク）を読むため、USB 越しの往復が無くなった。**
+取得した `duration` を `recordings.duration_seconds` に保存し、`ended_at = started_at + duration` を計算する。
 
 **失敗時の扱い（§15.1 と統一）**: `max_attempts` 回リトライし、それでも失敗したら **`duration_seconds = NULL` のまま処理を続行する**（`WARN audio_probe_failed`）。記録を残すことを優先する。duration が NULL の Part は、Timeline の時刻範囲を whisper のセグメント終端で代用し、Block 境界では「境界あり」として扱う。
 
@@ -1421,15 +1718,31 @@ proc.stdin.close()
 
 | 項目 | 規定 |
 |---|---|
-| 入力 | `primary_variant` に対応する**デバイス上の**ファイル。もう一方の Variant は読まない |
+| 入力 | `primary_variant` に対応する **inbox 上の**ファイル。もう一方の Variant は読まない |
 | 出力 | `/data/staging/<recording_id>/audio16k.wav`（30 分で約 58 MB） |
-| ハッシュ | 読みながら SHA-256 を算出し `sha256_<primary_variant>` に保存する。**USB の読み込みは 1 回だけ** |
+| ハッシュ | 読みながら SHA-256 を算出し `sha256_<primary_variant>` に保存する |
+| **コピー検証** | 算出した SHA-256 が **`.meta.json` の `sha256`（`sha256_helper`）と一致すること。**不一致は `SOURCE_HASH_MISMATCH` → `FAILED`。**Helper のコピーが壊れていないことを確認する唯一の経路** |
 | タイムアウト | `max(ffmpeg_min_timeout_seconds, duration_seconds × ffmpeg_timeout_factor)` |
 | 検証 | 出力が存在し `size > 0`、ffprobe で 16000 Hz / 1 ch / `s16`、かつ **出力の duration が入力の duration と ±`duration_tolerance_seconds` 以内** |
-| 失敗時 | 部分出力を削除し `IMPORT_FAILED` → `FAILED`。**元ファイルには一切触らない** |
+| 失敗時 | 部分出力を削除し `IMPORT_FAILED` → `FAILED`。**inbox の原本にもデバイス上の原本にも一切触らない** |
 | 冪等性 | 出力が存在し検証を通れば再実行しない |
+| **成功後** | `import.inbox_retain == "normalized"`（既定）なら **inbox の原本を `safe_unlink_inbox()` で削除する**（§11.2） |
 
 > **`-nostdin` を付けてはならない。**標準入力から WAV を受け取るため、`-nostdin`（stdin を `/dev/null` にする）と両立しない。サブプロセスが端末の標準入力を奪う問題は、こちらからパイプを与えることで回避されている。
+
+**inbox の寿命**（`import.inbox_retain`）:
+
+| 値 | 削除する時点 | inbox の常駐使用量 |
+|---|---|---|
+| `normalized`（既定） | `NORMALIZED` の検証成功直後 | **数 GB**（処理中の数 Part のみ） |
+| `raw_saved` | その Part が `RAW_SAVED` に到達した時点 | 1 日 8〜22 GB（§5.1） |
+
+既定を `normalized` とする理由: 文字起こしの再試行には 16 kHz ファイルがあれば足りる（§9.4）。
+原本が再び必要になるのは変換自体をやり直すときだけで、そのときはデバイスが接続されていれば
+Helper が再コピーできる。**inbox に 1 日分を溜める必要はない。**
+
+**inbox の原本を削除しても §14.1 の削除条件には影響しない。**削除の根拠は
+「テキストが Vault に残っていること」であり、原本のコピーの有無ではない（§14.1）。
 
 **空き容量の必要量:**
 
@@ -1583,31 +1896,52 @@ for part in sorted(valid_parts, key=lambda p: p.started_at):
 
 ### 10.12 削除
 
+**v4.0 では削除は非同期になる。**コンテナは判断して要求を書くだけで、実行はホストの
+`voicedock-reaper` が行う（§4.2, §5.6）。
+
 ```text
-§14.1 の論理式を評価
-    ↓ 真
-デバイスが接続されているか確認
-    ↓ はい
-削除対象ファイルの同定（パス・サイズ・更新時刻・ファイル名規則）
-    ↓ 一致
-Part ごとに全 Variant を削除
-    ↓
-削除検証（os.path.exists() が False であること）
-    ↓
-Part を COMPLETED、Session を CLEANUP へ
-    ↓
-staging の残骸を削除
-    ↓
-Session を COMPLETED へ
+[コンテナ]  §14.1 の論理式を評価
+              ↓ 真
+            state/inventory.json でデバイスの接続を確認
+              ↓ 接続されている
+            queue/delete/<request_id>.json を書く（一時名 → rename）
+              ↓
+            Part を SOURCE_DELETING へ（＝ 結果待ち）
+              ↓
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+[reaper]    queue/delete/ を読む
+              ↓
+            §14.1.1 の 11 項目を独立検証（コンテナの判断を信用しない）
+              ↓ すべて真
+            Part の全 Variant を unlink
+              ↓
+            不在を確認（stat が ENOENT）
+              ↓
+            queue/result/<request_id>.json を書く
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+              ↓
+[コンテナ]  result を読む ∧ inventory.json でも不在を確認
+              ↓
+            Part を COMPLETED、Session を CLEANUP へ
+              ↓
+            staging の残骸を削除 → Session を COMPLETED へ
 ```
 
 | 失敗 | 扱い |
 |---|---|
-| デバイス未接続 | `SOURCE_DELETE_PENDING`。ノートは残す。次回同デバイス接続時に再試行 |
-| **同定に失敗**（サイズ・更新時刻・パスが DB の記録と一致しない） | `SOURCE_DELETE_PENDING`。**削除しない**。`WARN source_identity_mismatch` |
-| 削除は成功したが検証でファイルが残っている | `SOURCE_DELETE_FAILED` → `SOURCE_DELETE_PENDING` |
+| デバイス未接続（`inventory.json` に無い） | 要求を書かない。`SOURCE_DELETE_PENDING`。ノートは残す |
+| **reaper の結果がタイムアウト**（`cleanup.delete_result_timeout_seconds` 超過） | `SOURCE_DELETE_PENDING`。**古い要求はキューから取り下げ、再試行時は新しい `request_id` で投入する**（リプレイ防止と両立させるため） |
+| **reaper が同定に失敗** | 結果に `SOURCE_IDENTITY_MISMATCH` が入る → `SOURCE_DELETE_PENDING`。**削除しない**。`WARN source_identity_mismatch` |
+| **reaper が存在しない**（ロック 2-A） | 結果が来ない → タイムアウト → `SOURCE_DELETE_PENDING`。**これは正常な状態である**（Phase 7 前） |
+| 削除は成功したが `inventory.json` にまだ在る | `SOURCE_DELETE_FAILED` → `SOURCE_DELETE_PENDING` |
 | 一部 Variant のみ削除成功 | `SOURCE_DELETE_PENDING`。残りを次回処理する |
 | staging 削除失敗 | `LOCAL_DELETE_FAILED`。Session は `CLEANUP` に留める。次回リトライ |
+| キューへ書けない（権限・容量） | `DELETE_QUEUE_FAILED` → `SOURCE_DELETE_PENDING` |
+
+> **なぜ結果を 2 系統で確認するのか**: `queue/result/` は reaper の自己申告である。
+> `state/inventory.json` は ingest が**独立に**走査した結果なので、
+> **コンテナは reaper の申告を信用せずに不在を確認できる。**両方が一致して初めて `COMPLETED` にする。
+> これは §14.4 N-12（DB の状態だけを根拠にしない）と同じ考え方である。
 
 **再試行時にノートを二重生成してはならない。**`SOURCE_DELETE_PENDING` からの再開は削除処理のみを実行し、§10.8〜10.11 は `output_sha256` の一致確認によって飛ばされる（§9.4）。
 
@@ -1624,25 +1958,44 @@ Session を COMPLETED へ
 **(1) 削除経路の一本化（§14.4 N-10）**
 
 ```python
-# device.py — デバイス上のファイルを列挙・同定するが、決して削除しない
-def detect_devices(root: Path) -> list[MountedDevice]:
-    """root 配下から DJI デバイスを検出する（§5.4）。"""
+# device.py — inbox を走査し .meta.json を読む。デバイスには到達しない
+def list_inbox_parts(inbox_root: Path) -> list[PartCandidate]:
+    """inbox の Part 候補を列挙する。.meta.json が揃ったものだけを返す（§10.2）。"""
 
-def list_parts(device: MountedDevice) -> list[PartCandidate]:
-    """デバイス上の Part 候補を列挙する。ファイルの内容は読まない（§10.2）。"""
+def read_inventory(state_root: Path) -> DeviceInventory:
+    """Helper が書いた state/inventory.json を読む。接続状況と現存ファイルを得る。"""
 
-def resolve_delete_targets(device: MountedDevice, part: PartCandidate) -> list[DevicePath]:
-    """削除対象の実パスを返す。削除そのものは行わない。"""
+def resolve_delete_targets(part: PartCandidate) -> list[DevicePath]:
+    """削除対象の relpath を返す。DevicePath は PurePosixPath であり開けない。"""
 
-# cleaner.py — DevicePath を受け取って削除する唯一のモジュール
-def delete_part_sources(part, session, cfg, device) -> DeleteResult:
-    """§14.1 が真のときだけ、Part の全 Variant を削除する（§10.12, §14.3）。"""
+# cleaner.py — 削除要求を書く唯一のモジュール
+def request_part_deletion(part, session, cfg, inventory) -> DeleteRequest:
+    """§14.1 が真のときだけ queue/delete/<request_id>.json を書く（§10.12, §14.3）。
+
+    この関数はデバイス上のファイルを削除しない。削除できない。
+    実行するのはホストの voicedock-reaper のみである（§14.4 N-16）。
+    """
 ```
 
-- **`device.py` は `os.remove` / `Path.unlink` / `shutil.rmtree` を一切持たない。**
-- `DevicePath` を受け取って削除する関数は **`cleaner.py` の 1 本だけ**とする
-- staging と一時ファイルの削除は `paths.py` の `safe_unlink_staging()` / `safe_unlink_tmp()` に限定する。§11.2 の型分離により、誤った引数は型検査と実行時の双方で弾かれる
+- **`device.py` も `cleaner.py` も `os.remove` / `Path.unlink` / `shutil.rmtree` を持たない。**
+  v4.0 では**コンテナのどのモジュールもデバイス上のファイルを削除できない**
+- `DevicePath` を組み立てて要求へ載せる関数は **`cleaner.py` の 1 本だけ**とする
+- inbox・staging・一時ファイルの削除は `paths.py` の `safe_unlink_inbox()` /
+  `safe_unlink_staging()` / `safe_unlink_tmp()` に限定する。§11.2 の型分離により、
+  誤った引数は型検査と実行時の双方で弾かれる
 - この規約は §20.1 の「パス型」テストで検証する
+
+**(1b) デバイス上の削除の一本化（§14.4 N-16）**
+
+```sh
+# helper/voicedock-reaper — デバイス上のファイルを削除する唯一のプログラム
+#   引数なし。<VOICEDOCK_HOME>/queue/delete/*.json を処理する
+#   §14.1.1 の 11 項目を独立に検証し、1 つでも偽なら削除しない
+```
+
+- **`voicedock-ingest` は `rm` / `unlink` / `mv` をデバイス上のパスに対して実行しない**（N-18）
+- reaper は `diskutil` を呼ばない。マウント操作は ingest の責務に閉じる。
+  **これにより reaper は POSIX 互換の bash となり、Linux のテストコンテナから直接実行できる**（§20.4）
 
 **(2) 文字起こしエンジンの差し替え**
 
@@ -1664,31 +2017,55 @@ LLM も同様に `llm.py` の `analyze()` / `is_available()` に閉じる。た�
 
 ```python
 # paths.py — 削除経路を型で守る（§14.4 N-10）
-DevicePath  = NewType("DevicePath", Path)    # DJI デバイス上。cleaner.py のみが扱う
-StagingPath = NewType("StagingPath", Path)   # /data 配下
-VaultPath   = NewType("VaultPath", Path)     # /obsidian 配下
+#
+# ★v4.0 の要点: DevicePath を PurePosixPath にする。
+#   PurePosixPath は open() も stat() も exists() も持たない。
+#   したがって「コンテナがデバイス上のパスを開く」コードは書こうとしても書けない。
+#   v3.x の「規約で禁止する」から「型で不可能にする」へ強化された。
+DevicePath  = NewType("DevicePath", PurePosixPath)  # デバイス上の relpath。I/O 不可
+InboxPath   = NewType("InboxPath", Path)            # /inbox 配下。読み、変換後に消す
+StagingPath = NewType("StagingPath", Path)          # /data 配下
+VaultPath   = NewType("VaultPath", Path)            # /obsidian 配下
 
 # device.py
 @dataclass(frozen=True)
-class MountedDevice:
-    device_id: str          # Volume 名
-    path: DevicePath        # /host-volumes/<name>
-    writable: bool          # rw マウントか（削除可否判定に使う）
+class DeviceInventory:
+    """Helper が書いた state/inventory.json（§4.1）。コンテナの唯一のデバイス視界。"""
+    generated_at: datetime
+    mount_readonly: bool           # ロック 2-B が効いているか（§14.2）
+    devices: dict[str, frozenset[DevicePath]]   # device_id -> 現存する relpath の集合
+
+    def is_connected(self, device_id: str) -> bool: ...
+    def contains(self, device_id: str, rel: DevicePath) -> bool: ...
 
 @dataclass(frozen=True)
 class VariantFile:
     variant: Literal["orig", "denoised"]
-    path: DevicePath
+    relpath: DevicePath     # ボリュームルートからの相対パス。絶対パスを持たない
+    inbox_path: InboxPath | None    # 変換後に削除されると None になる
     size: int
     mtime: float
+    sha256_helper: str
 
 @dataclass(frozen=True)
 class PartCandidate:
+    device_id: str
     transmitter_id: str
     mic_index: int
     started_at: datetime
     source_folder: str
     variants: dict[str, VariantFile]    # "orig" / "denoised"
+
+# cleaner.py
+@dataclass(frozen=True)
+class DeleteRequest:
+    """queue/delete/<request_id>.json の内容（§14.1.1）。絶対パスを持たない。"""
+    request_id: str
+    created_at: datetime
+    device_id: str
+    recording_id: int
+    session_key: str
+    targets: list[VariantFile]
 
 # transcribe.py
 @dataclass(frozen=True)
@@ -2242,6 +2619,13 @@ VoiceDock の削除条件を整理し、午後の打ち合わせで MVP の範�
 
 Part の元音声を削除してよいのは、以下の論理式が真のときだけである。
 
+> **v4.0 でもこの論理式は 1 文字も変えていない。**変わったのは**評価の結果として何が起きるか**だけで、
+> 真になったときコンテナは削除ではなく**削除要求の書き込み**を行う（§10.12）。
+> `device` は `state/inventory.json` から得た `DeviceInventory` であり、
+> **`device.writable` は「`helper.conf` の `MOUNT_MODE` が `rw`」を意味する**（§14.2 ロック 2-B）。
+> `target_is_identical()` はコンテナ側の**事前**確認であり、**同じ検証を reaper が独立にやり直す**
+> （§14.1.1）。二重に検証することが v4.0 の設計である。
+
 ```python
 TERMINAL = ("RAW_SAVED", "SOURCE_DELETING", "SOURCE_DELETE_PENDING", "COMPLETED")
 
@@ -2288,96 +2672,216 @@ def can_delete_source(part, session, cfg, device) -> bool:
 重要な点:
 
 - `verify_raw_note()` / `verify_daily_note()` は **DB の `status` を信用せず、実ファイルを読み直して §13.7 を再実行する**
+- **コンテナはデバイスを読めない。**`target_is_identical()` がコンテナ側で参照するサイズ・更新時刻は
+  Helper が `.meta.json` に記録した値であり、**実ファイルとの突き合わせは reaper が行う**（§14.1.1）
 - **削除の根拠は「音声のコピーが正しかったこと」ではなく「テキストが Vault に確実に残っていること」である。**原音のコピーを保持しない設計（§10.5）に合わせて、v3.0 の「staging 上のファイルからハッシュを再計算する」条件は廃止した
 - 処理できなかった Part（`FAILED` / `SKIPPED`）はノートの `voicedock_recording_ids` に載らないため、**自動的に削除対象から外れる**
 - `all()` / `any()` を安全条件に使う場合は、**対象集合が空でないことを別条件として必ず明示する**（空集合の `all()` は真になるため）
 
-#### 14.1.1 削除対象ファイルの同定
+#### 14.1.1 削除対象ファイルの同定（reaper の独立検証）
 
-パスだけを信じて削除してはならない。削除の直前に以下をすべて検証する（1 つでも偽なら `SOURCE_IDENTITY_MISMATCH` → `SOURCE_DELETE_PENDING`）。
+パスだけを信じて削除してはならない。**v4.0 では検証を 2 か所で行う。**
+
+| 層 | いつ | 何を見るか |
+|---|---|---|
+| コンテナ | 要求を書く前 | DB と `.meta.json` に記録された値、`state/inventory.json` の現存一覧 |
+| **reaper** | **unlink の直前** | **デバイス上の実ファイル。コンテナの判断を一切信用しない** |
+
+**削除要求の形式**（`queue/delete/<request_id>.json`）:
+
+```json
+{
+  "schema": 1,
+  "request_id": "20260912T180000Z-42-a1b2c3",
+  "created_at": "2026-09-12T18:00:00+09:00",
+  "device_id": "DJIMIC3",
+  "recording_id": 42,
+  "session_key": "DJIMIC3:20260829",
+  "targets": [
+    {
+      "variant": "orig",
+      "relpath": "TX_MIC001_20260829_071201/TX01_MIC002_20260829_071204_orig.wav",
+      "size": 345600000,
+      "mtime": 1787000000.0
+    }
+  ]
+}
+```
+
+> **要求は絶対パスを持たない。**`relpath`（ボリュームルートからの相対パス）だけを載せる。
+> reaper は `device_id` と名前が一致する**現在マウント中のボリューム**に対してのみ解決する。
+> これにより **「要求がボリューム外のパスを指名すること」自体が構造的に不可能**になる。
+> v3.x は DB に絶対パスを持ち、それを信じて削除していた（付録 E の A-13）。v4.0 はその余地を消した。
+
+**reaper の検証（11 項目）。1 つでも偽なら削除せず、結果に `SOURCE_IDENTITY_MISMATCH` を書く。**
+
+| # | 検証 | 何を防ぐか |
+|---|---|---|
+| 1 | `helper.conf` の `DELETE_SOURCE_AUDIO=true` | 安全ロック 1（§14.2） |
+| 2 | `helper.conf` の `MOUNT_MODE=rw` かつ `state/heartbeat.json` の `mount_readonly` が偽 | 安全ロック 2-B。readOnly なら OS が拒否するが、**試みる前に落とす** |
+| 3 | `device_id` と同名のボリュームが現在マウントされている | 別のデバイスや未接続時の誤爆 |
+| 4 | `relpath` に `..` / 先頭 `/` / 空要素 / 制御文字が無い | パストラバーサル |
+| 5 | `realpath(<volume>/<relpath>)` が `realpath(<volume>)` 配下 | **symlink 経由の脱出**（§22 R-19。`docs/POC.md` §5.1 で実証済み） |
+| 6 | 対象が symlink でなく、通常ファイルである | 同上 |
+| 7 | ファイル名が `RECORDING_FILENAME_RE` に一致 | DJI 以外のファイルの削除 |
+| 8 | 親ディレクトリ名が `RECORDING_FOLDER_RE` に一致 | 同上。v3.x に無かった追加の防壁 |
+| 9 | `relpath` の各要素が `.` で始まらない | `.Trashes` / `.Spotlight-V100` 等の削除（§22 R-22） |
+| 10 | `size` が一致し、更新時刻の差が 2.0 秒未満 | 別の内容に差し替わったファイルの削除 |
+| 11 | `request_id` が `state/processed.log` に無い | **リプレイ**（同じ要求の二重実行） |
+
+**規範実装**（コンテナ側の事前確認も同じ規則に従う）:
 
 ```python
 import os
 import stat
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-def target_is_identical(part, variant, device) -> bool:
-    target = Path(part.source_path(variant))
-
-    # (1) 絶対パスであること・対象自身が symlink でないこと
-    if not target.is_absolute() or target.is_symlink():
+def target_is_identical(volume_root: Path, rel: PurePosixPath,
+                        expected_size: int, expected_mtime: float) -> bool:
+    # (4) relpath 自体の健全性。絶対パス・.. ・空要素・. 始まりを拒否する
+    parts = rel.parts
+    if rel.is_absolute() or not parts:
+        return False
+    if any(p in ("", ".", "..") or p.startswith(".") for p in parts):
         return False
 
-    # (2) 経路上の symlink をすべて解決してから封じ込めを判定する（§22 R-19）
+    target = volume_root / Path(*parts)
+
+    # (6) 対象自身が symlink でないこと
+    if target.is_symlink():
+        return False
+
+    # (5) 経路上の symlink をすべて解決してから封じ込めを判定する（§22 R-19）
     #     Path.parents は字句的判定であり symlink を解決しない。
-    #     macOS には /Volumes/Macintosh HD -> / が実在するため、
-    #     realpath を挟まないと封じ込めを擦り抜ける経路が理論上残る。
+    #     macOS には /Volumes/Macintosh HD -> / が実在し、コンテナ内でも
+    #     symlink のまま見えて無限に再帰できる（docs/POC.md §5.1）。
     resolved = Path(os.path.realpath(target))
-    device_root = Path(os.path.realpath(device.path))
-    if resolved != target:            # 経路の途中に symlink がある = 前提が崩れている
-        return False
-    if device_root not in resolved.parents:
+    root = Path(os.path.realpath(volume_root))
+    if resolved != target or root not in resolved.parents:
         return False
 
-    # (3) 同定（サイズ・更新時刻・ファイル名規則・通常ファイル）
+    # (7)(8) 名前の規則。ファイルと親フォルダの両方を見る
+    if RECORDING_FILENAME_RE.match(target.name) is None:
+        return False
+    if RECORDING_FOLDER_RE.match(target.parent.name) is None:
+        return False
+
+    # (6)(10) 通常ファイルであり、サイズと更新時刻が記録と一致すること
     st = target.lstat()
     return (
-        RECORDING_FILENAME_RE.match(target.name) is not None
-        and stat.S_ISREG(st.st_mode)
-        and st.st_size == part.source_size(variant)
-        and abs(st.st_mtime - part.source_mtime(variant)) < 2.0
+        stat.S_ISREG(st.st_mode)
+        and st.st_size == expected_size
+        and abs(st.st_mtime - expected_mtime) < 2.0
     )
 ```
 
-- SHA-256 の再計算はしない（USB 越しに 1 日 11 GB を読み直すことになるため）。パス・サイズ・更新時刻・ファイル名規則の一致で同定する
-- `device.path` 配下であることの検証は必須。§18.2 の bind mount は `/Volumes` ツリー全体であり、**`rw` にすると他のボリューム（Time Machine、外付け SSD）にも書き込めてしまう**ため、パス封じ込めがアプリ側の唯一の防壁になる
+- SHA-256 の再計算はしない（USB 越しに 1 日分を読み直すことになるため）。パス・サイズ・更新時刻・
+  ファイル名規則の一致で同定する
 - **`realpath` 解決は必須。**`Path.parents` は字句的な比較しか行わない。`/Volumes/Macintosh HD` が
   `/` への symlink として実在する以上、字句判定だけでは「デバイス配下」と偽装されたパスを拒否できない
   （§22 R-19）。§5.4 でボリュームルートの symlink を弾き、ここで経路全体を再確認する二重防壁とする
+- **reaper は要求に書かれたものしか削除しない。**ディレクトリの再帰削除を一切行わない（N-16）
 
-### 14.2 二重ロック
+### 14.2 三重ロック
 
-削除は **設定とファイルシステム権限の 2 段**で守る。
+削除は **設定・コードの不在・OS レベルの 3 段**で守る。
+v3.x の二重ロックのうち「マウント権限」は、コンテナが `/Volumes` をマウントしなくなったことで
+そのままでは成立しない。**同等の強度を保つために 2 つに分けて再設計した。**
 
-| ロック | 場所 | 既定値 | 解除するタイミング |
-|---|---|---|---|
-| ロック 1: 設定 | `config.yaml` の `cleanup.delete_source_audio` | `false` | Phase 7（実機 E2E 完了後） |
-| ロック 2: マウント権限 | `.env` の `DJI_MOUNT_MODE` | `ro` | Phase 7（同上） |
+| ロック | 場所 | 既定値 | 強度 | 解除するタイミング |
+|---|---|---|---|---|
+| **ロック 1: 設定** | `config.yaml` の `cleanup.delete_source_audio` **と** `helper.conf` の `DELETE_SOURCE_AUDIO`（**両方**） | `false` | 設定 | Phase 7 |
+| **ロック 2-A: コードの不在** | `<VOICEDOCK_HOME>/bin/voicedock-reaper` が**存在しない** | 未配置 | **実行不能** | Phase 7 に `install.sh --with-reaper` |
+| **ロック 2-B: OS レベル** | `helper.conf` の `MOUNT_MODE=ro` → ingest が `diskutil mount readOnly` で再マウント | `ro` | **OS レベル** | Phase 7 に `MOUNT_MODE=rw` |
 
-この状態では、**プログラムにバグがあってもコンテナから DJI 側を削除できない**（ファイルシステムが読み取り専用のため）。両方を解除して初めて削除が可能になる。
+#### ロック 2-A: 削除できるコードがホスト上に存在しない
 
-> **ロック 2 の適用範囲に注意する。**`DJI_MOUNT_MODE` は `/Volumes` ツリー全体の bind mount モードであり、`rw` にした瞬間 DJI Mic 以外のマウント中ボリュームもコンテナから書き込み可能になる。Phase 7 以降は §14.1.1 のパス検証と N-14 が唯一の防壁になる。
+**デバイス上のファイルを削除できるプログラムは `voicedock-reaper` 1 本だけである**（§14.4 N-16）。
+`install.sh` は既定でこれを配置しない。**存在しないプログラムは実行できない。**
 
-```dotenv
-# Phase 7 以降のみ
-DJI_MOUNT_MODE=rw
+この状態ではコンテナが要求を書いても、それを読む者がいない。要求はキューに溜まり、
+`cleanup.delete_result_timeout_seconds` 後に `SOURCE_DELETE_PENDING` になる。
+**これは Phase 7 前の正常な状態である**（§10.12）。
+
+#### ロック 2-B: OS レベルの読み取り専用マウント
+
+`MOUNT_MODE=ro`（既定）のとき、ingest はデバイスを検出するたびに読み取り専用へ再マウントする。
+
+```sh
+diskutil unmount "/Volumes/$VOL"
+diskutil mount readOnly "$NODE"
 ```
 
-```yaml
+`mount(8)` の `rdonly` は **「even the super-user may not write it」**と規定されている。
+**プログラムにバグがあっても、root であっても、デバイス上のファイルを消せない。**
+v3.x の `DJI_MOUNT_MODE=ro` と同じ強度である。
+
+再マウントの扱い:
+
+| 状況 | ingest の挙動 |
+|---|---|
+| 再マウント成功 | `heartbeat.json` に `mount_readonly: true` を書く。取り込みを続行 |
+| **再マウント失敗**（他プロセスが使用中など） | **取り込みは続行する**（記録を優先。§1.3）。`WARN remount_readonly_failed` を出し、`heartbeat.json` に `mount_readonly: false` を書く |
+
+**失敗は安全側へ倒れる。**`mount_readonly: false` を見た reaper は検証 2 で削除を拒否する
+（§14.1.1）。つまり **「ロック 2-B をかけられなかった」ことが「削除しない」理由になる。**
+
+> **v3.x からの改善点**: 旧ロック 2 は `/Volumes` ツリー全体の bind mount モードだったため、
+> `rw` にした瞬間 **DJI 以外のマウント中ボリューム（Time Machine、外付け SSD）もコンテナから
+> 書き込み可能**になっていた。v4.0 のロック 2-B は**当該デバイス 1 台だけ**に効く。
+> 被害範囲が原理的に狭くなった。
+
+#### Phase 7 の解除手順
+
+```sh
+# 1. helper.conf
+MOUNT_MODE=rw
+DELETE_SOURCE_AUDIO=true
+
+# 2. config.yaml
 cleanup:
   delete_source_audio: true
+
+# 3. reaper を初めて配置する
+./helper/install.sh --with-reaper
+
+# 4. 状態を確認（3 つすべてが解除されていること）
+./scripts/doctor.sh
 ```
 
-`DJI_MOUNT_MODE` を変更したら `docker compose up -d` でコンテナを再生成する必要がある。
+**片方だけの解除は起動時に弾く**（V-30）。`config.yaml` だけを `true` にしても、
+`helper.conf` が `false` なら reaper が検証 1 で拒否する。
+
+削除モードが有効な場合、サービス起動時と `doctor` 実行時に必ず警告を出す（§14.3）。
 
 ### 14.3 削除順序
 
 ```text
-Raw ノート保存検証 成功
-    ↓
-Daily ノート保存検証 成功
-    ↓
-§14.1 の論理式を評価 → 真
-    ↓
-削除対象の同定（§14.1.1）→ 一致
-    ↓
-DJI 側 Part の全 Variant を削除
-    ↓
-削除検証（ファイルが存在しないことを確認）
-    ↓
-staging の残骸を削除
-    ↓
-COMPLETED
+[コンテナ]  Raw ノート保存検証 成功
+              ↓
+            Daily ノート保存検証 成功
+              ↓
+            §14.1 の論理式を評価 → 真
+              ↓
+            コンテナ側の事前同定（§14.1.1）→ 一致
+              ↓
+            削除要求を書く（relpath のみ。絶対パスを持たない）
+              ↓
+[reaper]    三重ロックを確認（§14.2）→ すべて解除済み
+              ↓
+            独立検証 11 項目（§14.1.1）→ すべて真
+              ↓
+            DJI 側 Part の全 Variant を unlink
+              ↓
+            削除検証（ファイルが存在しないことを確認）
+              ↓
+            結果を書く
+              ↓
+[コンテナ]  結果を読み、inventory.json でも不在を確認
+              ↓
+            staging の残骸を削除
+              ↓
+            COMPLETED
 ```
 
 Source 削除に失敗した場合:
@@ -2391,7 +2895,10 @@ Source 削除に失敗した場合:
 削除モードが有効な場合、サービス起動時と `doctor` 実行時に必ず警告を出す。
 
 ```text
-WARNING: Source deletion is ENABLED (cleanup.delete_source_audio=true, DJI_MOUNT_MODE=rw)
+WARNING: Source deletion is ENABLED
+         lock 1  : config.yaml=true, helper.conf=true
+         lock 2-A: voicedock-reaper is INSTALLED
+         lock 2-B: MOUNT_MODE=rw (device is mounted read-write)
 ```
 
 ### 14.4 実装上の禁止事項
@@ -2400,19 +2907,23 @@ WARNING: Source deletion is ENABLED (cleanup.delete_source_audio=true, DJI_MOUNT
 |---|---|---|
 | N-1 | `--privileged` の使用 | 不要な権限昇格 |
 | N-2 | `/var/run/docker.sock` のマウント | コンテナからホストを制御できてしまう |
-| N-3 | `/Volumes` と Vault 以外のホスト領域のマウント | 被害範囲の限定 |
-| N-4 | `/Users` 全体のマウント | 同上。Vault のみをマウントする |
+| N-3 | `<VOICEDOCK_HOME>` と Vault 以外のホスト領域のマウント。**`/Volumes` は一切マウントしない** | 被害範囲の限定（§18.2） |
+| N-4 | `/Users` 全体のマウント | 同上。Vault と `<VOICEDOCK_HOME>` の配下のみをマウントする |
 | N-5 | `subprocess` での `shell=True` | コマンドインジェクション。ファイル名は外部入力である |
 | N-6 | コマンド文字列の連結（`os.system("whisper " + filename)` など） | 同上 |
 | N-7 | 外部 LLM API へのフォールバック実装 | 音声内容の外部送信 |
 | N-8 | transcript / summary 本文のログ出力（`unsafe_log_content` が `false` のとき） | 情報漏洩 |
 | N-9 | 削除処理を `ensure_*` 以外の場所から呼ぶこと | 安全条件の迂回 |
-| N-10 | **デバイス上のファイル削除を `cleaner.py` 以外で行うこと。** staging・一時ファイルの削除は `paths.py` の `safe_unlink_staging()` / `safe_unlink_tmp()` に限定する。`device.py` は `os.remove` / `Path.unlink` / `shutil.rmtree` を持たない | 削除経路の一本化。`DevicePath` / `StagingPath` の型分離で機械的に守る（§11.2） |
-| N-11 | 元デバイス上のファイルへの書き込み・改名・移動 | 読み取りと削除のみを許す |
+| N-10 | **コンテナからデバイス上のファイルを削除しようとすること。**v4.0 ではコンテナはデバイスに到達できない。inbox・staging・一時ファイルの削除は `paths.py` の `safe_unlink_inbox()` / `safe_unlink_staging()` / `safe_unlink_tmp()` に限定する | 削除経路の一本化。`DevicePath` を `PurePosixPath` にすることで、**開く・消すコードが書けない**（§11.2） |
+| N-11 | 元デバイス上のファイルへの書き込み・改名・移動 | 読み取りと削除のみを許す。Helper にも同じく適用する（N-18） |
 | N-12 | DB の状態だけを根拠にした削除判断 | §14.1 の通り実ファイルを再検証する |
 | N-13 | `compose.yaml` の `ports:` によるホストポート公開 | 他プロジェクトとのポート衝突回避、攻撃面の最小化。CLI は `docker compose exec`、health は CLI 実行で足りる |
-| N-14 | 削除対象パスが `MountedDevice.path` 配下であることを検証せずに削除すること | `/host-volumes` 直下の他ボリュームへ到達する経路を作らない（§14.1.1） |
+| N-14 | 削除対象パスがボリュームルート配下であることを `realpath` 解決後に検証せずに削除すること | 他ボリュームへ到達する経路を作らない（§14.1.1 検証 4・5） |
 | N-15 | LLM に `[[ ]]` リンクを生成させること | 存在しないノートへのリンクを幻覚する（§13.8） |
+| **N-16** | **`voicedock-reaper` 以外がデバイス上のファイルを削除すること。**reaper はディレクトリの再帰削除を一切行わず、要求に書かれたファイルだけを `unlink` する | デバイス上の削除経路を 1 本に保つ。ロック 2-A（§14.2）の前提 |
+| **N-17** | **削除要求に絶対パス・`..`・`.` 始まりの要素を書くこと** | 要求がボリューム外を指名する経路を作らない（§14.1.1 検証 4・9） |
+| **N-18** | **Helper がデバイスへ書き込む・改名する・移動すること**（`voicedock-ingest` は読み取りと `diskutil` のマウント操作のみ） | 取り込みが原本を壊さない。N-11 のホスト側版 |
+| **N-19** | **reaper が `diskutil` を呼ぶこと** | マウント操作を ingest に閉じる。reaper を POSIX 互換に保ち、§20.4 を CI で実行可能にする |
 
 > v3.0 の N-10 は「`os.remove` の直接呼び出し禁止（`cleaner.py` 以外）」だったが、部分出力の削除・一時ファイルの削除など仕様内の他の削除と矛盾し、ルールとして守れなかった。削除対象で分離することで実行可能な規則にした。
 
@@ -2438,11 +2949,16 @@ VoiceDock Container ──HTTP──> Docker Model Runner（ローカル）
 |---|---|---|---|---|
 | `CONFIG_UNKNOWN_KEY` | 設定 | 起動 | 不可 | 起動中止（終了コード 2） |
 | `CONFIG_INVALID_VALUE` | 設定 | 起動 | 不可 | 起動中止（終了コード 2） |
+| `CONFIG_LOCK_MISMATCH` | 設定 | 起動 | 不可 | 起動中止（終了コード 2）。`config.yaml` と `helper.conf` の削除ロックが食い違っている（V-30） |
 | `DEVICE_NOT_READABLE` | デバイス | 走査 | 可（次回 polling） | スキップ |
 | `DEVICE_UNSUPPORTED` | デバイス | 走査 | 不可 | スキップ |
 | `FILE_NOT_STABLE` | デバイス | 安定性判定 | 可（次回 polling） | 登録保留（失敗ではない） |
 | `DUPLICATE_CONTENT` | 取り込み | SHA-256 衝突 | 不可 | Part `SKIPPED` |
 | `SOURCE_MISSING` | 取り込み | 取り込み直前の再確認 | 不可 | Part `SKIPPED`（失敗ではない）。**デバイス上のファイルには触れない** |
+| `SOURCE_HASH_MISMATCH` | 取り込み | SHA-256 の照合（§10.5） | 可（3 回） | Part `FAILED`。出力削除。**inbox の原本は残す**（再コピー判断のため） |
+| `HELPER_UNAVAILABLE` | Helper | ハートビート確認 | 可（次回評価時） | 取り込みを停止して待機。**元音声は削除しない** |
+| `DELETE_QUEUE_FAILED` | 削除 | キューへの書き込み | 可（次回接続時） | `SOURCE_DELETE_PENDING`。**削除しない** |
+| `DELETE_TIMEOUT` | 削除 | reaper の結果待ち | 可（次回接続時） | `SOURCE_DELETE_PENDING`。**Phase 7 前は正常な状態**（ロック 2-A） |
 | `DISK_SPACE_LOW` | 取り込み | 空き容量確認 | 可（次回 polling） | 処理停止。**元音声は削除しない** |
 | `AUDIO_PROBE_FAILED` | 音声 | ffprobe | 可（3 回） | **続行**（`duration_seconds = NULL`、警告のみ） |
 | `IMPORT_FAILED` | 音声 | 読み込み / 変換 / USB 切断 | 可（3 回） | Part `FAILED`。部分出力削除 |
@@ -2482,6 +2998,7 @@ retry:
 - `retry_count` が `max_attempts` に達したら `FAILED` として残す
 - **`FAILED` は `auto_retry_failed_after_hours`（既定 24 時間）経過後に自動で再投入する。**1 日 32 Part の運用で、失敗のたびに人が `retry` を打つのは現実的でないため。`auto_retry_max_rounds`（既定 3）を超えたら以降は自動で触らず、`status` / `doctor` の警告に出し続ける（`retry_exhausted`）
 - **自動再試行の対象外**: 設定エラー系、`DUPLICATE_CONTENT`、`NO_SPEECH_DETECTED`、`SOURCE_MISSING`
+- `HELPER_UNAVAILABLE` と `DELETE_TIMEOUT` は `max_attempts` の対象外。**Helper の復帰／デバイスの再接続のたびに無期限に再評価する**（`SOURCE_DELETE_PENDING` と同じ扱い）
 - `FAILED` からの即時復帰は CLI の `voicedock retry <id>`（`--force` 付きで上限無視）
 - **リトライは最初からやり直さない。**§9.4 の再開規則に従って完了済みステップを飛ばす
 - `SOURCE_DELETE_PENDING` は `max_attempts` の対象外。デバイスが接続されるたびに無期限に再試行する
@@ -2508,7 +3025,7 @@ make logs
 
 ```text
 2026-08-30T07:00:12+09:00 INFO  service_started version=3.2.0
-2026-08-30T07:00:17+09:00 INFO  device_detected device_id=DJI_MIC path=/host-volumes/DJI_MIC writable=false
+2026-08-30T07:00:17+09:00 INFO  device_detected device_id=DJIMIC3 source=helper_inventory writable=false
 2026-08-30T07:00:18+09:00 INFO  deep_scan_completed device_id=DJI_MIC files=64 new_parts=32 elapsed_s=1.4
 2026-08-30T07:00:18+09:00 INFO  part_discovered recording_id=42 tx=TX01 mic=2 started_at=2026-08-29T07:12:04+09:00 duration=1800.0 variants=2
 2026-08-30T07:00:18+09:00 INFO  session_opened session_id=12 session_key=DJI_MIC:20260829
@@ -2548,6 +3065,9 @@ make logs
 ```text
 service_started / service_stopping / recovery_completed
 device_detected / device_lost / device_unreadable / device_excluded
+helper_heartbeat_stale / helper_recovered / remount_readonly_failed
+inbox_part_found / inbox_meta_missing / inbox_source_deleted / source_hash_mismatch
+delete_requested / delete_result_received / delete_timeout / delete_queue_failed
 deep_scan_started / deep_scan_completed / deep_scan_skipped
 part_discovered / part_skipped / unparsable_filename / file_not_stable
 normalize_started / normalize_completed / normalize_failed / duplicate_content
@@ -2601,9 +3121,12 @@ $ voicedock status
 
 VoiceDock v0.1.0
 ────────────────────────────────────────────────────────
-Devices connected     : 1  (DJI_MIC, ro)
+Helper                : running   (last seen 42s ago, v4.0.0, mount=readOnly)
+Devices connected     : 1  (DJIMIC3, readOnly)
 Device free space     : 4.2 GiB  (残り約 4.3 時間)
-Source deletion       : DISABLED  (config=false, mount=ro)
+Inbox                 : 3 parts pending, 1.1 GiB
+Delete queue          : 0 requested, 0 awaiting result
+Source deletion       : DISABLED  (lock1=false, lock2A=reaper absent, lock2B=readOnly)
 
 Parts
   DISCOVERED          : 6
@@ -2654,13 +3177,17 @@ ID   DATE         PARTS  RECORDED  STATUS      TITLE
 
 | スクリプト | 内容 |
 |---|---|
-| `scripts/doctor.sh` | **初回セットアップ検査（§21.1）と環境診断を兼ねる。**ホスト側検査 DH-1〜DH-11（§19.2）を実行し、コンテナが起動していれば続けて `docker compose exec voicedock voicedock doctor` を実行する |
+| `scripts/doctor.sh` | **初回セットアップ検査（§21.1）と環境診断を兼ねる。**ホスト側検査 DH-1〜DH-13（§19.2）を実行し、コンテナが起動していれば続けて `docker compose exec voicedock voicedock doctor` を実行する |
 | `scripts/fetch-models.sh` | Whisper モデルと Silero VAD モデルを named volume へ取得（§18.6） |
+
+`helper/` の 3 本（`voicedock-ingest` / `voicedock-reaper` / `install.sh`）は**この 2 本とは別枠**である。
+`scripts/` は `docker compose` のラッパで**コンテナが動いている前提**に立つが、`helper/` は
+**Docker が止まっていても動く**（§6 の判断表）。
 
 ```makefile
 UV_IMAGE ?= ghcr.io/astral-sh/uv:0.12.13-python3.12-trixie-slim
 
-.PHONY: up down logs status doctor models test lock
+.PHONY: up down logs status doctor models test lock helper-install helper-status
 
 up:      ; docker compose up -d --build
 down:    ; docker compose down
@@ -2668,6 +3195,10 @@ logs:    ; docker compose logs -f voicedock
 status:  ; docker compose exec voicedock voicedock status
 doctor:  ; ./scripts/doctor.sh
 models:  ; ./scripts/fetch-models.sh
+
+# ホスト側 Helper（§3.4(6), §4.1）。Docker には依存しない
+helper-install: ; ./helper/install.sh
+helper-status:  ; ./helper/install.sh --status
 
 # テストはコンテナ内で実行する。ホストに Python / pytest を入れない（§3.3）
 test:
@@ -2728,9 +3259,14 @@ services:
       VOICEDOCK_CONFIG: /app/config/config.yaml
 
     volumes:
-      # DJI Mic を含む macOS Volume 群
-      # 既定は ro。削除試験完了後のみ rw（§14.2）
-      - /Volumes:/host-volumes:${DJI_MOUNT_MODE:-ro}
+      # ★v4.0: /Volumes はマウントしない（§5.6, §14.4 N-3）
+      #   VirtioFS は物理 USB を読めず、読もうとすると Docker 全体が固まりうる。
+      #   デバイスへ到達できるのはホストの Helper だけである。
+
+      # Helper と共有する作業領域（§4.1）。/Users 配下なので VirtioFS で動く
+      - ${VOICEDOCK_HOME:?VOICEDOCK_HOME is required}/inbox:/inbox:rw
+      - ${VOICEDOCK_HOME:?VOICEDOCK_HOME is required}/queue:/queue:rw
+      - ${VOICEDOCK_HOME:?VOICEDOCK_HOME is required}/state:/state:ro
 
       # Obsidian Vault
       - ${OBSIDIAN_VAULT:?OBSIDIAN_VAULT is required}:/obsidian:rw
@@ -2782,7 +3318,10 @@ volumes:
 
 | 記述 | 意図 |
 |---|---|
-| `${DJI_MOUNT_MODE:-ro}` | `.env` 未設定時も必ず読み取り専用にする（安全側の既定） |
+| **`/Volumes` が無い** | §5.6。コンテナは物理デバイスに到達できない。マウントしようとすると Docker 全体が固まりうる（`docs/POC.md` §2.3） |
+| `/state:ro` | Helper の報告（heartbeat / inventory）は**コンテナから改変できない**。コンテナが自分に都合よく書き換えて削除判断を通す経路を作らない |
+| `/queue:rw` | コンテナが要求を書き、reaper の結果を読む。**双方向なので rw** |
+| `${VOICEDOCK_HOME:?...}` | 未設定なら起動を失敗させる。**`/Users` 配下であることは V-28 が検査する** |
 | `${OBSIDIAN_VAULT:?...}` | 未設定なら起動を失敗させる。誤ったパスへ書かない |
 | `models` 長構文 | 環境変数名を明示し、モデル名変更の影響をアプリへ波及させない |
 | `security_opt` / `cap_drop` | §14.4 N-1 に沿った最小権限 |
@@ -2853,7 +3392,7 @@ RUN ldd /usr/local/bin/whisper-cli || true \
     && /usr/local/bin/whisper-cli --help > /dev/null
 
 RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin voicedock \
-    && mkdir -p /data /models/whisper /obsidian /host-volumes \
+    && mkdir -p /data /models/whisper /obsidian /inbox /queue /state \
     && chown -R voicedock:voicedock /data /models
 
 WORKDIR /app
@@ -2938,17 +3477,30 @@ htmlcov/
 
 VoiceDock 用に `launchd` は使用しない。
 
+**v4.0 の常駐は 2 本立てになる。**取り込み（Helper）と処理（コンテナ）が独立に動く。
+
 ```text
 macOS ログイン
-    ↓
-Docker Desktop 起動（AutoStart 有効が前提 §3.4）
-    ↓
-Docker Engine Ready
-    ↓
-restart: unless-stopped により VoiceDock コンテナ起動
-    ↓
-走査開始
+    │
+    ├── launchd が com.voicedock.ingest.plist を読む
+    │       ↓
+    │   StartOnMount / StartInterval で voicedock-ingest が起動される
+    │       ↓
+    │   デバイスを検出 → readOnly 再マウント → inbox へコピー
+    │   （Docker が止まっていても動く）
+    │
+    └── Docker Desktop 起動（AutoStart 有効が前提 §3.4）
+            ↓
+        Docker Engine Ready
+            ↓
+        restart: unless-stopped により VoiceDock コンテナ起動
+            ↓
+        inbox の走査開始
 ```
+
+> **取り込みが Docker の状態に依存しないことは設計上の利点である。**Docker Desktop が
+> 起動途中でも、更新中でも、落ちていても、**デバイスを挿せば録音は inbox へ確保される。**
+> 処理はコンテナが起きてから追いつけばよい。v3.x では Docker が落ちていると取り込み自体ができなかった。
 
 ### 18.5 バージョン固定
 
@@ -3034,8 +3586,14 @@ VAD モデルは whisper.cpp `v1.9.4` の `models/download-vad-model.sh` が参�
 | H-5 | `transcription.executable` が存在し実行可能 | unhealthy |
 | H-6 | `transcription.model` が存在する | unhealthy |
 | H-7 | `VOICEDOCK_LLM_URL` / `VOICEDOCK_LLM_MODEL` が設定されている | unhealthy |
+| **H-8** | **`/state/heartbeat.json` が存在し、`import.helper_heartbeat_max_age_seconds` より新しい** | unhealthy |
+| **H-9** | `/inbox` が読み書き可能、`/queue` が読み書き可能 | unhealthy |
 
 **DJI Mic が未接続であることを unhealthy の条件にしてはならない。**通常はデバイスが接続されていない状態が正常である。
+
+**H-8 は逆に unhealthy にする。**Helper が止まると**録音は 1 本も取り込まれないのに、
+コンテナは正常に見え続ける**（§22 R-23）。無人稼働が前提である以上、この沈黙は検出しなければ
+ならない。`docker ps` の `unhealthy` として見えることに価値がある。
 
 LLM への実リクエストは `health` では行わない（`doctor` で行う）。
 
@@ -3053,8 +3611,12 @@ VoiceDock doctor
 [✓] Database             /data/voicedock.db (schema v1, 261 recordings, 8 sessions, 2104 events, 4.1 MiB)
 [✓] Data volume          /data writable, 58.1 GiB free
 [✓] Staging usage        0.1 GiB / 5.0 GiB
-[✓] Host volumes root    /host-volumes (2 entries, 1 excluded: "Macintosh HD")
-[✓] DJI device           DJI_MIC  mode=ro  parts=3  free=4.2 GiB (≈4.3h)
+[✓] Helper               running (last seen 42s ago, v4.0.0)
+[✓] Helper mount mode    readOnly (lock 2-B engaged)
+[✓] Inbox                /inbox  3 parts pending, 1.1 GiB
+[✓] Delete queue         /queue  0 requested, 0 awaiting result
+[✓] Host volumes         2 entries, 1 excluded: "Macintosh HD"   (reported by Helper)
+[✓] DJI device           DJIMIC3  readOnly  parts=3  free=4.2 GiB (≈4.3h)
 [✓] Whisper executable   /usr/local/bin/whisper-cli (v1.9.4, VAD: supported)
 [✓] Whisper model        ggml-large-v3-turbo-q5_0.bin (574.0 MiB)
 [✓] VAD model            ggml-silero-v5.1.2.bin (2.2 MiB)
@@ -3076,7 +3638,7 @@ VoiceDock doctor
 | D-2 | DB へ接続でき、スキーマバージョンが最新。`events` 行数と DB サイズを表示 | 致命的 |
 | D-3 | `/data` が書き込み可能、空き容量が `free_space_margin_bytes` 以上 | 致命的 |
 | D-4 | staging 使用量が上限内 | 警告 |
-| D-5 | `/host-volumes` が存在し読み取り可能。**除外パターンで除外した Volume 名を必ず列挙する** | 致命的 |
+| D-5 | Helper が報告した Volume 一覧（`state/inventory.json`）。**除外パターンで除外した Volume 名を必ず列挙する** | 致命的 |
 | D-6 | DJI デバイスの検出状況と**本体の残容量・推定残り録音時間**（未接続は正常）。推定残り録音時間は下記の基準で算出する | 情報 |
 | D-7 | `whisper-cli` が存在し `--help` が成功する。**VAD オプションの有無を表示** | 致命的 |
 | D-8 | Whisper モデルが存在し、サイズが 0 でない | 致命的 |
@@ -3088,7 +3650,9 @@ VoiceDock doctor
 | D-14 | Raw / Daily の出力フォルダが存在するか作成できる | 致命的 |
 | D-15 | `FAILED` / `SOURCE_DELETE_PENDING` / 自動再試行待ちの件数 | 警告 |
 | D-16 | **自コンテナに公開ポートが無いこと、LLM エンドポイントが `*.docker.internal` であること** | 致命的 |
-| D-17 | **削除モードの状態を必ず表示する** | 有効なら警告表示 |
+| D-17 | **削除モードの状態を必ず表示する。三重ロックの 3 つすべてを個別に表示する**（§14.2） | 有効なら警告表示 |
+| **D-18** | **Helper が稼働している**（`heartbeat.json` が `helper_heartbeat_max_age_seconds` 以内）。`mount_readonly` と Helper のバージョンを表示する。**Helper が報告した除外一覧と `config.yaml` の `device.exclude_volumes` が一致すること**（§7.4 の二重定義の食い違いを検出する） | 致命的 |
+| **D-19** | `/inbox` と `/queue` が読み書き可能。**inbox の滞留件数・容量、削除キューの未処理件数と最古の経過時間**を表示する | 警告（滞留が閾値超のとき） |
 
 **推定残り録音時間の算出基準**:
 
@@ -3105,11 +3669,23 @@ VoiceDock doctor
 削除モードが有効な場合の表示:
 
 ```text
-[!] Source deletion      ENABLED  (config=true, mount=rw)
+[!] Source deletion      ENABLED
+      lock 1  : config.yaml=true, helper.conf=true
+      lock 2-A: voicedock-reaper is INSTALLED
+      lock 2-B: MOUNT_MODE=rw (device mounted read-write)
     WARNING: Source deletion is ENABLED. Verified recordings will be
              permanently removed from the DJI Mic 3 after saving.
-    NOTE: DJI_MOUNT_MODE=rw makes ALL mounted volumes writable from the
-          container. Path containment (§14.1.1) is the only remaining guard.
+    NOTE: Deletion is executed by the host-side reaper, not by this container.
+          The reaper re-verifies every request independently (§14.1.1).
+```
+
+いずれか 1 つでも解除されていなければ、そのロックを明示して `DISABLED` と表示する。
+
+```text
+[!] Source deletion      DISABLED
+      lock 1  : config.yaml=false, helper.conf=false
+      lock 2-A: voicedock-reaper is NOT installed  <- deletion is impossible
+      lock 2-B: MOUNT_MODE=ro (device mounted read-only)
 ```
 
 ホスト側の検査（`scripts/doctor.sh` が追加で実施。コンテナ内からは確認できないため）。**§21.1 の初回セットアップ検査もこの表に一本化する**（v3.1 では `setup.sh` と `doctor.sh` に同じ検査が二重に書かれていた）。
@@ -3122,13 +3698,17 @@ VoiceDock doctor
 | DH-4 | Docker Desktop `AutoStart == true` | 警告 |
 | DH-5 | `.env` が存在し `OBSIDIAN_VAULT` が実在するディレクトリ | 致命的 |
 | DH-6 | `docker` コマンドが利用可能で、エンジンが起動している | 致命的 |
-| DH-7 | `.env` の `DJI_MOUNT_MODE` が `ro` | `rw` なら警告して確認を求める（§14.2） |
+| DH-7 | `helper.conf` の `MOUNT_MODE` が `ro`（安全ロック 2-B） | `rw` なら警告して確認を求める（§14.2） |
 | DH-8 | `config/config.yaml` が存在する（内容の検証はコンテナ内の D-1 が行う） | 致命的 |
 | DH-9 | Whisper モデルと VAD モデルが named volume に存在する | 無ければ `fetch-models.sh` の実行を案内 |
 | DH-10 | `docker compose config` が成功する（変数解決・構文の検証） | 致命的 |
 | DH-11 | `docker compose config` の出力に `ports:` が含まれない（§14.4 N-13） | 致命的 |
+| **DH-12** | **`com.voicedock.ingest` の LaunchAgent が load されている**（`launchctl print gui/$UID/com.voicedock.ingest`） | 致命的（Helper が動かなければ録音は 1 本も取り込まれない） |
+| **DH-13** | `<VOICEDOCK_HOME>` が存在し `/Users` 配下である。`helper.conf` が存在し、`MOUNT_MODE` と `DELETE_SOURCE_AUDIO` の値を表示する | 致命的 |
+| **DH-14** | **`<VOICEDOCK_HOME>/bin/voicedock-reaper` の有無を表示する**（ロック 2-A の状態） | 存在すれば警告表示 |
+| **DH-15** | `docker compose config` の出力に **`/Volumes` が含まれない**（§14.4 N-3） | 致命的 |
 
-実行順は `doctor.sh` に委ねる（DH-6 → DH-3 → DH-1 の順に前提が積み上がる）。**`doctor.sh` は検査のみを行い、ホスト設定の変更はしない。**
+実行順は `doctor.sh` に委ねる（DH-6 → DH-3 → DH-1 → DH-13 → DH-12 の順に前提が積み上がる）。**`doctor.sh` は検査のみを行い、ホスト設定の変更はしない。**
 
 ---
 
@@ -3170,7 +3750,9 @@ VoiceDock doctor
 
 | 対象 | 方法 |
 |---|---|
-| デバイス | `tests/fixtures/fake_volumes` を pytest の `tmp_path` へコピーし、そのパスを `device.root` に与える。**git 管理下の fixture を直接使ってはならない**（削除テストが実ファイルを消してしまうため） |
+| **Helper（inbox）** | `tests/fixtures/fake_inbox` を `tmp_path` へコピーし、`import.inbox_root` に与える。`.meta.json` も fixture として置く。**git 管理下の fixture を直接使ってはならない** |
+| **Helper（state）** | `heartbeat.json` / `inventory.json` を `tmp_path` に生成して `/state` 相当に与える。Helper 本体は動かさない |
+| **reaper** | `tests/fixtures/fake_volumes` を `tmp_path` へコピーして偽ボリュームとし、`bash helper/voicedock-reaper` を `subprocess` で直接実行する（§20.4） |
 | Whisper | `transcription.executable` をテスト用スクリプトへ差し替え、固定の JSON を出力する |
 | LLM | `llm.py` の HTTP 呼び出しを monkeypatch し、`tests/fixtures/llm_responses/` の JSON を返す。**ネットワークを一切使わない** |
 | Obsidian | `tmp_path` 配下のディレクトリを Vault として与える |
@@ -3179,8 +3761,10 @@ VoiceDock doctor
 検証フロー:
 
 ```text
-Detection → 直接変換 → Whisper mock → Raw ノート → Session merge
-    → LLM mock → Daily ノート → Atomic write → 保存検証 → （削除は §20.4）
+偽 inbox（.meta.json 付き）→ SHA-256 照合 → 変換 → inbox 原本の削除
+    → Whisper mock → Raw ノート → Session merge
+    → LLM mock → Daily ノート → Atomic write → 保存検証
+    → 削除要求の書き込み → reaper 実行 → 結果の読み取り（詳細は §20.4）
 ```
 
 fixture の WAV は **実際に 48 kHz / 32 bit float** で生成し、変換が本当に必要な条件を再現すること（16 kHz の WAV を置くと §10.5 のバグを見逃す）。
@@ -3206,7 +3790,22 @@ fixture の WAV は **実際に 48 kHz / 32 bit float** で生成し、変換が
 
 ### 20.4 最重要テスト: 削除禁止
 
-**以下の各状態で、DJI 側の元音声が必ず残ることを検証する。**すべて `cleanup.delete_source_audio: true` かつ `DJI_MOUNT_MODE=rw`（削除が可能な状態）で実行し、それでも削除されないことを確認する。
+**以下の各状態で、DJI 側の元音声が必ず残ることを検証する。**すべて**三重ロックをすべて解除した状態**
+（`config.yaml` と `helper.conf` の `delete_source_audio` が `true`、reaper が配置済み、`MOUNT_MODE=rw`）
+で実行し、それでも削除されないことを確認する。
+
+**v4.0 では削除がコンテナと reaper にまたがるため、テストを 2 層に分ける。**
+
+| 層 | 何を assert するか | 実行方法 |
+|---|---|---|
+| **コンテナ層**（ND-01〜ND-17） | §14.1 が偽のとき **`queue/delete/` に要求が 1 件も書かれない**こと | pytest。偽 inbox と偽 state を与える |
+| **reaper 層**（ND-18〜ND-21、ND-24〜ND-28） | 偽装・改竄した要求を置いても **偽ボリューム上のファイルが消えない**こと | pytest から `subprocess.run(["bash", "helper/voicedock-reaper"], env=...)` |
+| **両層**（ND-22 / ND-23） | ロックが 1 つでも掛かっていれば削除されないこと | 両方 |
+
+> **なぜ reaper 層を pytest から実行できるのか**: reaper は `diskutil` を呼ばず（§14.4 N-19）、
+> POSIX 互換の bash で書かれる。`stat` の BSD / GNU 差だけを内部の薄いラッパ
+> （`_stat_size` / `_stat_mtime`）で吸収するため、**Linux のテストコンテナでもそのまま動く。**
+> これにより `make test`（§17.4）1 コマンドで ND 群が全部回り、CI の必須ゲートに載せられる。
 
 | # | 故障注入 | §14.1 で偽になる条件 | 期待 |
 |---|---|---|---|
@@ -3231,10 +3830,22 @@ fixture の WAV は **実際に 48 kHz / 32 bit float** で生成し、変換が
 | ND-19 | 削除直前に mtime が変わる | 同上 | 元音声が残る |
 | ND-20 | 対象パスがデバイスのルート外（対象自身が symlink / **経路の途中に symlink（`/Volumes/Macintosh HD` 経由など）**） | パス封じ込めが偽 | 元音声が残る。**他ボリュームのファイルに触れない** |
 | ND-21 | Part を 0 件持つ Session / Variant パスが空 | 空集合を真にしない条件が偽 | 削除が起きない |
-| ND-22 | `delete_source_audio: false` | ロック 1 が偽 | 元音声が残る |
-| ND-23 | `DJI_MOUNT_MODE=ro` | ロック 2 が偽 | 元音声が残る（OS レベルで不可） |
+| ND-22 | `delete_source_audio: false`（`config.yaml` / `helper.conf` のどちらか一方だけでも） | ロック 1 が偽 | 元音声が残る。要求が書かれない、または reaper の検証 1 で拒否 |
+| ND-23 | `MOUNT_MODE=ro`（`heartbeat.json` の `mount_readonly` が真） | ロック 2-B が偽 | 元音声が残る。reaper の検証 2 で拒否。**実機では OS レベルでも不可**（`docs/POC.md` §4.1 で実証済み） |
+| **ND-24** | 要求の `relpath` に `../` を仕込む | 検証 4 が偽 | 元音声が残る。**ボリューム外のファイルに触れない** |
+| **ND-25** | 要求の `relpath` が symlink 経由でボリューム外を指す | 検証 5 が偽 | 同上 |
+| **ND-26** | `voicedock-reaper` が存在しない（ロック 2-A） | — | 何も起きない。要求はキューに残り、タイムアウトで `SOURCE_DELETE_PENDING` |
+| **ND-27** | 同じ `request_id` を 2 回投入（リプレイ） | 検証 11 が偽 | 2 回目は拒否される。**既に削除済みの ID で別のファイルを消せない** |
+| **ND-28** | 要求の `relpath` が `.Trashes/...` を指す | 検証 9 が偽 | 元音声が残る。**ユーザーが意図的に捨てた録音に触れない**（§22 R-22） |
+| **ND-29** | 親ディレクトリ名が `RECORDING_FOLDER_RE` に一致しない | 検証 8 が偽 | 元音声が残る |
+| **ND-30** | `state/` をコンテナから書き換えて `mount_readonly` を偽装しようとする | `/state` は `ro` マウント（§18.2） | 書き込み自体が失敗する |
 
 このテスト群は CI で必ず実行し、**1 件でも失敗したらリリースしない。**
+
+> **v4.0 で失ったものと埋め合わせ**: v3.x では「コンテナがデバイスを消す」1 経路だけを見ればよかった。
+> v4.0 では判断（コンテナ）と実行（reaper）に分かれ、**その間にキューという新しい信頼境界ができた。**
+> ND-24〜ND-30 はすべてこの境界を狙った故障注入である。**境界が増えた分だけテストを増やす**のが
+> §5.6.3 で受け入れたコストの支払い方である。
 
 ---
 
@@ -3249,29 +3860,33 @@ cd voicedock
 cp .env.example .env
 cp config/config.example.yaml config/config.yaml
 
-# .env の OBSIDIAN_VAULT だけを自分の環境に合わせる
+# .env の OBSIDIAN_VAULT と VOICEDOCK_HOME を自分の環境に合わせる
 
-./scripts/doctor.sh          # ホスト設定の検査（§19.2 DH-1〜DH-11）
+./helper/install.sh          # ★ホスト側 Helper の導入（§3.4(6)）。reaper は入らない
+./scripts/doctor.sh          # ホスト設定の検査（§19.2 DH-1〜DH-15）
 ./scripts/fetch-models.sh
 make up                      # = docker compose up -d --build
 ```
 
 `doctor.sh` は **初回セットアップ検査と環境診断を兼ねる。検査のみを行い、ホスト設定の変更はしない。**検査項目は §19.2 の DH-1〜DH-11 に一本化した。
 
-起動後に再度 `./scripts/doctor.sh` を実行すると、DH-1〜DH-11 に続けてコンテナ内の D-1〜D-17 が実行される。
+起動後に再度 `./scripts/doctor.sh` を実行すると、DH-1〜DH-15 に続けてコンテナ内の D-1〜D-19 が実行される。
+
+> **`helper/install.sh` を飛ばすと録音は 1 本も取り込まれない。**コンテナは正常に起動して
+> 正常に見え続けるため、この失敗は気づきにくい。DH-12 と H-8 がこれを検出する（§22 R-23）。
 
 ### 21.2 フェーズ
 
 | Phase | 内容 | 受け入れ条件 |
 |---|---|---|
-| **Phase 0** | DJI Mic 3 PoC | §5.5 の P0-1〜P0-7, P0-9〜P0-15 がすべて PASS。**削除は一切行わない**。P0-1 / P0-6 が失敗したら §5.6 の代替設計へ |
-| **Phase 1** | 取り込みと変換 | デバイス検出 → WAV 検出 → **デバイスから直接 16 kHz 変換** → SHA-256 記録まで動作。二重検出しない。USB 切断で部分出力が残らない。**デバイス未接続時のアイドル CPU < 1%、接続時の定常 < 2%** |
+| **Phase 0** | DJI Mic 3 PoC | §5.5 の P0-1〜P0-7, P0-9〜P0-15 がすべて PASS。**削除は一切行わない**。**#2 で VirtioFS が使えないことが判明し、§5.6 案 A（ホスト Helper）へ移行済み**（`docs/POC.md` §8） |
+| **Phase 1** | 取り込みと変換 | **Helper がデバイス検出 → inbox へコピー**、コンテナが **inbox から 16 kHz 変換** → SHA-256 照合まで動作。二重検出しない。USB 切断で部分出力が残らない。**Helper は常駐ループを持たないため未接続時のアイドル CPU は 0%**、接続時の定常 < 2% |
 | **Phase 2** | 文字起こし | whisper.cpp で日本語 transcript 生成。VAD が機能する。**1 日分（16 時間）を 8 時間以内に処理しきることを実測で確認**（未達なら `medium-q5_0` → `small-q5_1` と落とす） |
 | **Phase 3** | LLM | Docker Model Runner へ疎通。JSON スキーマ検証が通る。repair が機能する。**1 日分（約 350,000 文字 / 約 18 チャンク）を 30 分以内に Map-Reduce 処理できる** |
 | **Phase 4** | Obsidian 出力 | Raw / Daily の 2 層が生成される。atomic write と §13.7 の保存検証。Obsidian で正しく表示され、`[[]]` が既存ノートにのみ張られる。**再生成でファイルが増殖しない** |
 | **Phase 5** | 状態管理 | SQLite による再開・リトライ・二重処理防止。§9.4 のクラッシュリカバリ。Docker 再起動で途中から再開する。**工程通過で `retry_count` がリセットされる。`FAILED` が 24 時間後に自動再試行される** |
 | **Phase 6** | 終日運用 | 16 時間連続録音が日境界で 1 セッションにまとまり、Daily 1 枚 + Raw 1 枚になる。Timeline から時間帯を辿れる。**無音 Part と失敗 Part があってもセッションが止まらない**（E2E-06〜E2E-09 が PASS） |
-| **Phase 7** | 自動削除 | **§20.4 の ND-01〜ND-23 が全件 PASS** かつ **E2E-01〜E2E-12 が全件 PASS** した後にのみ、`DJI_MOUNT_MODE=rw` と `delete_source_audio: true` を有効化する |
+| **Phase 7** | 自動削除 | **§20.4 の ND-01〜ND-30 が全件 PASS** かつ **E2E-01〜E2E-12 が全件 PASS** した後にのみ、三重ロック（§14.2）を解除する |
 | **Phase 8** | 運用 | health / doctor / logs / recovery / 更新手順が揃う |
 
 **Phase 7 へ進む前に、Phase 0〜6 の受け入れ条件が全件 PASS していること。**
@@ -3282,18 +3897,24 @@ make up                      # = docker compose up -d --build
 # 1. 削除禁止テストと E2E がすべて通っていることを確認
 make test
 
-# 2. 二重ロックを解除する
-#    .env       : DJI_MOUNT_MODE=rw
-#    config.yaml: cleanup.delete_source_audio: true
-docker compose up -d        # bind mount モード変更のため再生成が必要
+# 2. 三重ロックを解除する（§14.2）
+#    (a) helper.conf : MOUNT_MODE=rw / DELETE_SOURCE_AUDIO=true
+#    (b) config.yaml : cleanup.delete_source_audio: true
+#    (c) reaper を初めて配置する
+./helper/install.sh --with-reaper
+docker compose up -d        # config.yaml の再読み込み
 
-# 3. 状態を確認（削除モードが ENABLED と表示されること）
+# 3. 状態を確認（3 つのロックすべてが解除と表示されること）
 ./scripts/doctor.sh
 
 # 4. Phase 1〜6 で処理済みの録音を後追いで削除する
 docker compose exec voicedock voicedock cleanup --backlog --dry-run
 docker compose exec voicedock voicedock cleanup --backlog
 ```
+
+> **(a) と (b) は両方必要である**（V-30）。片方だけでは reaper が検証 1 で拒否する。
+> **(c) を忘れると要求はキューに溜まるだけで何も起きない。**これは事故ではなく設計どおりの挙動で、
+> `doctor` の DH-14 が `voicedock-reaper is NOT installed` と表示する。
 
 手順 4 が必要な理由: 削除 OFF の期間に処理した Part は `COMPLETED` で終わっており、通常フローでは削除対象にならない。1 日で本体が満杯になる運用では、この後追い経路が無いと溜まった録音を消せない（§17.1）。
 
@@ -3333,7 +3954,7 @@ docker compose exec voicedock voicedock cleanup --backlog
 
 | # | 項目 | 影響 | 対応 |
 |---|---|---|---|
-| R-1 | **`/Volumes` のホットプラグ伝播**（コンテナ起動後にマウントされたデバイスが `/host-volumes` に現れるか） | 現れない場合、本アーキテクチャの前提が崩れる | Phase 0 の P0-6 で最優先検証。失敗時は §5.6 案 A |
+| R-1 | **Docker Desktop の共有層が物理 USB を読めない**（VirtioFS）。しかも失敗は「現れない」ではなく**ハングし、Docker Desktop が新規コンテナを起動できなくなる**。`timeout(1)` でも中断できず、再起動でしか回復しない | v3.x のアーキテクチャが成立しない。無人常駐アプリにとって検出も復旧もできない | **クローズ**（2026-09-12、#2 で確定。`docs/POC.md` §2）。**v4.0 で §5.6 案 A（ホスト側 Helper）へ移行し、コンテナは `/Volumes` をマウントしなくなった**（§18.2, N-3）。Docker の共有設定に一切依存しない |
 | R-2 | **仮想化バックエンドの取り違え** | Docker VMM では外付けボリュームの bind mount が失敗する（docker/for-mac#7480） | **クローズ**（2026-09-12 実測で `UseVirtualizationFramework = True`）。設定変更による再発を検知するため `doctor.sh` DH-1 は残す |
 | R-3 | **bind mount のパーミッション**（non-root uid 1000 で exFAT/FAT32 のファイルを読めるか、削除できるか） | 読めない / 消せない | **読み取りは #2 でクローズ**（実機 FAT32 を uid 1000 で全バイト読了し、SHA-256 がホストと一致。`docs/POC.md` §3.2）。削除はディスクイメージ上で PASS、**実機での確認は #38**。uid 1000 の方針は変更不要 |
 | R-4 | **whisper.cpp の CPU 実行速度** | 1 日分の処理が 8 時間を超えると翌日分に追いつけず遅延が累積する | Phase 2 で実測。VAD が最大の対策。未達なら `medium-q5_0` → `small-q5_1`。恒久対策は §23 の Mac ネイティブ化 |
@@ -3341,7 +3962,7 @@ docker compose exec voicedock voicedock cleanup --backlog
 | R-6 | **送信機 2 台使用時の見え方** | Volume が 2 個か 1 個かで走査範囲が変わる | P0-10 で検証。Session は device_id + 日付で分かれるため、Volume が 2 個なら Daily ノートも 2 枚になる |
 | R-7 | **受信機（RX）側ストレージ** | 取り込み対象に含めるべきか未確定 | P0-12 で調査のみ。MVP のスコープ外（§1.6） |
 | R-8 | **`_orig` / denoised の実際の生成有無** | 設定によっては片方しか生成されない | §5.3 でどちらのケースも扱えるよう設計済み。P0-4 / P0-13 で確認 |
-| R-9 | **ディスク使用量** | staging が溢れると処理が止まる | 原本をコピーしない設計（§10.5）により 1 日 1.8 GB が流れるのみで、常駐使用量は 200 MB 未満。`staging_max_bytes: 5 GiB` は異常時の歯止め |
+| R-9 | **ディスク使用量** | inbox / staging が溢れると処理が止まる | v4.0 で原本コピーが復活した（§5.6.3）。1 日に流れる量は約 10 GB だが、**inbox の原本は `NORMALIZED` 後に即削除する**ため常駐使用量は数 GB（`import.inbox_retain: normalized`）。`staging_max_bytes: 5 GiB` は異常時の歯止め。滞留は D-19 が検出する |
 | R-10 | **原本音声の完全削除**（§1.4 で受容） | 文字起こしに誤りがあっても聞き直せない | §14.1 の厳格な条件、§14.2 の二重ロック、§20.4 の削除禁止テスト群で補う。**Raw ノートにより文字起こし本文は必ず残る** |
 | R-11 | **whisper.cpp のバージョン固定** | 未知の回帰の可能性 | `ARG WHISPER_CPP_REF` で固定。問題があれば 1 つ前の tag へ戻す |
 | R-12 | **Docker Model Runner の API 仕様変更 / モデルタグの変動** | LLM 呼び出しが壊れる | OpenAI 互換部分のみに依存する。タグは 2026-09-12 に Docker Hub で実在を確認済み（`ai/qwen3:30b-a3b-instruct-2507-q4_K_M`）。Model Runner 自体の疎通は #13 と `doctor` の D-12 で検証する |
@@ -3354,7 +3975,11 @@ docker compose exec voicedock voicedock cleanup --backlog
 | R-19 | **`/Volumes/Macintosh HD` が `/` への symlink**（実機で実在を確認） | `Path.parents` は字句的判定のため、パス封じ込めを擦り抜ける経路が理論上残る | §14.1.1 を `realpath` 解決後の判定へ改訂（**本版で対応済**）。§5.4 でボリュームルートが symlink なら走査対象から外す。ND-20 で検証 |
 | R-20 | **DJI 以外のマウント済みボリューム**（実機の `/Volumes` には `Macintosh HD` のほか、時期によって `PATLABOR`・`NO NAME` などが現れる） | 走査対象に混ざる。名前が回によって変わるため固定の除外リストでは守れない | §5.4 の判定（DJI 形式のフォルダ／ファイルの実在を要求）で除外されるはず。`device.exclude_volumes` の既定へ追加すべきかは **#2 で判断する** |
 | R-21 | **Compose がメジャー 5 系**（5.5.1）であり、`models` 長構文による環境変数注入の実挙動が未確認 | LLM 接続が立ち上がらない | **#13 で検証**し、`VOICEDOCK_LLM_URL` の実際の形（`/engines/v1` の有無など）を `docs/POC.md` へ記録する |
-| R-22 | **macOS がデバイス上にファイルを作る**（`._*` の AppleDouble / `.Spotlight-V100` / `.fseventsd` / `.Trashes`） | 走査規則で除外しないと Part ごとに `unparsable_filename` が鳴ってログが埋まる。`.Trashes` 配下は読み取りも macOS に拒否される | §10.2 で **`.` 始まりを黙って無視**し、`.Trashes` を走査対象から外す（本版で対応済）。`docs/POC.md` §6.3 |
+| R-22 | **macOS がデバイス上にファイルを作る**（`._*` の AppleDouble / `.Spotlight-V100` / `.fseventsd` / `.Trashes`） | 走査規則で除外しないと Part ごとに `unparsable_filename` が鳴ってログが埋まる。`.Trashes` 配下は読み取りも macOS に拒否される | §10.2 で **`.` 始まりを黙って無視**し、`.Trashes` を走査対象から外す（v3.4 で対応済）。reaper も検証 9 で拒否する（§14.1.1）。ND-28 |
+| R-23 | **Helper が停止しても、コンテナは正常に見え続ける** | 録音が 1 本も取り込まれないまま何日も気づかない。**無人稼働では最も起きやすい沈黙** | `heartbeat.json` を **H-8 で unhealthy 条件にする**（§19.1）。`doctor` D-18 と DH-12 でも検査。`status` に Helper の状態を常時表示（§17.2） |
+| R-24 | **削除の判断（コンテナ）と実行（reaper）がテスト境界をまたぐ** | 境界のどちらかだけをテストしても安全性を保証できない | §20.4 を 2 層に分け、境界そのものを狙う ND-24〜ND-30 を追加。reaper を POSIX bash に限定して **CI で実行可能**にした（§14.4 N-19） |
+| R-25 | **`diskutil mount readOnly` による再マウントが失敗する**（他プロセスが使用中など） | ロック 2-B が掛からないまま運用が続く | **失敗は安全側へ倒す。**ingest は取り込みを続行しつつ `heartbeat.json` に `mount_readonly: false` を書き、**reaper が検証 2 で削除を拒否する**（§14.2）。`doctor` D-18 が表示 |
+| R-26 | **Helper（bash）とコンテナ（Python）で §5.4 / §10.3 の規則が二重実装になる** | 食い違うと検出漏れが無言で起きる | **§5.4 / §10.3 の記述が唯一の規範**と明記（§7.4）。`doctor` D-18 が両者の除外一覧を突き合わせる |
 
 ---
 
@@ -3370,10 +3995,38 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 | 連携 | Calendar との時刻照合による予定名の推定 |
 | UI | Mac 通知、Menu Bar UI、Web UI |
 | 処理 | 複数 Worker 並列化、増分要約（その日の途中経過を随時更新する） |
+| 構成 | **Helper の廃止。**Docker Desktop が既定の共有実装で物理 USB マスストレージを扱えるようになれば、v3.x の「`/Volumes` を bind mount する」構成へ戻せる。判定手順は `docs/POC.md` §2 に残してある（§5.6.4） |
 
 ---
 
-## 付録 A. v3.3 から v3.4 への主な変更点
+## 付録 A. v3.4 から v4.0 への主な変更点
+
+v4.0 は、**#2 の実機検証で現行アーキテクチャが成立しないと判明したことを受けた構成変更**である。
+
+**変えていないもの**: §14.1 の削除条件（論理式そのもの）、パイプラインの中核（文字起こし・LLM・
+Obsidian 出力）、状態機械の骨格、設定項目の意味。
+**変えたもの**: デバイスに触れる主体と、削除を実行する主体。
+
+| # | 変更 | 理由 |
+|---|---|---|
+| E-1 | **コンテナは `/Volumes` をマウントしない。ホスト側 Helper が inbox へコピーする**（§4.1, §5.6, §18.2） | Docker Desktop 4.90.0 の VirtioFS は物理 USB を読めず、読もうとすると **Docker 全体が固まる**（`docs/POC.md` §2）。案 B（個別パス bind mount）も不可。案 C（gRPC FUSE）はグローバル設定で他プロジェクトが 2〜6 倍遅くなる |
+| E-2 | **`voicedock-ingest` / `voicedock-reaper` を新設**（§4.2, §6） | ホスト側でデバイスを読む唯一の経路。base system の bash だけで動き、§3.3 の「Python を入れない」を維持する |
+| E-3 | **削除をキュー経由の非同期へ**（§10.12, §14.3） | コンテナはデバイスに到達できない。**判断はコンテナ、実行は reaper** に分ける |
+| E-4 | **削除要求が絶対パスを持たない。`relpath` のみ**（§14.1.1, §8.2, N-17） | 要求がボリューム外を指名すること自体を構造的に不可能にする。v3.x は DB の絶対パスを信じて削除していた |
+| E-5 | **reaper が 11 項目を独立検証する**（§14.1.1） | コンテナの判断を信用しない。親フォルダ名の照合（検証 8）、`.` 始まりの拒否（検証 9）、リプレイ防止（検証 11）は v3.x に無かった |
+| E-6 | **二重ロック → 三重ロック**（§14.2） | 旧ロック 2（bind mount の `ro`）が成立しなくなったため、**2-A: 削除コードをホストに置かない** と **2-B: `diskutil mount readOnly`（OS レベル）** に分けた。**2-B は当該デバイス 1 台だけに効くので、旧ロック 2 より被害範囲が狭い** |
+| E-7 | **`DevicePath` を `PurePosixPath` へ**（§11.2） | `open()` も `stat()` も持たないため、**コンテナがデバイスを触るコードは書こうとしても書けない。**規約から型による保証へ |
+| E-8 | **ND-01〜ND-23 を 2 層に分け、ND-24〜ND-30 を追加**（§20.4） | 判断と実行の間に新しい信頼境界ができた。reaper を POSIX bash に限定（N-19）して **CI で実行できる**ようにした |
+| E-9 | **Helper のハートビートを H-8 で unhealthy 条件に**（§19.1, §22 R-23） | Helper が止まると**録音が 1 本も取り込まれないのにコンテナは正常に見える**。無人稼働で最も起きやすい沈黙 |
+| E-10 | **`.env` の `DJI_MOUNT_MODE` を廃止し、`helper.conf` を新設**（§7.1, §7.4） | bind mount のモードという概念が無くなった。Helper は **Docker が止まっていても動く**必要があるため設定を分けた |
+| E-11 | **inbox の原本は `NORMALIZED` 後に即削除**（§10.5, `import.inbox_retain`） | 原本コピーが復活した代償を抑える。常駐使用量を数 GB に収める |
+| E-12 | **常駐が 2 本立てに**（§18.4） | launchd（取り込み）と Docker（処理）が独立する。**Docker が落ちていても録音は確保される**という v3.x に無かった利点 |
+| E-13 | **§22 R-1 をクローズし、R-23〜R-26 を追加** | 実測で潰れたリスクと、この構成変更が新たに生むリスクを反映 |
+| E-14 | **失うものを §5.6.3 に明記** | 原本コピーの復活・ホスト書き込み 10 GB/日・テスト境界の増加・「Docker Desktop と Obsidian だけ」の崩壊 |
+
+---
+
+## 付録 B. v3.3 から v3.4 への主な変更点
 
 v3.4 は、**#2（Phase 0 PoC）で DJI Mic 3 の実機から得た測定値を反映する**ことだけを目的とした改訂である。
 **機能・安全設計・設定項目は 1 つも変えていない。**実測値の出典はすべて `docs/POC.md` §6。
@@ -3394,7 +4047,7 @@ v3.4 は、**#2（Phase 0 PoC）で DJI Mic 3 の実機から得た測定値を�
 
 ---
 
-## 付録 B. v3.2 から v3.3 への主な変更点
+## 付録 C. v3.2 から v3.3 への主な変更点
 
 v3.3 は、**実装に着手する前に、仕様書に残っていた事実誤りと仕様内の不整合を潰す**ことだけを目的とした
 改訂である。**処理の内容・安全設計・設定項目の意味は 1 つも変えていない**（追加は V-27 と
@@ -3419,7 +4072,7 @@ v3.3 は、**実装に着手する前に、仕様書に残っていた事実誤�
 
 ---
 
-## 付録 C. v3.1 から v3.2 への主な変更点
+## 付録 D. v3.1 から v3.2 への主な変更点
 
 v3.2 は、**実装に着手する前に「個人用途に対して過剰な構造」を削る**ことだけを目的とした改訂である。
 **機能・安全設計・設定項目は 1 つも削っていない。**処理の内容が変わる変更は含まれない。
@@ -3451,7 +4104,7 @@ v3.2 は、**実装に着手する前に「個人用途に対して過剰な構�
 
 ---
 
-## 付録 D. v3.0 から v3.1 への主な変更点
+## 付録 E. v3.0 から v3.1 への主な変更点
 
 v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間録り続ける」へ変わった**ことを起点に全面改訂したものである。
 
@@ -3488,7 +4141,7 @@ v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間
 
 ---
 
-## 付録 E. 参考資料
+## 付録 F. 参考資料
 
 Docker 公式ドキュメントを実装時の一次資料とする。
 
