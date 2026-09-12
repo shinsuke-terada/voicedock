@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import os
 import shutil
-from collections.abc import Callable, Mapping
-from datetime import datetime
+from collections.abc import Callable, Iterator, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -20,7 +20,9 @@ import pytest
 
 from tests.fixtures.fake_tree import build_fake_inbox, build_fake_volumes
 from tests.helpers import complete_tree, example_document, merge, parsed
+from voicedock import db
 from voicedock.config import Config
+from voicedock.db import Database
 
 # --- マーカー ------------------------------------------------------------
 
@@ -87,11 +89,15 @@ def queue_root(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def db_path(tmp_path: Path) -> Path:
-    """SQLite の置き場。**ファイルは作らない。**
-
-    TODO(#10): スキーマの初期化をここへ足す。いま DDL を書くと `db.py` と二重管理になる。
-    """
+    """SQLite の置き場。**ファイルは作らない**（「DB が無い」状態を作れるようにする）。"""
     return tmp_path / "voicedock.db"
+
+
+@pytest.fixture
+def database(db_path: Path, frozen_now: datetime) -> Iterator[Database]:
+    """スキーマ v1 を適用した空の DB（§8）。"""
+    with db.connect(db_path, tz=frozen_now.tzinfo or UTC, now=frozen_now) as opened:
+        yield opened
 
 
 # --- 偽 inbox / 偽ボリューム ---------------------------------------------

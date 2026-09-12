@@ -11,7 +11,7 @@ import argparse
 import signal
 import sys
 
-from voicedock import __version__, doctor
+from voicedock import __version__, db, doctor
 from voicedock.config import ConfigError, load_config, logger_for, startup_notices
 from voicedock.errors import EXIT_CONFIG, EXIT_ERROR, EXIT_OK
 
@@ -111,7 +111,12 @@ def _service() -> int:
     log = logger_for(cfg)
     for notice in startup_notices(cfg):
         log.warning("config_warning", rule=notice.rule, message=notice.message)
-    log.info("service_started", version=__version__)
+
+    # スキーマは起動時に自動適用する（SPEC §8.5）。未適用の版が無ければ何も書かない
+    database = db.connect(
+        cfg.database.path, busy_timeout_ms=cfg.database.busy_timeout_ms, tz=cfg.tz
+    )
+    log.info("service_started", version=__version__, schema_version=database.schema_version())
 
     print(
         "voicedock: service は未実装です（SPEC §10.0 / #19）。"

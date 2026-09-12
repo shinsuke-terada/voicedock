@@ -8,8 +8,8 @@ import signal
 import pytest
 import yaml
 
-from tests.helpers import complete_tree
-from voicedock import __version__
+from tests.helpers import complete_tree, merge
+from voicedock import __version__, db, paths
 from voicedock.cli import IMPLEMENTED, SUBCOMMANDS
 from voicedock.errors import EXIT_CONFIG, EXIT_ERROR, EXIT_OK
 from voicedock.main import main
@@ -73,8 +73,12 @@ def test_service_waits_and_announces_stub(
         nonlocal paused
         paused = True
 
+    document = merge(
+        complete_tree(tmp_path),
+        {"database": {"path": str(tmp_path / "data" / "voicedock.db")}},
+    )
     config = tmp_path / "config.yaml"
-    config.write_text(yaml.safe_dump(complete_tree(tmp_path)), encoding="utf-8")
+    config.write_text(yaml.safe_dump(document), encoding="utf-8")
     monkeypatch.setenv("VOICEDOCK_CONFIG", str(config))
     monkeypatch.setattr(signal, "pause", _fake_pause)
 
@@ -82,7 +86,9 @@ def test_service_waits_and_announces_stub(
     assert paused, "service は待機しなければならない（即座に終了するとクラッシュループになる）"
     out = capsys.readouterr().out
     assert "service_started" in out, "設定を読めたら service_started を出す（§16.2）"
+    assert "schema_version=1" in out, "起動時にスキーマを自動適用する（§8.5）"
     assert "未実装" in out
+    assert (tmp_path / "data" / "voicedock.db").is_file(), "起動時に DB を作ること"
 
 
 def test_service_returns_config_exit_code_on_violation(
@@ -111,8 +117,16 @@ def test_service_returns_config_exit_code_when_the_file_is_missing(
 def test_doctor_runs(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    monkeypatch.setattr(paths, "DATA_ROOT", data_root)
+    with db.connect(data_root / "voicedock.db"):
+        pass
+    document = merge(
+        complete_tree(tmp_path), {"database": {"path": str(data_root / "voicedock.db")}}
+    )
     config = tmp_path / "config.yaml"
-    config.write_text(yaml.safe_dump(complete_tree(tmp_path)), encoding="utf-8")
+    config.write_text(yaml.safe_dump(document), encoding="utf-8")
     monkeypatch.setenv("VOICEDOCK_CONFIG", str(config))
     # state_root は既定（/state）のまま。delete_source_audio が false のあいだ
     # V-30 は heartbeat を読まないので、結果に影響しない（§7.3）
