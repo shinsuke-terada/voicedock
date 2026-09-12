@@ -12,7 +12,7 @@ import json
 import re
 import shutil
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -30,7 +30,8 @@ from tests.fixtures.fake_tree import (
     write_state,
 )
 from tests.helpers import REPO_ROOT
-from voicedock.paths import is_safe_relpath
+from voicedock import paths
+from voicedock.paths import DevicePath, is_safe_relpath, partkey_for
 
 # §5.2 の正規表現（#14 が device.py へ実装する。ここでは fixture の検証に使う）
 FOLDER_RE = re.compile(r"^TX_MIC(?P<mic>\d{3})_(?P<date>\d{8})_(?P<time>\d{6})$")
@@ -290,3 +291,16 @@ def test_two_builds_are_independent(tmp_path: Path) -> None:
     target.unlink()
     assert not target.exists()
     assert (second / DEVICE_ID / recording.folder / recording.filename(ORIG)).is_file()
+
+
+def test_partkey_uses_paths_partkey_for() -> None:
+    """fixture の `partkey()` が `paths.partkey_for()` の結果と一致すること（§8.1）。
+
+    **fixture が独自に文字列を組み立てていないことの確認である。**組み立てていると、
+    `partkey_for()` の算出規則を変えても DB や削除のテストが落ちなくなる。
+    """
+    recording = DEFAULT_RECORDINGS[0]
+    key = recording.partkey()
+    assert key == partkey_for(DEVICE_ID, DevicePath(PurePosixPath(recording.relpath(ORIG))))
+    assert paths.device_id_of(key) == DEVICE_ID
+    assert str(paths.relpath_of(key)) == recording.relpath(ORIG)

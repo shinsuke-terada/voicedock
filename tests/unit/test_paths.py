@@ -357,3 +357,120 @@ def test_safe_unlink_tmp_requires_the_tmp_name(
         with pytest.raises(ValueError, match="一時ファイルではありません"):
             safe_unlink_tmp(target)
         assert target.exists()
+
+
+# --- 恒久識別子（§8.1 / §8.5） ------------------------------------------
+
+
+PINNED_DEVICE_ID = "DJIMIC3"
+PINNED_RELPATH = "TX_MIC001_20260829_071201/TX01_MIC002_20260829_071204_orig.wav"
+PINNED_PARTKEY = "DJIMIC3/TX_MIC001_20260829_071201/TX01_MIC002_20260829_071204_orig.wav"
+PINNED_SLUG = "a5d046dce76cfedc"
+
+
+def test_partkey_is_pinned() -> None:
+    """**`partkey` の算出結果を固定する。§8.5 の唯一の禁則がこれである。**
+
+    この値はノートの frontmatter（`voicedock_recording_keys`。§13.3）に載り、
+    §14.1 の削除条件は「ノートがこの鍵を含むか」だけを見る。
+
+    **算出規則を変えると、既に保存したノートの鍵と食い違う。**§14.1 は偽に倒れるので
+    削除事故にはならないが、**それ以前に保存した録音が永久に削除対象にならない。**
+
+    したがって**このテストが落ちたら、期待値を書き換えて通すのではなく、
+    変更をやめるか、保存済みノートを書き換える手順を同時に用意する**こと。
+    v5.0 までの §8.5 は「振り直しに繋がる構文」を代理で禁止していたが、
+    v5.1 は不変量そのものをここで固定する（v5.0→v5.1 の変更 M-2）。
+    """
+    key = paths.partkey_for(PINNED_DEVICE_ID, DevicePath(PurePosixPath(PINNED_RELPATH)))
+    assert key == PINNED_PARTKEY
+
+
+def test_key_slug_is_pinned() -> None:
+    """`key_slug` も固定する。`staging` / `transcripts` / `analysis` のパスになる。
+
+    こちらが変わっても**削除の安全性は動かない**（正は `partkey` であり、slug は
+    ファイル名のための派生値である）。ただし変えると作業中の Part の中間成果物が
+    見つからなくなり、§9.4 の再開規則が最初からやり直す。
+    """
+    assert paths.key_slug(paths.PartKey(PINNED_PARTKEY)) == PINNED_SLUG
+    assert len(PINNED_SLUG) == 16
+    assert re.fullmatch(r"[0-9a-f]{16}", PINNED_SLUG)
+
+
+def test_key_slug_accepts_a_session_key() -> None:
+    """`session_key` も受ける（`analysis_path` に使う。§8.3）。"""
+    slug = paths.key_slug(paths.SessionKey("DJIMIC3:20260829"))
+    assert re.fullmatch(r"[0-9a-f]{16}", slug)
+
+
+def test_key_slug_differs_per_key() -> None:
+    other = PINNED_PARTKEY.replace("MIC002", "MIC003")
+    assert paths.key_slug(paths.PartKey(other)) != PINNED_SLUG
+
+
+def test_partkey_round_trips() -> None:
+    key = paths.partkey_for(PINNED_DEVICE_ID, DevicePath(PurePosixPath(PINNED_RELPATH)))
+    assert paths.device_id_of(key) == PINNED_DEVICE_ID
+    assert paths.relpath_of(key) == PurePosixPath(PINNED_RELPATH)
+
+
+def test_relpath_of_returns_a_device_path() -> None:
+    """戻り値は `PurePosixPath` なので `open()` / `stat()` を書けない（§11.2）。"""
+    key = paths.partkey_for(PINNED_DEVICE_ID, DevicePath(PurePosixPath(PINNED_RELPATH)))
+    rel = paths.relpath_of(key)
+    assert isinstance(rel, PurePosixPath)
+    assert not hasattr(rel, "open")
+    assert not hasattr(rel, "stat")
+
+
+def test_partkey_survives_a_device_id_with_a_space() -> None:
+    """`NO NAME` のような Volume 名でも鍵は作れる（§5.4）。
+
+    ファイル名には使えないが、それは `key_slug()` が引き受ける。
+    """
+    key = paths.partkey_for("NO NAME", DevicePath(PurePosixPath(PINNED_RELPATH)))
+    assert key == f"NO NAME/{PINNED_RELPATH}"
+    assert paths.device_id_of(key) == "NO NAME"
+
+
+@pytest.mark.parametrize(
+    ("device_id", "rel", "reason"),
+    [
+        ("", PINNED_RELPATH, "device_id が空"),
+        ("a/b", PINNED_RELPATH, "device_id に '/'"),
+        (".hidden", PINNED_RELPATH, "device_id が '.' 始まり"),
+        (PINNED_DEVICE_ID, "../escape.wav", "relpath に '..'"),
+        (PINNED_DEVICE_ID, "/absolute.wav", "relpath が絶対パス"),
+        (PINNED_DEVICE_ID, ".Trashes/x.wav", "relpath の要素が '.' 始まり"),
+    ],
+)
+def test_partkey_for_rejects_bad_input(device_id: str, rel: str, reason: str) -> None:
+    """**鍵を組み立てる前に弾く。**壊れた鍵がノートへ載ると、あとから直す手段が無い。"""
+    with pytest.raises(ValueError):
+        paths.partkey_for(device_id, DevicePath(PurePosixPath(rel)))
+
+
+def test_partkey_for_reuses_is_safe_relpath() -> None:
+    """relpath の検査を二重実装していないこと（§11.1 の「規則を 2 か所に書かない」）。
+
+    `is_safe_relpath` が偽にするものは `partkey_for` も必ず拒否する。
+    """
+    for rel in ("", ".", "..", "/x", "a/../b", ".hidden/x.wav", "a/\x01/b"):
+        candidate = DevicePath(PurePosixPath(rel))
+        if is_safe_relpath(candidate):
+            continue
+        with pytest.raises(ValueError):
+            paths.partkey_for(PINNED_DEVICE_ID, candidate)
+
+
+def test_partkey_and_relpath_are_consistent_with_the_spec_example() -> None:
+    """SPEC §8.2 / §14.1.1 の例に出てくる値と一致すること。
+
+    §14.1.1 の reaper 検証 12 は `<device_id>/<relpath>` が `partkey` と一致することを
+    確かめる。**その等式をここで固定する。**
+    """
+    spec = (Path(__file__).parents[2] / "docs" / "SPEC.md").read_text(encoding="utf-8")
+    assert PINNED_PARTKEY in spec, "SPEC の例と鍵が食い違っている"
+    key = paths.partkey_for(PINNED_DEVICE_ID, DevicePath(PurePosixPath(PINNED_RELPATH)))
+    assert f"{paths.device_id_of(key)}/{paths.relpath_of(key)}" == key

@@ -26,7 +26,8 @@ SUBCOMMANDS: dict[str, str] = {
 }
 """SPEC §17.1 の全サブコマンド。**引数を取るものは無い。**
 
-v5.0 で `scan` / `history` / `show` / `retry` / `pending` / `cleanup` を削除した（付録 A L-4）。
+v5.0 で `scan` / `history` / `show` / `retry` / `pending` / `cleanup` を削除した
+（v4.6→v5.0 の変更 L-4）。
 **`health` は `compose.yaml` の healthcheck が呼ぶので消せない。**
 """
 

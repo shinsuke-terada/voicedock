@@ -1,11 +1,11 @@
-# VoiceDock 詳細仕様書 v5.0
+# VoiceDock 詳細仕様書 v5.1
 
 **DJI Mic 3 × ローカル文字起こし × ローカルLLM × Obsidian**
 
 | 項目 | 内容 |
 |---|---|
-| 文書版 | **v5.0（不要な処理の整理）** |
-| 前身文書 | v4.6 / v4.5 / v4.4 / v4.3 / v4.2 / v4.1 / v4.0 / v3.4 / v3.3 / v3.2 / v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
+| 文書版 | **v5.1（識別子の自然キー化）** |
+| 前身文書 | v5.0 / v4.6 / v4.5 / v4.4 / v4.3 / v4.2 / v4.1 / v4.0 / v3.4 / v3.3 / v3.2 / v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
 | 作成日 | 2026-09-11 |
 | 改訂日 | 2026-09-12 |
 | 実測記録 | `docs/POC.md`（Phase 0 の実測値と判断。本書と食い違う場合は POC.md を正とする） |
@@ -452,23 +452,23 @@ macOS の Docker Desktop は Linux VM 上でコンテナを動かすため、**�
              │ inbox からストリーム読み（SHA-256 を再計算し .meta.json と照合）→ ffmpeg
              │ NORMALIZED 到達後に inbox の原本を削除する
              ▼
-[Staging] /data/staging/<recording_id>/audio16k.wav        ← 30 分で約 58 MB
+[Staging] /data/staging/<slug>/audio16k.wav        ← 30 分で約 58 MB
              │ whisper-cli（VAD 有効）
              ▼
-[Data]    /data/transcripts/parts/<recording_id>.json
+[Data]    /data/transcripts/parts/<slug>.json
              │ その日の Raw ノートを再生成 → atomic write → verify
              ▼
 [Vault]   Daily/Voice/Raw/20260829/2026-08-29 raw.md       ← ここでテキストが保全される
              │ 全 Part 終端到達 → 統合（メモリ上）→ LLM（Map-Reduce）
              ▼
-[Data]    /data/analysis/<session_id>.json
+[Data]    /data/analysis/<slug>.json
              │ render → atomic write → verify
              ▼
 [Vault]   Daily/Voice/Wiki/20260829/2026-08-29 Voice.md
              │ 検証成功 かつ 三重ロック解除のときのみ、削除要求を書く（§14.1 の判断はここ）
              ▼
 [Queue]   <VOICEDOCK_HOME>/queue/delete/<request_id>.json   ← relpath のみ。絶対パスを持たない
-             │ ★reaper: コンテナの判断を信用せず 11 項目を独立検証（§14.1.1）
+             │ ★reaper: コンテナの判断を信用せず 12 項目を独立検証（§14.1.1）
              ▼
 [Device]  Part の `_orig` を削除 → 不在を確認
              │ 結果を書く
@@ -793,7 +793,7 @@ voicedock/
 │       ├── log.py                  # 構造化ログ（§16）
 │       ├── errors.py               # エラーコード定義（§15）
 │       ├── db.py                   # 接続・行データクラス・クエリ・マイグレーション（§8）
-│       ├── paths.py                # DevicePath / InboxPath / StagingPath / VaultPath
+│       ├── paths.py                # DevicePath / InboxPath / StagingPath / VaultPath / PartKey
 │       │                           #   + safe_unlink_inbox / _staging / _tmp（§11.2, §14.4 N-10）
 │       ├── device.py               # inbox の走査・.meta.json 読み取り・ファイル名パース
 │       │                           #   + inventory.json の読み取り（§10.2, §11.1）
@@ -1272,9 +1272,25 @@ declare -p INCLUDE_VOLUMES 2>/dev/null | grep -q '^declare -a'
 
 ### 8.1 方針
 
-- SQLite（Python 標準ライブラリ `sqlite3`）を使用する
+- SQLite（Python 標準ライブラリ `sqlite3`）を使用する。**選定の根拠は `docs/STORE.md`**
+  （ファイル方式との実測比較と決定。**§8 を変えるときは先に読むこと**）
 - 保存先は Docker named volume 上の `/data/voicedock.db`
 - **SQLite が全状態の単一の真実**。ファイルの有無は補助的な確認材料に過ぎない
+- **識別子は自然キーである。整数の連番を使わない。**
+
+  | エンティティ | 識別子 | 形 |
+  |---|---|---|
+  | Part | `recordings.partkey` | `<device_id>/<source_folder>/<filename>` |
+  | Session | `sessions.session_key` | `<device_id>:<YYYYMMDD>`（§8.3） |
+
+  **理由は §14.1 の削除条件にある。**削除可否はノートの frontmatter に載っている識別子と
+  DB の識別子が同じ Part を指すことに賭かっている。連番だと**振り直しで対応が壊れうる**
+  （v5.0 まではそれを §8.5 の禁則 3 点で防いでいた）。自然キーなら**数える対象が無いので
+  壊れようがない。**`docs/STORE.md` §6 とv5.0→v5.1 の変更 M-1 を参照。
+
+  **1 Part = 1 ファイル = 1 パス = 1 識別子**が成り立つのは、v5.0 で `_orig` 固定にしたため
+  である（§5.3）。v4.6 までは 1 Part が最大 2 ファイルを持っていたので、単一のパスを
+  識別子にできなかった。
 - 接続時に必ず以下を設定する
 
 ```sql
@@ -1290,10 +1306,14 @@ PRAGMA synchronous = FULL;   -- 削除判断の根拠になるため耐久性を
 
 ```sql
 CREATE TABLE recordings (
-    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- 恒久識別子（§8.1）。'<device_id>/<source_folder>/<filename>'
+    -- ★NOT NULL を省略できない。SQLite では INTEGER PRIMARY KEY だけが rowid の別名として
+    --   NULL を弾き、TEXT PRIMARY KEY は NULL を許す（標準 SQL からの既知の逸脱）
+    partkey               TEXT    PRIMARY KEY NOT NULL,
 
-    -- 由来
-    device_id             TEXT    NOT NULL,   -- Volume 名（不安定。参考情報）
+    -- 由来。すべて partkey とファイル名から導けるが、索引を張るために列で持つ
+    -- （partkey == device_id || '/' || source_path の不変量はテストが固定する）
+    device_id             TEXT    NOT NULL,   -- Volume 名
     source_folder         TEXT    NOT NULL,   -- TX_MIC001_20260829_071201
     transmitter_id        TEXT    NOT NULL,   -- TX01（不安定。恒久 ID にしない）
     mic_index             INTEGER NOT NULL,   -- MIC002 -> 2
@@ -1301,36 +1321,27 @@ CREATE TABLE recordings (
     duration_seconds      REAL,               -- ffprobe 由来。失敗時は NULL のまま続行
     ended_at              TEXT,               -- started_at + duration_seconds
 
-    -- 取り込み元。削除時の同定に使う（§14.1）
+    -- 取り込み元（`_orig` の 1 本だけ。§5.3）。削除時の同定に使う（§14.1）
     -- ★v4.0: ボリュームルートからの相対パスを格納する。絶対パスを持たない（§14.1.1）
-    -- ★v5.0: `_orig` 固定にしたため `*_denoised` と primary_variant は使わない（§5.3）。
-    --        列は残すが常に NULL である。削除はストア方式の決定（T-52）後に 1 回だけ行う
-    source_path_denoised  TEXT,               -- ★v5.0 で未使用（常に NULL）
-    source_path_orig      TEXT,               -- 'TX_MIC001_.../TX01_..._orig.wav'
-    source_size_denoised  INTEGER,            -- ★v5.0 で未使用（常に NULL）
-    source_size_orig      INTEGER,
-    source_mtime_denoised REAL,               -- ★v5.0 で未使用（常に NULL）
-    source_mtime_orig     REAL,
-    sha256_denoised       TEXT,               -- ★v5.0 で未使用（常に NULL）
-    sha256_orig           TEXT,
+    source_path           TEXT,               -- 'TX_MIC001_.../TX01_..._orig.wav'
+    source_size           INTEGER,
+    source_mtime          REAL,
+    sha256                TEXT,
     -- Helper がコピー時に算出した値。コンテナが再計算して照合する（§10.5）
     sha256_helper         TEXT,
 
-    primary_variant       TEXT,               -- ★v5.0 で未使用（常に NULL。実質 'orig' 固定）
-
-    -- 作業成果物
+    -- 作業成果物。slug = key_slug(partkey)（§11.2）
     inbox_path            TEXT,               -- /inbox/<device_id>/<folder>/<name>.wav
     staging_dir           TEXT,
-    normalized_path       TEXT,               -- /data/staging/<id>/audio16k.wav
-    transcript_path       TEXT,               -- /data/transcripts/parts/<id>.json
+    normalized_path       TEXT,               -- /data/staging/<slug>/audio16k.wav
+    transcript_path       TEXT,               -- /data/transcripts/parts/<slug>.json
 
     -- 所属
-    session_id            INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+    session_key           TEXT REFERENCES sessions(session_key) ON DELETE SET NULL,
 
     -- 状態（§9.1）
     status                TEXT    NOT NULL,
     retry_count           INTEGER NOT NULL DEFAULT 0,   -- 現在の工程での連続失敗回数
-    auto_retry_rounds     INTEGER NOT NULL DEFAULT 0,   -- ★v5.0 で未使用。常に 0（§15.2）
     error_code            TEXT,
     error_message         TEXT,
 
@@ -1339,29 +1350,28 @@ CREATE TABLE recordings (
     updated_at            TEXT    NOT NULL    -- 状態が変わるたびに更新する
 );
 
--- 論理的な同一 Part の二重登録を防ぐ（ファイル名由来の自然キー）
-CREATE UNIQUE INDEX idx_recordings_partkey
-    ON recordings (transmitter_id, mic_index, started_at, source_folder);
+-- 論理的な同一 Part の二重登録は PRIMARY KEY が防ぐ。
+-- v5.0 までの idx_recordings_partkey（transmitter_id, mic_index, started_at, source_folder）は
+-- 主キーに包含されたので削除した。新しい鍵はファイル名を丸ごと含むため識別能力は落ちない。
 
 -- 内容同一性による二重処理防止。NULL は重複可なので未ハッシュ行は衝突しない
--- ★v5.0: sha256_denoised は常に NULL なのでこの索引は空のままである（§5.3）
-CREATE UNIQUE INDEX idx_recordings_sha_denoised
-    ON recordings (sha256_denoised) WHERE sha256_denoised IS NOT NULL;
-CREATE UNIQUE INDEX idx_recordings_sha_orig
-    ON recordings (sha256_orig)     WHERE sha256_orig     IS NOT NULL;
+CREATE UNIQUE INDEX idx_recordings_sha ON recordings (sha256) WHERE sha256 IS NOT NULL;
 
 CREATE INDEX idx_recordings_status   ON recordings (status);
-CREATE INDEX idx_recordings_session  ON recordings (session_id);
+CREATE INDEX idx_recordings_session  ON recordings (session_key);
 CREATE INDEX idx_recordings_started  ON recordings (started_at);
 ```
 
 **設計意図:**
 
-- `idx_recordings_partkey` が高速な事前判定。走査のたびに SHA-256 を計算しない（USB 越しの全読み込みを避ける）
-- `sha256_*` の部分 UNIQUE インデックスが二重処理の最終防壁。ハッシュは §10.5 の変換時にストリームで算出するため、追加の読み込みコストはゼロ
-- `source_size_*` と `source_mtime_*` は削除直前の同定に使う（§14.1）。**記録した値と一致しないファイルは削除しない**
-- **`source_path_*` は絶対パスではなく、ボリュームルートからの相対パスである。**削除要求（§14.1.1）に
-  絶対パスを載せないための設計であり、**要求がボリューム外を指名すること自体を構造的に不可能にする**
+- **`partkey` は `paths.partkey_for()` だけが作る**（§11.2）。呼び出し側で文字列を連結してはならない。
+  **算出規則を変えることが §8.5 の唯一の禁則である**
+- `partkey` の PRIMARY KEY が高速な事前判定。走査のたびに SHA-256 を計算しない（USB 越しの全読み込みを避ける）
+- `sha256` の部分 UNIQUE インデックスが二重処理の最終防壁。ハッシュは §10.5 の変換時にストリームで算出するため、追加の読み込みコストはゼロ
+- `source_size` と `source_mtime` は削除直前の同定に使う（§14.1）。**記録した値と一致しないファイルは削除しない**
+- **`source_path` は絶対パスではなく、ボリュームルートからの相対パスである。**削除要求（§14.1.1）に
+  絶対パスを載せないための設計であり、**要求がボリューム外を指名すること自体を構造的に不可能にする**。
+  **`partkey` は `device_id` と `source_path` を `/` で繋いだものである**（§14.1.1 の reaper 検証 12 がこれを確かめる）
 - `sha256_helper` は Helper がコピーしながら算出した値。コンテナは inbox から読み直して再計算し、
   一致しなければ `SOURCE_HASH_MISMATCH` → `FAILED` とする（§10.5）。**コピー破損を検出する唯一の経路**
 - `inbox_path` は `NORMALIZED` 到達後に削除される（`import.inbox_retain`）。削除後も列は残す（監査用）
@@ -1371,8 +1381,8 @@ CREATE INDEX idx_recordings_started  ON recordings (started_at);
 
 ```sql
 CREATE TABLE sessions (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_key         TEXT    NOT NULL UNIQUE,   -- "<device_id>:<YYYYMMDD>"
+    -- 恒久識別子（§8.1）。NOT NULL の省略は不可（§8.2 の注記と同じ理由）
+    session_key         TEXT    PRIMARY KEY NOT NULL,   -- "<device_id>:<YYYYMMDD>"
     day_date            TEXT    NOT NULL,          -- 'YYYY-MM-DD'（config.timezone）
     device_id           TEXT    NOT NULL,
 
@@ -1383,7 +1393,7 @@ CREATE TABLE sessions (
     failed_part_count   INTEGER NOT NULL DEFAULT 0,
 
     title               TEXT,           -- LLM 生成。ファイル名には使わない
-    analysis_path       TEXT,           -- /data/analysis/<session_id>.json
+    analysis_path       TEXT,           -- /data/analysis/<slug>.json（slug = key_slug(session_key)）
 
     -- Raw ノート（文字起こし生データ）
     raw_output_path     TEXT,           -- Vault 内の相対パス
@@ -1395,7 +1405,6 @@ CREATE TABLE sessions (
 
     status              TEXT    NOT NULL,
     retry_count         INTEGER NOT NULL DEFAULT 0,
-    auto_retry_rounds   INTEGER NOT NULL DEFAULT 0,     -- ★v5.0 で未使用。常に 0（§15.2）
     regenerated_count   INTEGER NOT NULL DEFAULT 0,
     delete_attempts     INTEGER NOT NULL DEFAULT 0,   -- 削除評価のバックオフ段数
     error_code          TEXT,
@@ -1425,9 +1434,11 @@ UNIQUE 制約が「1 デバイス・1 日 = 1 行」を保証し、再接続時�
 
 ```sql
 CREATE TABLE events (
+    -- ここだけ AUTOINCREMENT を残す。追記専用ログの順序付けにしか使わず、誰も参照しない。
+    -- 振り直されても壊れるものが無い（§8.1 の識別子の議論はエンティティの話である）
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_type   TEXT NOT NULL,      -- 'recording' | 'session'
-    entity_id     INTEGER NOT NULL,
+    entity_key    TEXT NOT NULL,      -- recordings.partkey | sessions.session_key
     from_status   TEXT,
     to_status     TEXT NOT NULL,
     error_code    TEXT,
@@ -1435,11 +1446,15 @@ CREATE TABLE events (
     created_at    TEXT NOT NULL
 );
 
-CREATE INDEX idx_events_entity ON events (entity_type, entity_id, id);
+CREATE INDEX idx_events_entity ON events (entity_type, entity_key, id);
 ```
 
 - すべての状態遷移は `events` への INSERT と **同一トランザクション** で行う
 - **`events` は削除も圧縮もしない。**1 日約 260 行、年間約 9.5 万行で SQLite には十分小さい
+- **`entity_key` には完全な鍵を入れる。**`key_slug()`（16 桁）を入れれば 3 年で 27.4 MiB を
+  20 MiB 弱に減らせるが（`docs/STORE.md` §3.2 の実測）、**それは §14.1 が消した間接参照を
+  監査ログに再導入することになる。**`recordings` の行が無くても `events` だけで何が起きたか
+  分かることに価値がある。3 年で 70 MiB は `/data` の空き前提（58 GiB。§19.2）に対して無視できる
 - 工程ごとの累積失敗回数は `events` から復元できるため、`recordings` 側に列を増やさない
 - **`detail` と `recordings.error_message` / `sessions.error_message` は 200 文字で切り詰める**
   （§16.3 の `MAX_VALUE_CHARS` と同じ値。`db.py` が強制する）。`events` は削除も圧縮もしない
@@ -1459,13 +1474,40 @@ CREATE TABLE schema_version (
 - `db.py` のマイグレーション関数が `version` 昇順の SQL を順次適用する
 - 起動時に自動適用する
 - **`version` を PRIMARY KEY にするのは、二重適用を構造的に防ぐためである。**コードの冪等
-  チェックと二重の防壁になる。**後から UNIQUE を張るのは既存データで失敗しやすく、定番の
-  回避策「新テーブル → INSERT SELECT → RENAME」を選ばせてしまう** — それは下の注記が禁じて
-  いる AUTOINCREMENT の振り直しそのものである。**v1 が唯一の安全な機会である**
-- **破壊的変更（列削除・テーブル削除）は禁止**。追加のみとし、**スキーマ変更は `ALTER TABLE ADD COLUMN` に限る**
+  チェックと二重の防壁になる
 
-> §14.1 の削除条件は `part.id in frontmatter_ids(session.raw_output_path)` で **`recordings.id` の同一性に削除可否を賭けている**。SQLite 定番の「新テーブル作成 → INSERT SELECT → RENAME」形式でスキーマを変えると AUTOINCREMENT が振り直され、**ノートに載っている ID 42 と DB の ID 42 が別の Part を指しうる**。これは §20.4 の ND-01〜ND-23 がどれも検出できない削除事故経路であるため、テーブルの作り直しを伴う変更を禁止する。
+#### 唯一の禁則: `partkey` と `session_key` の算出規則を変えてはならない
+
+ノートの frontmatter（`voicedock_recording_keys` / `voicedock_session_key`。§13.3）には
+**算出した鍵そのものが載る。**算出規則を変えると、既に保存したノートに載っている鍵と DB の
+鍵が食い違い、**§14.1 の「ノートがこのファイルを含むと言っているか」が偽になる。**
+
+**偽になる側に倒れるので削除事故にはならない**（元音声が残る）が、**それ以前に保存した
+録音が永久に削除対象にならない。**規則を変えたいなら、変更前のノートをすべて書き換える
+手順を同時に用意すること。
+
+`tests/unit/test_paths.py` の `test_partkey_is_pinned` が固定入力に対する算出結果を
+バイト単位で固定している。**この値を書き換えるときは、上の段落を読んだうえで行うこと。**
+
+> **テーブルの作り直しは許される。**識別子が自然キーになったので、
+> 「新テーブル → `INSERT SELECT` → `RENAME`」をやっても `partkey` は変わらず、
+> ノートとの対応が壊れない。
+>
+> **v5.0 までの禁則 3 点（テーブルを作り直すな / スキーマは v1 完全形 /
+> `ALTER TABLE ADD COLUMN` 以外禁止）は、`AUTOINCREMENT` を守るためだけに存在していた。**
+> §14.1 が `part.id in frontmatter_ids(...)` という**整数の間接参照**で削除可否を決めて
+> いたため、振り直されると「ノートの 42」と「DB の 42」が別の Part を指しえた
+> （v5.0 → v5.1 の変更 M-1 / `docs/STORE.md` §6）。**v5.1 でその間接参照が消えたので、
+> 禁則も不要になった。**
+
+ただし**データ損失のリスクは残る**ため、次を守る。
+
+- **v2 以降は原則 `ALTER TABLE ADD COLUMN`**。作り直す場合は**行数の一致をテストで確認する**
 - 適用前に DB をバックアップする。**WAL モードのため単純なファイルコピーは禁止する**（`-wal` の未チェックポイント分が失われ、「保存済みなのに未保存」と誤認する事故をバックアップ手順自体が作る）
+
+> **v5.1 で `0001_initial.sql` を 1 回だけ書き直した。**`SCHEMA_VERSION` は 1 のままである。
+> **本番データが 1 行も無い間だけ許される操作**であり、ストア方式の決定（`docs/STORE.md`）を
+> #16（Part 登録）の着手前に置いたのはこの機会を 1 回で使い切るためである。
 
 ```python
 with sqlite3.connect(backup_path) as dst:
@@ -1834,7 +1876,7 @@ def session_key_for(part: Part, cfg) -> str:
     return f"{part.device_id}:{day}"
 ```
 
-- 対象は **`session_id IS NULL` の Part のみ**（再接続時に処理済み Part を再分組しない）
+- 対象は **`session_key IS NULL` の Part のみ**（再接続時に処理済み Part を再分組しない）
 - 送信機が変わっても、DJI が 50 ファイルごとにフォルダを変えても、**同じ日なら同じセッション**にする
 - 日付が変われば必ず別セッション（`started_at` の日付が基準。日をまたぐ 30 分 Part は開始日に属する）
 - `session_key` は UNIQUE。存在すればその行へ追加し、無ければ `OPEN` で作成する
@@ -1896,8 +1938,9 @@ proc.stdin.close()
 | 項目 | 規定 |
 |---|---|
 | 入力 | **inbox 上の `_orig` ファイル**（§5.3。denoised は取り込まれていない） |
-| 出力 | `/data/staging/<recording_id>/audio16k.wav`（30 分で約 58 MB） |
-| ハッシュ | 読みながら SHA-256 を算出し `sha256_orig` に保存する |
+| 出力 | `/data/staging/<slug>/audio16k.wav`（30 分で約 58 MB）。`slug = paths.key_slug(partkey)`（§11.2） |
+| **slug の衝突** | **`staging/<slug>/` が既に存在する場合、`normalized_path` がそこを指す行の `partkey` が自分と一致することを確認する。**しなければ `IMPORT_FAILED` → `FAILED`（下記） |
+| ハッシュ | 読みながら SHA-256 を算出し `sha256` に保存する |
 | **コピー検証** | 算出した SHA-256 が **`.meta.json` の `sha256`（`sha256_helper`）と一致すること。**不一致は `SOURCE_HASH_MISMATCH` → `FAILED`。**Helper のコピーが壊れていないことを確認する唯一の経路** |
 | タイムアウト | `max(ffmpeg_min_timeout_seconds, duration_seconds × ffmpeg_timeout_factor)` |
 | 検証 | 出力が存在し `size > 0`、ffprobe で 16000 Hz / 1 ch / `s16`、かつ **出力の duration が入力の duration と ±`duration_tolerance_seconds` 以内** |
@@ -1906,6 +1949,15 @@ proc.stdin.close()
 | **成功後** | `import.inbox_retain == "normalized"`（既定）なら **inbox の原本を `safe_unlink_inbox()` で削除する**（§11.2） |
 
 > **`-nostdin` を付けてはならない。**標準入力から WAV を受け取るため、`-nostdin`（stdin を `/dev/null` にする）と両立しない。サブプロセスが端末の標準入力を奪う問題は、こちらからパイプを与えることで回避されている。
+
+> **slug の衝突を確率で片付けない。**`key_slug()` は `sha256(partkey)[:16]`（64 bit）なので、
+> 3 年分 35,040 件での衝突確率は約 3.5e-11 である。それでも**上表の確認を省かない。**
+> 衝突したまま進むと、**別の Part の `audio16k.wav` を自分のものとして文字起こしし、
+> その結果で §14.1 が真になって元音声を削除する**（`slug` は `transcript_path` にも使う）。
+> 確認は既存の行を 1 件引くだけで、`normalized_path` に索引は要らない
+> （`slug` は `partkey` から決まるので、`WHERE partkey = ?` で引いて比べればよい）。
+>
+> **slug は識別子ではない**（§11.2）。正は `partkey` であり、slug はファイル名のための派生値である。
 
 **inbox の寿命**（`import.inbox_retain`）:
 
@@ -1945,7 +1997,7 @@ if du(staging_root) + expected > import.staging_max_bytes:  -> DISK_SPACE_LOW
 ```bash
 /usr/local/bin/whisper-cli \
     -m /models/whisper/ggml-large-v3-turbo-q5_0.bin \
-    -f /data/staging/<id>/audio16k.wav \
+    -f /data/staging/<slug>/audio16k.wav \
     -l ja \
     -t 6 \
     --vad \
@@ -1955,7 +2007,7 @@ if du(staging_root) + expected > import.staging_max_bytes:  -> DISK_SPACE_LOW
     --vad-min-silence-duration-ms 1000 \
     --vad-speech-pad-ms 200 \
     -oj \
-    -of /data/transcripts/parts/<recording_id> \
+    -of /data/transcripts/parts/<slug> \
     -np
 ```
 
@@ -1976,7 +2028,7 @@ VAD はタイムスタンプを元の時刻のまま維持するため、Raw ノ
 
 | 項目 | 規定 |
 |---|---|
-| 出力 | `/data/transcripts/parts/<recording_id>.json`。**whisper の生 JSON ではなく、下記の正規化形式で保存する** |
+| 出力 | `/data/transcripts/parts/<slug>.json`。**whisper の生 JSON ではなく、下記の正規化形式で保存する** |
 | 実行方式 | `subprocess.run(argv_list, ...)`。**`shell=True` および文字列連結は禁止**（§14.4） |
 | スレッド数 | `transcription.threads`。`0` なら `min(os.cpu_count(), 8)` |
 | タイムアウト | `clamp(duration_seconds × timeout_factor, min_timeout_seconds, max_timeout_seconds)` |
@@ -1991,7 +2043,7 @@ Part transcript の正規化形式:
 
 ```json
 {
-  "recording_id": 42,
+  "partkey": "DJIMIC3/TX_MIC001_20260829_071201/TX01_MIC002_20260829_071204_orig.wav",
   "language": "ja",
   "duration_seconds": 1800.0,
   "started_at": "2026-08-29T07:12:04+09:00",
@@ -2088,7 +2140,7 @@ for part in sorted(valid_parts, key=lambda p: p.started_at):
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 [reaper]    queue/delete/ を読む
               ↓
-            §14.1.1 の 11 項目を独立検証（コンテナの判断を信用しない）
+            §14.1.1 の 12 項目を独立検証（コンテナの判断を信用しない）
               ↓ すべて真
             Part の `_orig` を unlink
               ↓
@@ -2170,7 +2222,7 @@ def request_part_deletion(part, session, cfg, inventory) -> DeleteRequest:
 ```sh
 # helper/voicedock-reaper — デバイス上のファイルを削除する唯一のプログラム
 #   引数なし。<VOICEDOCK_HOME>/queue/delete/*.json を処理する
-#   §14.1.1 の 11 項目を独立に検証し、1 つでも偽なら削除しない
+#   §14.1.1 の 12 項目を独立に検証し、1 つでも偽なら削除しない
 ```
 
 - **`voicedock-ingest` は `rm` / `unlink` / `mv` をデバイス上のパスに対して実行しない**（N-18）
@@ -2207,6 +2259,10 @@ InboxPath   = NewType("InboxPath", Path)            # /inbox 配下。読み、�
 StagingPath = NewType("StagingPath", Path)          # /data 配下
 VaultPath   = NewType("VaultPath", Path)            # /obsidian 配下
 
+# 恒久識別子（§8.1）。str の別型にするのは、両者を取り違えても型検査が止めるため
+PartKey     = NewType("PartKey", str)               # '<device_id>/<source_folder>/<filename>'
+SessionKey  = NewType("SessionKey", str)            # '<device_id>:<YYYYMMDD>'
+
 # コンテナのマウント点（§18.2）。設定ではない。config.yaml から取らない
 INBOX_ROOT = Path("/inbox"); DATA_ROOT = Path("/data")
 VAULT_ROOT = Path("/obsidian"); QUEUE_ROOT = Path("/queue")
@@ -2226,6 +2282,29 @@ def is_safe_relpath(rel: PurePosixPath) -> bool:
 def safe_unlink_inbox(path: InboxPath, *, missing_ok: bool = False) -> None: ...
 def safe_unlink_staging(path: StagingPath, *, missing_ok: bool = False) -> None: ...
 def safe_unlink_tmp(path: Path, *, missing_ok: bool = True) -> None: ...
+
+# 恒久識別子（§8.1）。partkey を作るのはこの 1 本だけ。呼び出し側で連結しない
+def partkey_for(device_id: str, rel: DevicePath) -> PartKey:
+    """`f"{device_id}/{rel}"`。**算出規則の変更は §8.5 の唯一の禁則である。**
+
+    先に検証し、違反は ValueError にする。
+      - device_id が空 / '/' を含む / '.' で始まる
+      - is_safe_relpath(rel) が偽
+    """
+
+def device_id_of(key: PartKey) -> str:
+    """最初の '/' より前。1 回だけ分割する"""
+
+def relpath_of(key: PartKey) -> DevicePath:
+    """最初の '/' より後。DevicePath なので戻り値に open() / stat() は書けない"""
+
+def key_slug(key: PartKey | SessionKey) -> str:
+    """`sha256(key)[:16]`。**識別子ではなくファイル名のための派生値である。**
+
+    正は partkey / session_key であり、slug から鍵への対応は DB の
+    normalized_path / transcript_path / analysis_path が持つ。
+    衝突は §10.5 が検出する（確率で安全を担保しない）。
+    """
 
 # device.py
 @dataclass(frozen=True)
@@ -2249,6 +2328,7 @@ class SourceFile:
 
 @dataclass(frozen=True)
 class PartCandidate:
+    partkey: PartKey                    # partkey_for(device_id, source.relpath)（§8.1）
     device_id: str
     transmitter_id: str
     mic_index: int
@@ -2263,8 +2343,8 @@ class DeleteRequest:
     request_id: str
     created_at: datetime
     device_id: str
-    recording_id: int
-    session_key: str
+    partkey: PartKey                    # device_id + '/' + targets[0].relpath（reaper 検証 12）
+    session_key: SessionKey
     targets: list[SourceFile]           # 常に 1 要素（§5.3）。list のままにするのは JSON 形式を変えないため
 
 # transcribe.py
@@ -2293,7 +2373,7 @@ class SessionTranscript:
     day_date: date
     segments: list[AbsoluteSegment]
     blocks: list[tuple[datetime, datetime]]
-    excluded_part_ids: list[int]
+    excluded_partkeys: list[PartKey]
 ```
 
 **`is_under()` は「realpath 解決後に配下か」だけを判定する。**§14.1.1 の規範実装が併せて課す
@@ -2305,18 +2385,18 @@ class SessionTranscript:
 
 ```python
 # pipeline.py
-def process_part(recording_id: int) -> PartOutcome:
-    rec = repo.get_recording(recording_id)
-    if not ensure_normalized_audio(rec):    # §10.5
+def process_part(partkey: PartKey) -> PartOutcome:
+    rec = repo.get_recording(partkey)
+    if not ensure_normalized_audio(rec):     # §10.5
         return PartOutcome.STOPPED
-    if not ensure_part_transcript(rec):     # §10.6
+    if not ensure_part_transcript(rec):      # §10.6
         return PartOutcome.STOPPED
-    if not ensure_raw_note(rec.session_id): # §10.7
+    if not ensure_raw_note(rec.session_key): # §10.7
         return PartOutcome.STOPPED
     return PartOutcome.READY_FOR_SESSION
 
-def process_session(session_id: int) -> SessionOutcome:
-    ses = repo.get_session(session_id)
+def process_session(session_key: SessionKey) -> SessionOutcome:
+    ses = repo.get_session(session_key)
     transcript = build_session_transcript(ses)   # §10.8（永続化しない）
     if transcript is None:
         return mark_completed_empty(ses)
@@ -2602,8 +2682,10 @@ Vault/
 ---
 type: voice-raw
 voicedock_session_key: "DJI_MIC:20260829"
-voicedock_session_id: 12
-voicedock_recording_ids: [41, 42, 43]
+voicedock_recording_keys:
+  - "DJI_MIC/TX_MIC001_20260829_071201/TX01_MIC002_20260829_071204_orig.wav"
+  - "DJI_MIC/TX_MIC001_20260829_074201/TX01_MIC002_20260829_074210_orig.wav"
+  - "DJI_MIC/TX_MIC001_20260829_081201/TX01_MIC002_20260829_081204_orig.wav"
 date: 2026-08-29
 parts: 3
 source: DJI Mic 3
@@ -2634,10 +2716,21 @@ source: DJI Mic 3
 | `##` 見出し | Part の境界（時刻範囲）。`raw.part_boundary_heading` が true のとき |
 | `###` 見出し | `raw.timestamp_interval_seconds`（既定 300 秒）ごとの**絶対時刻**。`0` で無効 |
 | frontmatter | 検証・冪等性に必要な最小限のみ |
-| `voicedock_recording_ids` | この Raw ノートに本文が含まれている Part の ID。**削除判定に使う**（§14.1） |
+| `voicedock_recording_keys` | この Raw ノートに本文が含まれている Part の `partkey`（§8.1）。**削除判定に使う**（§14.1） |
 | 更新 | Part の文字起こしが 1 本終わるたびに全体を再生成（§10.7） |
 
 終日録音では「録音開始からの経過秒」より実時刻のほうが振り返りに使えるため、タイムスタンプは絶対時刻とする。
+
+**`voicedock_recording_keys` の書式**:
+
+- **各要素を `"` で囲む。**`partkey` は含まないが `session_key` は `:` を含み、
+  YAML では引用しないとマッピングと解釈されうる。**両方を同じ規則で囲んで揃える**
+- **ブロック形式（1 行 1 要素）で書く。**32 Part の日は 1 行が 2.4 KB になり、
+  フロー形式（`[...]`）だと editor で読めない
+- **32 Part の日で frontmatter が約 2.4 KB 増える**（Daily ノート全体は約 12.8 KB）。
+  v5.0 までは `[41, 42, 43]` と短かった。**これは `partkey` を使う代償である**が、
+  **frontmatter は「何を消してよいか」の唯一の根拠である**（§14.1）。
+  Obsidian のプロパティ表示に出したくない場合は、Obsidian 側の「非表示プロパティ」で隠す
 
 ### 13.4 Daily ノート
 
@@ -2645,8 +2738,10 @@ source: DJI Mic 3
 ---
 type: voice-daily
 voicedock_session_key: "DJI_MIC:20260829"
-voicedock_session_id: 12
-voicedock_recording_ids: [41, 42, 43]
+voicedock_recording_keys:
+  - "DJI_MIC/TX_MIC001_20260829_071201/TX01_MIC002_20260829_071204_orig.wav"
+  - "DJI_MIC/TX_MIC001_20260829_074201/TX01_MIC002_20260829_074210_orig.wav"
+  - "DJI_MIC/TX_MIC001_20260829_081201/TX01_MIC002_20260829_081204_orig.wav"
 voicedock_failed_parts: []
 date: 2026-08-29
 recorded: 09:41:20
@@ -2715,7 +2810,7 @@ VoiceDock の削除条件を整理し、午後の打ち合わせで MVP の範�
 | 全文 | **載せない**（`wiki.include_transcript` 既定 false）。`## Sources` から Raw ノートへ辿る |
 | `recorded` | 実録音時間の合計（`HH:MM:SS`） |
 | `tags` | `obsidian.default_tags` + LLM の `tags` を結合し重複除去。空白を `-` へ置換 |
-| frontmatter | YAML。`voicedock_session_key` と `voicedock_recording_ids` は**必須**（保存検証と削除判定に使う） |
+| frontmatter | YAML。`voicedock_session_key` と `voicedock_recording_keys` は**必須**（保存検証と削除判定に使う） |
 | YAML エスケープ | frontmatter の文字列値は必ず二重引用符で囲み、`"` と `\` をエスケープする |
 | 本文エスケープ | Markdown 本文はエスケープしない。ただし行頭の `---` は `\---` へ退避し、frontmatter 境界との誤認を防ぐ |
 
@@ -2728,7 +2823,7 @@ VoiceDock の削除条件を整理し、午後の打ち合わせで MVP の範�
 > ⚠ この日の録音のうち 2 本が処理できませんでした（合計 60 分）。次にデバイスを接続したときに自動で再試行されます。
 ```
 
-**欠落を隠さないこと。**除外された Part の音声は削除されない（§14.1 が `voicedock_recording_ids` への収録を要求するため自動的に保証される）。
+**欠落を隠さないこと。**除外された Part の音声は削除されない（§14.1 が `voicedock_recording_keys` への収録を要求するため自動的に保証される）。
 
 ### 13.5 ファイル名と sanitize
 
@@ -2777,7 +2872,7 @@ VoiceDock の削除条件を整理し、午後の打ち合わせで MVP の範�
 | R-3 | UTF-8 としてデコードできる |
 | R-4 | 読み直した内容の SHA-256 が、書き込み前に計算した値と一致する |
 | R-5 | frontmatter が YAML としてパースでき、`voicedock_session_key` が当該 Session の値と一致する |
-| R-6 | `voicedock_recording_ids` が、本文を含めた Part の ID をすべて含む |
+| R-6 | `voicedock_recording_keys` が、本文を含めた Part の `partkey` をすべて含む |
 
 **Daily ノート（W-1〜W-9）**: すべて満たした場合のみ `SAVED` へ遷移する。1 つでも欠ければ `OBSIDIAN_VERIFY_FAILED` → `FAILED`。
 
@@ -2789,7 +2884,7 @@ VoiceDock の削除条件を整理し、午後の打ち合わせで MVP の範�
 | W-4 | 読み直した内容の SHA-256 が、書き込み前に計算した値と一致する |
 | W-5 | 先頭が `---\n` で始まり、対応する終端 `---` が存在する |
 | W-6 | frontmatter が YAML としてパースでき、`voicedock_session_key` が当該 Session の値と一致する |
-| W-7 | `voicedock_recording_ids` が、統合対象とした Part の集合と完全一致する |
+| W-7 | `voicedock_recording_keys` が、統合対象とした Part の `partkey` 集合と完全一致する |
 | W-8 | `sections.summary.heading`（既定 `## Summary`）が存在し、その直下の本文が 1 文字以上ある |
 | W-9 | `wiki.include_transcript` が false のとき、Raw ノートへのリンクが 1 個以上存在する |
 
@@ -2849,20 +2944,20 @@ def can_delete_source(part, session, cfg, device) -> bool:
         # --- Raw ノート（文字起こし本文）が保存検証済みで、この Part を含む ---
         and session.raw_output_path is not None
         and verify_raw_note(session) is True          # §13.7 R-1〜R-6 を実ファイルで再実行
-        and part.id in frontmatter_ids(session.raw_output_path)
+        and part.partkey in frontmatter_keys(session.raw_output_path)
 
         # --- Daily ノートが保存検証済みで、この Part を含む ---
         and session.status in SESSION_DELETABLE
         and session.output_path is not None
         and verify_daily_note(session) is True        # §13.7 W-1〜W-9 を実ファイルで再実行
-        and part.id in frontmatter_ids(session.output_path)
+        and part.partkey in frontmatter_keys(session.output_path)
 
         # --- 解析結果が有効 ---
         and session.analysis_path is not None
         and analysis_is_schema_valid(session)
 
         # --- Part 自身の処理が完了 ---
-        and part.session_id == session.id
+        and part.session_key == session.session_key
         and part.status in PART_DELETABLE
         and part.transcript_path is not None
         and part_transcript_is_valid(part)
@@ -2872,8 +2967,8 @@ def can_delete_source(part, session, cfg, device) -> bool:
         and all(p.status in PART_TERMINAL for p in session.parts)   # ★§9.1 の 6 件
 
         # --- 削除対象ファイルの同定（§14.1.1）。NULL / 空文字を真にしない ---
-        and part.source_path_orig is not None
-        and part.source_path_orig != ""
+        and part.source_path is not None
+        and part.source_path != ""
         and target_is_identical(part, device)
     )
 ```
@@ -2881,10 +2976,17 @@ def can_delete_source(part, session, cfg, device) -> bool:
 重要な点:
 
 - `verify_raw_note()` / `verify_daily_note()` は **DB の `status` を信用せず、実ファイルを読み直して §13.7 を再実行する**
+- **v5.1 で整数の間接参照が無くなった。**v5.0 までの条件は `part.id in frontmatter_ids(note)` で、
+  「ノートが整数 42 を含み、かつ DB が 42 を X だと言っているとき、X を消す」という**2 段の論理**
+  だった。前段が真でも後段の対応が壊れていれば（`AUTOINCREMENT` の振り直し）事故になるため、
+  §8.5 が禁則 3 点でそれを防いでいた。v5.1 の条件は
+  **「ノートがファイル X を含むと言っているとき、X を消す」の 1 段である**
+  （`part.partkey` がそのファイルのパスそのもの。§8.1）。
+  **対応が壊れる余地が無くなったので、§8.5 の禁則も 1 点に減った**（`docs/STORE.md` §6 / v5.0→v5.1 の変更 M-1）
 - **コンテナはデバイスを読めない。**`target_is_identical()` がコンテナ側で参照するサイズ・更新時刻は
   Helper が `.meta.json` に記録した値であり、**実ファイルとの突き合わせは reaper が行う**（§14.1.1）
 - **削除の根拠は「音声のコピーが正しかったこと」ではなく「テキストが Vault に確実に残っていること」である。**原音のコピーを保持しない設計（§10.5）に合わせて、v3.0 の「staging 上のファイルからハッシュを再計算する」条件は廃止した
-- 処理できなかった Part（`FAILED` / `SKIPPED`）はノートの `voicedock_recording_ids` に載らないため、**自動的に削除対象から外れる**
+- 処理できなかった Part（`FAILED` / `SKIPPED`）はノートの `voicedock_recording_keys` に載らないため、**自動的に削除対象から外れる**
 - `all()` / `any()` を安全条件に使う場合は、**対象集合が空でないことを別条件として必ず明示する**（空集合の `all()` は真になるため。§14.1 では `session.parts` がこれに当たる）
 - **`_orig` 固定（§5.3）で削除対象は 1 ファイルになったが、`all()` を外しても「非空の明示」は消さない。**スカラーに退化した以上の危険は `NULL` / 空文字であり、`os.path.join(volume, "")` は**ボリュームのルートを指す。**上の 2 条件はそのための番犬である（v3.0 の欠陥 A-14 と同型）
 - **denoised はデバイスに残しても削除しない。**読まなかったファイルを消してよい根拠が無いためである（§5.3）
@@ -2912,7 +3014,7 @@ def can_delete_source(part, session, cfg, device) -> bool:
   "request_id": "20260912T180000Z-42-a1b2c3",
   "created_at": "2026-09-12T18:00:00+09:00",
   "device_id": "DJIMIC3",
-  "recording_id": 42,
+  "partkey": "DJIMIC3/TX_MIC001_20260829_071201/TX01_MIC002_20260829_071204_orig.wav",
   "session_key": "DJIMIC3:20260829",
   "targets": [
     {
@@ -2929,7 +3031,7 @@ def can_delete_source(part, session, cfg, device) -> bool:
 > これにより **「要求がボリューム外のパスを指名すること」自体が構造的に不可能**になる。
 > v3.x は DB に絶対パスを持ち、それを信じて削除していた（v3.1→v3.2 の変更 A-13）。v4.0 はその余地を消した。
 
-**reaper の検証（11 項目）。1 つでも偽なら削除せず、結果に `SOURCE_IDENTITY_MISMATCH` を書く。**
+**reaper の検証（12 項目）。1 つでも偽なら削除せず、結果に `SOURCE_IDENTITY_MISMATCH` を書く。**
 
 | # | 検証 | 何を防ぐか |
 |---|---|---|
@@ -2944,6 +3046,7 @@ def can_delete_source(part, session, cfg, device) -> bool:
 | 9 | `relpath` の各要素が `.` で始まらない | `.Trashes` / `.Spotlight-V100` 等の削除（§22 R-22） |
 | 10 | `size` が一致し、更新時刻の差が 2.0 秒未満 | 別の内容に差し替わったファイルの削除 |
 | 11 | `request_id` が `state/processed.log` に無い | **リプレイ**（同じ要求の二重実行） |
+| **12** | **`<device_id>/<relpath>` が要求の `partkey` と文字列一致する** | **要求の中で `device_id` / `relpath` と `partkey` が食い違っていること。**`partkey` はノートの frontmatter に載っている鍵そのものであり（§13.3）、コンテナは「その鍵がノートに載っていること」を確かめて要求を書いた（§14.1）。**したがって `partkey` と実際に消すパスが一致していなければ、「ノートで確認したファイル」と「消すファイル」が別物である**（v5.1 で追加） |
 
 **規範実装**（コンテナ側の事前確認も同じ規則に従う）:
 
@@ -2997,7 +3100,8 @@ def target_is_identical(volume_root: Path, rel: PurePosixPath,
   `/` への symlink として実在する以上、字句判定だけでは「デバイス配下」と偽装されたパスを拒否できない
   （§22 R-19）。§5.4 でボリュームルートの symlink を弾き、ここで経路全体を再確認する二重防壁とする
 - **コンテナ側が事前確認に使えるのは検証 4・9（relpath の健全性）だけである。**
-  `paths.is_safe_relpath()` がそれを担う。検証 5・6・7・8・10 はデバイス上の `stat` を必要とし、
+  `paths.is_safe_relpath()` がそれを担う。**検証 12（`partkey` との一致）はコンテナ側でも書ける**
+  （`paths.partkey_for()` を通す。§11.2）。検証 5・6・7・8・10 はデバイス上の `stat` を必要とし、
   `DevicePath` は `PurePosixPath`（I/O 不可）なので**コンテナには書けない**。reaper が独立に行う
 - **reaper は要求に書かれたものしか削除しない。**ディレクトリの再帰削除を一切行わない（N-16）
 
@@ -3088,7 +3192,7 @@ cleanup:
               ↓
 [reaper]    三重ロックを確認（§14.2）→ すべて解除済み
               ↓
-            独立検証 11 項目（§14.1.1）→ すべて真
+            独立検証 12 項目（§14.1.1）→ すべて真
               ↓
             DJI 側 Part の `_orig` を unlink
               ↓
@@ -3270,22 +3374,31 @@ make logs
 
 ```text
 2026-08-30T07:00:12+09:00 INFO  service_started version=0.1.0
-2026-08-30T07:00:18+09:00 INFO  part_discovered recording_id=42 tx=TX01 mic=2 started_at=2026-08-29T07:12:04+09:00 duration=1800.0
-2026-08-30T07:00:18+09:00 INFO  part_skipped recording_id=43 reason=variant_not_orig
-2026-08-30T07:01:02+09:00 INFO  normalize_completed recording_id=42 in_bytes=345600044 out_bytes=57600044 elapsed_s=43.1
-2026-08-30T07:06:33+09:00 INFO  transcription_completed recording_id=42 elapsed_s=331.4 chars=8421 rtf=0.18 speech_ratio=0.31
-2026-08-30T07:06:34+09:00 INFO  raw_note_saved session_id=12 parts=1 bytes=18402
-2026-08-30T09:41:05+09:00 INFO  session_merged session_id=12 parts=32 excluded=1 chars=348210
-2026-08-30T10:03:22+09:00 INFO  llm_completed session_id=12 chunks=18 elapsed_s=1337.0
-2026-08-30T10:03:23+09:00 INFO  obsidian_saved session_id=12 path="Daily/Voice/Wiki/20260829/2026-08-29 Voice.md" bytes=12844
-2026-08-30T10:03:23+09:00 INFO  source_delete_skipped session_id=12 reason=delete_source_audio_disabled
+2026-08-30T07:00:18+09:00 INFO  part_discovered recording_key=DJIMIC3/TX_MIC001_20260829_071201/TX01_MIC002_20260829_071204_orig.wav tx=TX01 mic=2 started_at=2026-08-29T07:12:04+09:00 duration=1800.0
+2026-08-30T07:00:18+09:00 INFO  part_skipped recording_key=DJIMIC3/TX_MIC001_20260829_074201/TX01_MIC002_20260829_074210_orig.wav reason=variant_not_orig
+2026-08-30T07:01:02+09:00 INFO  normalize_completed recording_key=DJIMIC3/TX_MIC001_20260829_071201/TX01_MIC002_20260829_071204_orig.wav in_bytes=345600044 out_bytes=57600044 elapsed_s=43.1
+2026-08-30T07:06:33+09:00 INFO  transcription_completed recording_key=DJIMIC3/TX_MIC001_20260829_071201/TX01_MIC002_20260829_071204_orig.wav elapsed_s=331.4 chars=8421 rtf=0.18 speech_ratio=0.31
+2026-08-30T07:06:34+09:00 INFO  raw_note_saved session_key=DJIMIC3:20260829 parts=1 bytes=18402
+2026-08-30T09:41:05+09:00 INFO  session_merged session_key=DJIMIC3:20260829 parts=32 excluded=1 chars=348210
+2026-08-30T10:03:22+09:00 INFO  llm_completed session_key=DJIMIC3:20260829 chunks=18 elapsed_s=1337.0
+2026-08-30T10:03:23+09:00 INFO  obsidian_saved session_key=DJIMIC3:20260829 path="Daily/Voice/Wiki/20260829/2026-08-29 Voice.md" bytes=12844
+2026-08-30T10:03:23+09:00 INFO  source_delete_skipped session_key=DJIMIC3:20260829 reason=delete_source_audio_disabled
 ```
 
 **json:**
 
 ```json
-{"ts":"2026-08-30T07:06:33+09:00","level":"INFO","event":"transcription_completed","recording_id":42,"elapsed_s":331.4,"chars":8421,"rtf":0.18}
+{"ts":"2026-08-30T07:06:33+09:00","level":"INFO","event":"transcription_completed","recording_key":"DJIMIC3/TX_MIC001_20260829_071201/TX01_MIC002_20260829_071204_orig.wav","elapsed_s":331.4,"chars":8421,"rtf":0.18}
 ```
+
+**識別子のフィールド名は `recording_key` / `session_key` である**（§8.1 の自然キーをそのまま出す）。
+v5.0 までは `recording_id=42` / `session_id=12` と短かった。**長くなるが、短い別名を作ると
+「ログの識別子」と「ノートの識別子」が 2 系統になり、障害時に人が突き合わせる作業が増える。**
+
+> **`device_id` に空白が含まれる場合は値が `"` で囲まれる。**Volume 名は `NO NAME` /
+> `Macintosh HD` のように空白を含みうる（§5.4）ので、`recording_key="NO NAME/TX_.../..."`
+> の形になる。text 形式の引用規則（空白・`=`・`"` を含む値を囲む）がそのまま働くだけで、
+> 特別扱いは無い。
 
 ### 16.3 ログへ出してはならない情報
 
@@ -3391,14 +3504,14 @@ docker compose exec voicedock voicedock <subcommand> [options]
 >
 > ```bash
 > docker compose exec voicedock sqlite3 -box /data/voicedock.db \
->   "SELECT ts, entity, entity_id, from_status, to_status, error_code
+>   "SELECT created_at, entity_type, entity_key, from_status, to_status, error_code
 >      FROM events ORDER BY id DESC LIMIT 20;"
 > ```
 
 > **`cleanup --backlog` を削った影響**: 削除 OFF の期間（Phase 1〜6）に処理した Part は
 > `COMPLETED` で終わるため、Phase 7 で削除を有効化しても通常フローでは削除対象にならない。
 > **この後追い経路は Phase 7 に入るまで必要にならない**ので、必要になった時点で #38 として足す。
-> Phase 7 の前提（ND-01〜ND-30 と E2E-01〜E2E-12 の全件 PASS。§21.1）が揃うまでは、
+> Phase 7 の前提（ND-01〜ND-31 と E2E-01〜E2E-12 の全件 PASS。§21.1）が揃うまでは、
 > 存在しないほうが安全である（削除の入口を 1 本に保てる）。
 
 ### 17.2 出力例
@@ -4060,10 +4173,12 @@ VoiceDock doctor
 | Variant の選別（§5.3） | `_orig` あり → 登録 / `_orig` なし → `part_skipped reason=variant_not_orig` / 同名衝突 / **denoised が削除対象に入らないこと** |
 | デバイス判定 | **Helper 層で検証する**（§20.4 と同じ枠組みで `bash helper/voicedock-ingest` を `tmp_path` の偽 `/Volumes` に対して実行）。DJI 形式あり / なし / **`INCLUDE_VOLUMES` が空なら素通り・非空なら一致のみ通す** / **glob として評価されること**（`.*` が全件に一致しない） / **空白を含むボリューム名が 1 パターンとして扱われること** / 深さ制限 |
 | 安定性判定 | **Helper 層で検証する。**バッチ判定 / `STABILITY_FAST_PATH_SECONDS` による即断 / size 変化 / mtime 変化 / 途中で変化して再カウント |
-| セッション分組 | 同一日で結合 / 日境界で分割（23:50 開始 30 分の Part） / デバイス違い / `session_id IS NULL` のみ対象 / 再オープン |
+| セッション分組 | 同一日で結合 / 日境界で分割（23:50 開始 30 分の Part） / デバイス違い / `session_key IS NULL` のみ対象 / 再オープン |
 | Block 算出 | ギャップ超過で分割 / duration NULL のとき境界扱い |
 | SHA-256 ストリーム | チャンク境界・空ファイル・大容量 |
 | 空き容量計算 | 境界値 |
+| **恒久識別子（§8.1）** | **`partkey_for()` の算出結果を固定入力に対してバイト単位で固定する**（§8.5 の唯一の禁則）。`device_id` の不正（空 / `/` を含む / `.` 始まり）と `is_safe_relpath` 違反で `ValueError`。`device_id_of` / `relpath_of` の往復。`relpath_of` が `PurePosixPath` を返すこと。空白を含む Volume 名（`NO NAME`）でも鍵が作れること。`key_slug` が 16 桁 hex で決定的であること |
+| **スキーマ（§8.2〜§8.5）** | SPEC の DDL とマイグレーションの `PRAGMA` レベルの一致。`recordings` が 24 列。**`partkey` / `session_key` に NULL を入れられないこと**（`TEXT PRIMARY KEY` は NOT NULL を含意しない）。**テーブルを作り直しても `partkey` が保たれること**（v5.0 までの禁則が不要になったことの確認） |
 | 状態遷移 | 全遷移の可否、不正遷移の拒否、ガード条件、終端状態の判定 |
 | クラッシュリカバリ | 各 `*ING` 状態からの巻き戻し / 過去日の `OPEN` の確定 |
 | リトライ | backoff の回数と待機秒 / **工程通過で `retry_count` がリセットされること** / **再接続の立ち上がりで `FAILED` が `retry_count = 0` で再投入されること** / **inventory が非空のまま続くループでは再投入されないこと**（毎周回の空回りを防ぐ） |
@@ -4161,7 +4276,7 @@ fixture の WAV は **実機と同じ 48 kHz / 24 bit PCM / モノラル**（144
 | ND-06 | 発話が検出されない | `SKIPPED`。Raw ノートに含まれない | 元音声が残る |
 | ND-07 | Raw ノート書き込み失敗 | `session.raw_output_path is None` | 元音声が残る |
 | ND-08 | Raw ノートを保存後に外部から削除 | `verify_raw_note` が偽 | 元音声が残る |
-| ND-09 | Raw ノートの `voicedock_recording_ids` に当該 Part が無い | ID 包含が偽 | 元音声が残る |
+| ND-09 | Raw ノートの `voicedock_recording_keys` に当該 Part が無い | 鍵の包含が偽 | 元音声が残る |
 | ND-10 | LLM 到達不可 | `session.analysis_path is None` | 元音声が残る |
 | ND-11 | LLM が不正 JSON を返す（repair も失敗） | `analysis_is_schema_valid` が偽 | 元音声が残る |
 | ND-12 | Obsidian Vault が存在しない | `session.output_path is None` | 元音声が残る |
@@ -4173,7 +4288,7 @@ fixture の WAV は **実機と同じ 48 kHz / 24 bit PCM / モノラル**（144
 | ND-18 | 削除直前にファイルサイズが変わる | `target_is_identical` が偽 | 元音声が残る。`SOURCE_IDENTITY_MISMATCH` |
 | ND-19 | 削除直前に mtime が変わる | 同上 | 元音声が残る |
 | ND-20 | 対象パスがデバイスのルート外（対象自身が symlink / **経路の途中に symlink（`/Volumes/Macintosh HD` 経由など）**） | パス封じ込めが偽 | 元音声が残る。**他ボリュームのファイルに触れない** |
-| ND-21 | Part を 0 件持つ Session / `source_path_orig` が `NULL` または空文字 | 空集合・空文字を真にしない条件が偽 | 削除が起きない |
+| ND-21 | Part を 0 件持つ Session / `source_path` が `NULL` または空文字 | 空集合・空文字を真にしない条件が偽 | 削除が起きない |
 | ND-22 | `delete_source_audio: false`（`config.yaml` / `helper.conf` のどちらか一方だけでも） | ロック 1 が偽 | 元音声が残る。要求が書かれない、または reaper の検証 1 で拒否 |
 | ND-23 | `MOUNT_MODE=ro`（`heartbeat.json` の `mount_readonly` が真） | ロック 2-B が偽 | 元音声が残る。reaper の検証 2 で拒否。**実機では OS レベルでも不可**（`docs/POC.md` §4.1 で実証済み） |
 | **ND-24** | 要求の `relpath` に `../` を仕込む | 検証 4 が偽 | 元音声が残る。**ボリューム外のファイルに触れない** |
@@ -4183,6 +4298,7 @@ fixture の WAV は **実機と同じ 48 kHz / 24 bit PCM / モノラル**（144
 | **ND-28** | 要求の `relpath` が `.Trashes/...` を指す | 検証 9 が偽 | 元音声が残る。**ユーザーが意図的に捨てた録音に触れない**（§22 R-22） |
 | **ND-29** | 親ディレクトリ名が `RECORDING_FOLDER_RE` に一致しない | 検証 8 が偽 | 元音声が残る |
 | **ND-30** | `state/` をコンテナから書き換えて `mount_readonly` を偽装しようとする | `/state` は `ro` マウント（§18.2） | 書き込み自体が失敗する |
+| **ND-31** | **ノートの `voicedock_recording_keys` に載っている鍵の `device_id` だけが対象と違う**（`NO NAME` などの同名衝突。§5.4）。フォルダ名以降は完全一致する | 鍵の包含が偽（`partkey` が `device_id` を含む） | **別デバイスの同名録音を消さない。**v5.0 までは整数 ID だったため、**この食い違いはノートを見ても分からなかった**（v5.1 で追加） |
 
 このテスト群は CI で必ず実行し、**1 件でも失敗したらリリースしない。**
 
@@ -4230,7 +4346,7 @@ make up                      # = docker compose up -d --build
 | **Phase 4** | Obsidian 出力 | Raw / Daily の 2 層が生成される。atomic write と §13.7 の保存検証。Obsidian で正しく表示され、`[[]]` が既存ノートにのみ張られる。**再生成でファイルが増殖しない** |
 | **Phase 5** | 状態管理 | SQLite による再開・リトライ・二重処理防止。§9.4 のクラッシュリカバリ。Docker 再起動で途中から再開する。**工程通過で `retry_count` がリセットされる。`FAILED` がデバイス再接続で再投入される** |
 | **Phase 6** | 終日運用 | 16 時間連続録音が日境界で 1 セッションにまとまり、Daily 1 枚 + Raw 1 枚になる。Timeline から時間帯を辿れる。**無音 Part と失敗 Part があってもセッションが止まらない**（E2E-06〜E2E-09 が PASS） |
-| **Phase 7** | 自動削除 | **§20.4 の ND-01〜ND-30 が全件 PASS** かつ **E2E-01〜E2E-12 が全件 PASS** した後にのみ、三重ロック（§14.2）を解除する |
+| **Phase 7** | 自動削除 | **§20.4 の ND-01〜ND-31 が全件 PASS** かつ **E2E-01〜E2E-12 が全件 PASS** した後にのみ、三重ロック（§14.2）を解除する |
 | **Phase 8** | 運用 | health / doctor / logs / recovery / 更新手順が揃う |
 
 **Phase 7 へ進む前に、Phase 0〜6 の受け入れ条件が全件 PASS していること。**
@@ -4323,6 +4439,7 @@ docker compose up -d        # config.yaml の再読み込み
 | R-23 | **Helper が停止しても、コンテナは正常に見え続ける** | 録音が 1 本も取り込まれないまま何日も気づかない。**無人稼働では最も起きやすい沈黙** | `heartbeat.json` を **H-8 で unhealthy 条件にする**（§19.1）。`doctor` D-18 と DH-12 でも検査。`status` に Helper の状態を常時表示（§17.2） |
 | R-24 | **削除の判断（コンテナ）と実行（reaper）がテスト境界をまたぐ** | 境界のどちらかだけをテストしても安全性を保証できない | §20.4 を 2 層に分け、境界そのものを狙う ND-24〜ND-30 を追加。reaper を POSIX bash に限定して **CI で実行可能**にした（§14.4 N-19） |
 | R-25 | **`diskutil mount readOnly` による再マウントが失敗する**（他プロセスが使用中など） | ロック 2-B が掛からないまま運用が続く | **失敗は安全側へ倒す。**ingest は取り込みを続行しつつ `heartbeat.json` に `mount_readonly: false` を書き、**reaper が検証 2 で削除を拒否する**（§14.2）。`doctor` D-18 が表示 |
+| **R-27** | **`partkey` / `session_key` の算出規則を将来変えてしまう**（§8.5 の唯一の禁則） | ノートの frontmatter に載っている鍵と DB の鍵が食い違い、§14.1 が偽に倒れる。**削除事故にはならないが、それ以前に保存した録音が永久に削除対象にならない** — しかも「削除が静かに止まる」という形なので気づきにくい | `tests/unit/test_paths.py::test_partkey_is_pinned` が算出結果をバイト単位で固定し、**docstring に「期待値を書き換えて通すな」と明記した。**`doctor` に検査は置けない（保存済みノートの鍵を全部読み直す必要があり、Vault 全走査になる）。**規則を変えるときはノートの書き換え手順を同時に用意する** |
 | R-26 | **Helper（bash）とコンテナ（Python）で §5.4 / §10.3 の規則が二重実装になる** | 食い違うと検出漏れが無言で起きる | **値の二重定義は v4.1 で解消した**（検出系の設定は `helper.conf` にのみ存在する。§7.4）。残るのは**規則の二重実装**だけで、**§5.4 / §10.3 の記述が唯一の規範**。`doctor` の DH-13 が `helper.conf` の実効値を表示する |
 
 ---
@@ -4343,7 +4460,32 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 ---
 
-## 付録 A. v4.6 から v5.0 への主な変更点
+## 付録 A. v5.0 から v5.1 への主な変更点
+
+**識別子を整数の連番から自然キーへ移した。**根拠と実測は `docs/STORE.md`（#60 / T-52）にある。
+**§14.1 の論理式・§14.1.1 の検証・§14.2 の三重ロックの設計思想は変えていない**
+（削除条件は 2 段から 1 段に*減った*。M-1）。
+
+| 数えたもの | v5.0 | v5.1 |
+|---|---|---|
+| `recordings` の列 | 30（うち 6 列が常に NULL / 0） | **24** |
+| `recordings` の索引 | 6 | **4** |
+| §8.5 の禁則 | 3 点 | **1 点** |
+| reaper の独立検証 | 11 項目 | **12 項目** |
+| ND-* | 30 | **31** |
+
+| # | 変更 | 理由 |
+|---|---|---|
+| M-1 | **識別子を自然キーへ**（§8.1, §8.2, §8.3, §8.4, §11.1, §11.2, §13.3, §13.7, §14.1, §14.1.1, §16.2） | **§8.5 のドクトリン全体が「整数 ID を守るため」だけに存在していた。**§14.1 の削除条件が `part.id in frontmatter_ids(note)` という**整数の間接参照**で、「ノートが 42 を含み、かつ DB が 42 を X だと言っているとき X を消す」の 2 段だった。前段が真でも後段の対応が壊れれば（`AUTOINCREMENT` の振り直し）**文字起こしが Vault に無い音声を削除する。**ND-01〜ND-30 がどれも検出できない経路である。`partkey`（`<device_id>/<source_folder>/<filename>`）にすると条件が**「ノートがファイル X を含むと言っているとき X を消す」の 1 段になり、対応が壊れる余地が消えた。****これは v5.0 の `_orig` 固定（v4.6→v5.0 の変更 L-1）が可能にした** — 1 Part = 1 ファイル = 1 パス = 1 識別子。v4.6 までは 1 Part が最大 2 ファイルを持っていたので単一のパスを識別子にできなかった。**簡素化が安全性の改善を可能にした** |
+| M-2 | **§8.5 の禁則を 3 点から 1 点へ**（§8.5） | 「テーブルを作り直すな / スキーマは v1 完全形 / `ALTER TABLE ADD COLUMN` 以外禁止」はすべて `AUTOINCREMENT` を守るためだった。M-1 でその必要が消えたので、**唯一の禁則は「`partkey` / `session_key` の算出規則を変えるな」になった。**破れ方も変わった: 算出規則を変えると §14.1 は**偽に倒れる**ので削除事故にはならないが、**それ以前に保存した録音が永久に削除対象にならない。**テストも「振り直しに繋がる構文の禁止」（代理）から「算出結果のバイト単位の固定」（不変量そのもの）へ変えた |
+| M-3 | **ストアは SQLite を継続**（`docs/STORE.md`、§8.1 に参照を追加） | 3 年分の実測で `status` の集計が SQLite 0.80 ms / ファイル全読み 315 ms、1 件の状態遷移が 0.78 ms / 0.82 ms。**負けている側も CLI として十分速く、性能では決まらなかった。**構造で比べると差が付く 4 軸のうち 3 軸（`sha256` の一意性索引 / 同時実行 / クラッシュ耐性）で SQLite が有利。ファイル方式は「索引とエンティティ本体の 2 書き込みの整合」「跨ぎ照会の一貫性」「孤児マーカーの修復」を自前で書くことになり、**§14.1 の安全性が依存する層にリスクを足す** |
+| M-4 | **`0001_initial.sql` を 1 回だけ書き直した**（§8.5） | `SCHEMA_VERSION` は 1 のまま。**本番データが 1 行も無い間だけ許される操作**であり、v5.0 で列の削除を保留した（v4.6→v5.0 の変更 L-7）のはこの機会を 1 回で使い切るためである。v5.0 で未使用になった `*_denoised` 5 列 / `primary_variant` / `auto_retry_rounds` 2 列をここで削除し、`*_orig` の接尾辞も外した（`source_path` / `source_size` / `source_mtime` / `sha256`） |
+| M-5 | **reaper 検証に 12 番目を追加**（§14.1.1） | `<device_id>/<relpath>` が要求の `partkey` と文字列一致すること。**`partkey` はノートに載っている鍵そのもの**であり、コンテナは「その鍵がノートに載っている」ことを確かめて要求を書いた。**食い違っていれば「ノートで確認したファイル」と「消すファイル」が別物である。**v5.0 まではこの検査を書けなかった（要求が運ぶ `recording_id` は整数で、パスと突き合わせようがなかった） |
+| M-6 | **ND-31 を追加**（§20.4） | **ノートの鍵の `device_id` だけが対象と違う場合**（`NO NAME` などの同名衝突。§5.4）に削除しないこと。`partkey` が `device_id` を含むので鍵の包含が偽になる。**v5.0 までは整数 ID だったため、この食い違いはノートを見ても分からなかった** |
+| M-7 | **ファイル名に使う鍵は `key_slug()` を通す**（§10.5, §10.6, §11.2, §8.2, §8.3） | `device_id` は Volume 名なので空白や任意文字を含みうる（`NO NAME` / `Macintosh HD`）し、`session_key` は `:` を含む。sanitize は衝突しうるので使わず `sha256(key)[:16]` にした。**slug は識別子ではなく派生値である**（正は `partkey`）。**衝突は確率で片付けず、§10.5 に「既存の `staging/<slug>/` の `partkey` が自分と一致すること」の確認を置いた** — 衝突したまま進むと別 Part の音声を自分のものとして文字起こしし、その結果で §14.1 が真になる |
+| M-8 | **frontmatter を `voicedock_recording_keys` へ改名し `voicedock_session_id` を削除**（§13.3, §13.4, §13.7） | **改名するのは、古い形式のノートが R-6 / W-7 を黙って通らないようにするため。**32 Part の日で frontmatter が約 2.4 KB 増える（Daily ノート全体は約 12.8 KB）が、**frontmatter は「何を消してよいか」の唯一の根拠である**（§14.1）。`voicedock_session_id` は Session に整数 ID が無くなったので消えた |
+
+## 付録 B. v4.6 から v5.0 への主な変更点
 
 **本筋は「USB 接続 → 文字起こし → LLM 要約 → Obsidian へ 2 枚のノート → 元音声を削除」である。**
 v5.0 はこの筋に必須でない付属機能と、v3.x から残っていた残骸を落とした。
@@ -4368,7 +4510,7 @@ v5.0 はこの筋に必須でない付属機能と、v3.x から残っていた�
 | L-6 | **ログのイベント名を 68 件から 28 件へ**（§16.2, §16.4） | 原則を「1 工程につき完了 1 件 + 失敗 1 件。開始イベントは出さない。状態遷移は `events` テーブルが持つのでログに二重で並べない」と明文化し、細かい分岐は `reason=` / `error_code=` のフィールドへ移した。**うち 9 件（`device_*` 5 件・`deep_scan_*` 3 件・`file_not_stable`）は純粋な v3.x の残骸**で、v4.0 で検出が、v4.1 で走査が Helper へ移ったのに一覧だけ更新されていなかった。**コンテナはデバイスを見ないので、これらを出せるコードは書けない**（§11.1 の `DevicePath`） |
 | L-7 | **スキーマは変えない**（§8.2, §8.3） | `*_denoised` 5 列・`primary_variant`・`auto_retry_rounds` は v5.0 で使わなくなったが、**列は残して「常に NULL / 0」と注記した。**理由は §8.5 が破壊的変更を禁じており（`recordings.id` の同一性に削除可否を賭けているため）、いま列を落とすには `0001_initial.sql` の書き直しが要る。**ストア方式（SQLite かファイルか）を T-52 で決める前に書き直すと、二度作ることになる。**#16（Part 登録）に着手する前に T-52 を決め、そのときに 1 回だけ作り直す |
 
-## 付録 B. v4.5 から v4.6 への主な変更点
+## 付録 C. v4.5 から v4.6 への主な変更点
 
 v4.6 は、**状態機械の内部整合を取る**改訂である。SPEC を parse して図と表を突き合わせた
 結果として見つかった食い違いを直した。**§14.1 の論理式そのものは変えていない**（参照する
@@ -4383,7 +4525,7 @@ v4.6 は、**状態機械の内部整合を取る**改訂である。SPEC を pa
 
 ---
 
-## 付録 C. v4.4 から v4.5 への主な変更点
+## 付録 D. v4.4 から v4.5 への主な変更点
 
 v4.5 は、**スキーマ v1 を確定させる**改訂である。§8.5 が破壊的変更を禁じているため、
 **v1 に入れ損ねた制約は後から安全に足せない。**§14 の削除設計には触れていない。
@@ -4395,7 +4537,7 @@ v4.5 は、**スキーマ v1 を確定させる**改訂である。§8.5 が破�
 
 ---
 
-## 付録 D. v4.3 から v4.4 への主な変更点
+## 付録 E. v4.3 から v4.4 への主な変更点
 
 v4.4 は、**テスト fixture の形式と組み立て方式を実測へ合わせる**改訂である。
 **規則そのものは 1 つも変えていない。**変更範囲はテスト仕様だけである。
@@ -4409,7 +4551,7 @@ v4.4 は、**テスト fixture の形式と組み立て方式を実測へ合わ�
 
 ---
 
-## 付録 E. v4.2 から v4.3 への主な変更点
+## 付録 F. v4.2 から v4.3 への主な変更点
 
 v4.3 は、**パス封じ込めの API を本文へ明記する**改訂である。実装が §14.1.1 のコードを
 各モジュールでインライン展開する余地を消すことが目的で、**規則そのものは 1 つも変えていない。**
@@ -4420,11 +4562,11 @@ v4.3 は、**パス封じ込めの API を本文へ明記する**改訂である
 | H-2 | **`is_under()` の判定範囲を規定**（§11.2） | §14.1.1 の `resolved == target`（経路上に symlink が 1 つも無い）は**デバイス側の規則**である。コンテナへ持ち込むと、Vault 内に symlink を張っている利用者の一時ファイルを片付けられなくなる。代わりに `safe_unlink_*` が対象自身が通常ファイルであることを要求する |
 | H-3 | **コンテナ側が担える検証を §14.1.1 に明記**（§14.1.1） | 検証 5・6・7・8・10 は `stat` を要し、`DevicePath` が `PurePosixPath` である以上**コンテナには書けない**。どこまでが誰の責務かを本文に残す |
 | H-4 | **`assert_` で始まる bool 返し関数を禁止**（§11.1） | 戻り値を捨てた呼び出しが黙って何もしない。**封じ込め検査で最も起きてはいけない形**である。`is_under`（判定）と `require_under`（違反で例外）に分ける |
-| H-5 | **本文から付録のレター参照をやめる**（§10.5, §14.1.1） | 付録は新しい順に並べる規約なので、版が上がるたびに `付録 E` → `付録 F` → … とずれ、本文の参照を毎回追わねばならなかった。`v3.1→v3.2 の変更 A-4` のように**版で指す**形に変え、以後は見出しの繰り下げだけで済むようにした |
+| H-5 | **本文から付録のレター参照をやめる**（§10.5, §14.1.1）。**v5.1 でこの規約を `src/` と `tests/` のコメントにも広げた** | 付録は新しい順に並べる規約なので、版が上がるたびに `付録 E` → `付録 F` → … とずれ、本文の参照を毎回追わねばならなかった。`v3.1→v3.2 の変更 A-4` のように**版で指す**形に変え、以後は見出しの繰り下げだけで済むようにした |
 
 ---
 
-## 付録 F. v4.1 から v4.2 への主な変更点
+## 付録 G. v4.1 から v4.2 への主な変更点
 
 v4.2 は、**§7.3 の検証規則を実装可能な形へ整え、Helper からコンテナへの報告形式を明文化する**
 改訂である。**§14 の削除設計には一切触れていない。**
@@ -4443,7 +4585,7 @@ v4.2 は、**§7.3 の検証規則を実装可能な形へ整え、Helper から
 
 ---
 
-## 付録 G. v4.0 から v4.1 への主な変更点
+## 付録 H. v4.0 から v4.1 への主な変更点
 
 v4.1 は、**走査対象の許可リストを追加し、あわせて v4.0 が残した設定の積み残しを解消する**改訂である。
 **§14 の削除設計には一切触れていない。**変更範囲は検出側だけである。
@@ -4465,7 +4607,7 @@ v4.1 は、**走査対象の許可リストを追加し、あわせて v4.0 が�
 
 ---
 
-## 付録 H. v3.4 から v4.0 への主な変更点
+## 付録 I. v3.4 から v4.0 への主な変更点
 
 v4.0 は、**#2 の実機検証で現行アーキテクチャが成立しないと判明したことを受けた構成変更**である。
 
@@ -4492,7 +4634,7 @@ Obsidian 出力）、状態機械の骨格、設定項目の意味。
 
 ---
 
-## 付録 I. v3.3 から v3.4 への主な変更点
+## 付録 J. v3.3 から v3.4 への主な変更点
 
 v3.4 は、**#2（Phase 0 PoC）で DJI Mic 3 の実機から得た測定値を反映する**ことだけを目的とした改訂である。
 **機能・安全設計・設定項目は 1 つも変えていない。**実測値の出典はすべて `docs/POC.md` §6。
@@ -4513,7 +4655,7 @@ v3.4 は、**#2（Phase 0 PoC）で DJI Mic 3 の実機から得た測定値を�
 
 ---
 
-## 付録 J. v3.2 から v3.3 への主な変更点
+## 付録 K. v3.2 から v3.3 への主な変更点
 
 v3.3 は、**実装に着手する前に、仕様書に残っていた事実誤りと仕様内の不整合を潰す**ことだけを目的とした
 改訂である。**処理の内容・安全設計・設定項目の意味は 1 つも変えていない**（追加は V-27 と
@@ -4538,7 +4680,7 @@ v3.3 は、**実装に着手する前に、仕様書に残っていた事実誤�
 
 ---
 
-## 付録 K. v3.1 から v3.2 への主な変更点
+## 付録 L. v3.1 から v3.2 への主な変更点
 
 v3.2 は、**実装に着手する前に「個人用途に対して過剰な構造」を削る**ことだけを目的とした改訂である。
 **機能・安全設計・設定項目は 1 つも削っていない。**処理の内容が変わる変更は含まれない。
@@ -4564,13 +4706,13 @@ v3.2 は、**実装に着手する前に「個人用途に対して過剰な構�
 | ファイル名 sanitize の縮小（§13.5） | **LLM 生成タグが frontmatter に入る経路を守るため。**制御文字が混ざると §13.7 の W-5 / W-6 が落ち、LLM は同じタグを再生成するのでリトライも効かず、その日の Daily ノートが恒久的に作れなくなる（§1.3 優先順位 2 の違反） |
 | 設定キーの定数化 | `src/` は §18.3 でイメージへ COPY されるため、定数化した値の変更には `--build` が必要になる。設定のままなら「ホストで編集 → 再起動」で済む |
 | `events` テーブルの縮小（§8.4） | §16.1 のログは 10 MB × 3 でローテートするため、不可逆操作の痕跡が数日で消える |
-| ~~自動再試行機構の廃止（§15.2）~~ | **v5.0 で判断を変えた。**機構そのものは残すが、24 時間タイマーとラウンド上限を捨て「**デバイス再接続とサービス起動で `FAILED` を無条件に再投入する**」形へ単純化した。人が `retry` を打たずに済むという要件は満たしたまま、設定 2 つ・列 1 つ・CLI 1 本が消えた（付録 A L-2） |
+| ~~自動再試行機構の廃止（§15.2）~~ | **v5.0 で判断を変えた。**機構そのものは残すが、24 時間タイマーとラウンド上限を捨て「**デバイス再接続とサービス起動で `FAILED` を無条件に再投入する**」形へ単純化した。人が `retry` を打たずに済むという要件は満たしたまま、設定 2 つ・列 1 つ・CLI 1 本が消えた（v4.6→v5.0 の変更 L-2） |
 | `health` と healthcheck の廃止（§19.1） | 無人稼働が前提のため、`docker ps` で異常が見えることに価値がある |
 | ~~§10.1 の 2 段スキャンの単純化~~ | **v4.1 で走査ごと Helper へ移り、v5.0 で #15 を close して決着した。**コンテナ側の `/inbox` 走査は 1 段（`poll_interval_seconds` の scandir）だけである |
 
 ---
 
-## 付録 L. v3.0 から v3.1 への主な変更点
+## 付録 M. v3.0 から v3.1 への主な変更点
 
 v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間録り続ける」へ変わった**ことを起点に全面改訂したものである。
 
@@ -4607,7 +4749,7 @@ v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間
 
 ---
 
-## 付録 M. 参考資料
+## 付録 N. 参考資料
 
 Docker 公式ドキュメントを実装時の一次資料とする。
 
