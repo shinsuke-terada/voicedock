@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 import yaml
 
-from tests.unit.test_config import complete_tree, example_document, merge
+from tests.helpers import complete_tree, example_document, merge
 from voicedock import doctor
 from voicedock.doctor import DETAIL_INDENT, LABEL_WIDTH, SEPARATOR, Status
 from voicedock.errors import EXIT_DOCTOR_FATAL, EXIT_OK
