@@ -14,10 +14,11 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Final
 
 from tests.fixtures.make_wav import Content, WavFormat, write_wav
+from voicedock.paths import DevicePath, PartKey, partkey_for
 
 DEVICE_ID: Final = "DJIMIC3"
 """実機のボリューム名（`docs/POC.md` §6.1。出荷時の `NO NAME` から改名したもの）。"""
@@ -52,6 +53,16 @@ class FakeRecording:
     def relpath(self, variant: str) -> str:
         """ボリュームルートからの相対パス（`device_id` を含めない。§14.1.1）。"""
         return f"{self.folder}/{self.filename(variant)}"
+
+    def partkey(self, variant: str = ORIG, *, device_id: str = DEVICE_ID) -> PartKey:
+        """この録音の `partkey`（§8.1）。
+
+        **`paths.partkey_for()` を通す。**fixture の中で文字列を連結すると、算出規則を
+        変えてもテストが落ちず、**§8.5 の唯一の禁則が守られていることを確かめられなくなる。**
+
+        既定が `ORIG` なのは、v5.0 以降 `_orig` だけが取り込まれるためである（§5.3）。
+        """
+        return partkey_for(device_id, DevicePath(PurePosixPath(self.relpath(variant))))
 
     def tone_hz(self, variant: str) -> float:
         """Variant ごとに中身を変える。**同じ録音の 2 Variant は別ファイルである。**"""

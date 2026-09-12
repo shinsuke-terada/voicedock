@@ -19,7 +19,7 @@ from voicedock.main import main
 # v5.0 まではここに 11 本を写していたため、SPEC の表に 1 行足しても何も落ちなかった。
 SPEC_SUBCOMMANDS: tuple[str, ...] = tuple(spec_subcommands())
 
-# §17.1 の「v5.0 で削除した 6 本」の表（付録 A L-4）。**戻っていないことを固定する。**
+# §17.1 の「v5.0 で削除した 6 本」の表（v4.6→v5.0 の変更 L-4）。**戻っていないことを固定する。**
 REMOVED_SUBCOMMANDS: tuple[str, ...] = tuple(spec_removed_subcommands())
 
 
@@ -40,7 +40,7 @@ def test_spec_subcommand_tables_do_not_overlap() -> None:
 
 @pytest.mark.parametrize("name", REMOVED_SUBCOMMANDS)
 def test_removed_subcommands_are_gone(name: str) -> None:
-    """v5.0 で削った 6 本が argparse の使い方エラーになること（付録 A L-4）。
+    """v5.0 で削った 6 本が argparse の使い方エラーになること（v4.6→v5.0 の変更 L-4）。
 
     **未実装（EXIT_ERROR）と区別する。**未実装は「いずれ実装する」を意味するが、
     この 6 本は代替へ移した結果として存在しない（§17.1 の対応表）。
