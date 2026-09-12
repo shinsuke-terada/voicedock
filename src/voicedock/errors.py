@@ -1,7 +1,12 @@
 """エラーコードと終了コード（SPEC §15, §17.3）。
 
 このモジュールは **判定材料をデータとして提供するだけ**で、リトライを実行しない。
-実行は #32（リトライ）と #33（status / retry）が担う。
+実行は #32（リトライ）と #33（status）が担う。
+
+**`auto_retry_exempt` は v5.0 で廃止した**（付録 A L-3）。v4.6 は「24 時間後の自動再投入の
+対象外」を 6 コードに付けていたが、**その 6 つはどれも `FAILED` に来ない**（設定系は起動中止、
+残りは Part `SKIPPED`）。`FAILED` だけを再評価する §15.2 のもとでは、除外リストが指すものが
+存在しない。`tests/unit/test_errors.py` がこの前提を §15.1 の遷移先列から固定している。
 
 `ErrorCode` の並びは **SPEC §15.1 の表と同じ順**に保つこと。照合しやすさのためであり、
 `tests/unit/test_errors.py` が SPEC を parse して過不足を検出する。
@@ -67,9 +72,6 @@ class ErrorSpec:
     category: Category
     retry: RetryPolicy
 
-    auto_retry_exempt: bool = False
-    """§15.2 の「自動再試行の対象外」。`FAILED` の 24 時間後の自動再投入を行わない。"""
-
     aborts_startup: bool = False
     """遷移先が「起動中止（終了コード 2）」である。"""
 
@@ -128,20 +130,14 @@ _C = Category
 _R = RetryPolicy
 
 ERRORS: Mapping[ErrorCode, ErrorSpec] = {
-    ErrorCode.CONFIG_UNKNOWN_KEY: ErrorSpec(
-        _C.CONFIG, _R.NONE, auto_retry_exempt=True, aborts_startup=True
-    ),
-    ErrorCode.CONFIG_INVALID_VALUE: ErrorSpec(
-        _C.CONFIG, _R.NONE, auto_retry_exempt=True, aborts_startup=True
-    ),
-    ErrorCode.CONFIG_LOCK_MISMATCH: ErrorSpec(
-        _C.CONFIG, _R.NONE, auto_retry_exempt=True, aborts_startup=True
-    ),
+    ErrorCode.CONFIG_UNKNOWN_KEY: ErrorSpec(_C.CONFIG, _R.NONE, aborts_startup=True),
+    ErrorCode.CONFIG_INVALID_VALUE: ErrorSpec(_C.CONFIG, _R.NONE, aborts_startup=True),
+    ErrorCode.CONFIG_LOCK_MISMATCH: ErrorSpec(_C.CONFIG, _R.NONE, aborts_startup=True),
     ErrorCode.DEVICE_NOT_READABLE: ErrorSpec(_C.DEVICE, _R.NEXT_POLL),
     ErrorCode.DEVICE_UNSUPPORTED: ErrorSpec(_C.DEVICE, _R.NONE),
     ErrorCode.FILE_NOT_STABLE: ErrorSpec(_C.DEVICE, _R.NEXT_POLL),
-    ErrorCode.DUPLICATE_CONTENT: ErrorSpec(_C.IMPORT, _R.NONE, auto_retry_exempt=True),
-    ErrorCode.SOURCE_MISSING: ErrorSpec(_C.IMPORT, _R.NONE, auto_retry_exempt=True),
+    ErrorCode.DUPLICATE_CONTENT: ErrorSpec(_C.IMPORT, _R.NONE),
+    ErrorCode.SOURCE_MISSING: ErrorSpec(_C.IMPORT, _R.NONE),
     ErrorCode.SOURCE_HASH_MISMATCH: ErrorSpec(_C.IMPORT, _R.ATTEMPTS),
     ErrorCode.HELPER_UNAVAILABLE: ErrorSpec(_C.HELPER, _R.NEXT_EVAL),
     ErrorCode.DELETE_QUEUE_FAILED: ErrorSpec(_C.DELETE, _R.NEXT_CONNECT),
@@ -154,15 +150,15 @@ ERRORS: Mapping[ErrorCode, ErrorSpec] = {
     ErrorCode.WHISPER_MODEL_MISSING: ErrorSpec(_C.TRANSCRIBE, _R.NONE, aborts_startup=True),
     ErrorCode.WHISPER_FAILED: ErrorSpec(_C.TRANSCRIBE, _R.ATTEMPTS),
     ErrorCode.WHISPER_TIMEOUT: ErrorSpec(_C.TRANSCRIBE, _R.ATTEMPTS),
-    ErrorCode.NO_SPEECH_DETECTED: ErrorSpec(_C.TRANSCRIBE, _R.NONE, auto_retry_exempt=True),
+    ErrorCode.NO_SPEECH_DETECTED: ErrorSpec(_C.TRANSCRIBE, _R.NONE),
     ErrorCode.OBSIDIAN_RAW_WRITE_FAILED: ErrorSpec(_C.OUTPUT, _R.ATTEMPTS),
     ErrorCode.OBSIDIAN_RAW_VERIFY_FAILED: ErrorSpec(_C.OUTPUT, _R.ATTEMPTS),
     ErrorCode.SESSION_MERGE_FAILED: ErrorSpec(_C.SESSION, _R.ATTEMPTS),
     ErrorCode.LLM_UNAVAILABLE: ErrorSpec(_C.LLM, _R.ATTEMPTS),
     ErrorCode.LLM_FAILED: ErrorSpec(_C.LLM, _R.ATTEMPTS),
-    # 即時リトライは repair 1 回で打ち切るが、§15.2 の対象外リストに入っていないため
-    # FAILED として残った後 24 時間で自動再投入される。即時リトライの可否と
-    # 自動再投入の可否は別の概念である（混同すると LLM の一時障害から復帰できない）。
+    # 即時リトライは repair 1 回で打ち切る（`不可`）。それでも FAILED として残るので、
+    # 次のデバイス接続で §15.2 の再評価にかかる。LLM の一時的な出力崩れから
+    # 永久に復帰できない経路は無い。
     ErrorCode.LLM_INVALID_JSON: ErrorSpec(_C.LLM, _R.NONE),
     ErrorCode.OBSIDIAN_NOT_FOUND: ErrorSpec(_C.OUTPUT, _R.ATTEMPTS),
     ErrorCode.OBSIDIAN_WRITE_FAILED: ErrorSpec(_C.OUTPUT, _R.ATTEMPTS),
@@ -192,20 +188,6 @@ def counts_against_max_attempts(code: ErrorCode) -> bool:
     「`SOURCE_DELETE_PENDING` は対象外」が自動的に満たされる。
     """
     return ERRORS[code].retry is RetryPolicy.ATTEMPTS
-
-
-def is_auto_retryable(code: ErrorCode) -> bool:
-    """`FAILED` の `auto_retry_failed_after_hours` 経過後の自動再投入の対象か（§15.2）。
-
-    **`retry` 列を見ない。**§15.1 の「可 / 不可」は*即時*リトライの可否であり、
-    24 時間後の自動再投入は §15.2 が名指しする対象外リストだけで決まる。
-    この 2 つは別の軸である。
-
-    この区別は `LLM_INVALID_JSON` で効く。即時リトライは repair 1 回で打ち切る（`不可`）が、
-    対象外リストに入っていないため翌日には自動で再投入される。`retry` 列で判定すると
-    LLM の一時的な出力崩れから永久に復帰できなくなる。
-    """
-    return not ERRORS[code].auto_retry_exempt
 
 
 def aborts_startup(code: ErrorCode) -> bool:

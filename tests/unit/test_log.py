@@ -1,6 +1,6 @@
 """`voicedock.log` が SPEC §16 と一致することを固定する。
 
-§16.2 の出力例 13 行と json 例 1 行は、**SPEC から読み出して 1 バイト単位で突き合わせる**。
+§16.2 の出力例 10 行と json 例 1 行は、**SPEC から読み出して 1 バイト単位で突き合わせる**。
 §16.3 の遮断（N-8）は、本文を渡しても出力に現れないことで確認する。
 """
 
@@ -23,27 +23,15 @@ JST = timezone(timedelta(hours=9))
 
 # §16.2 の text 例を再現するための引数。SPEC の行と 1 対 1 に対応する。
 TEXT_EXAMPLE_FIELDS: dict[str, dict[str, log.LogValue]] = {
-    "service_started": {"version": "3.2.0"},
-    "device_detected": {
-        "device_id": "DJIMIC3",
-        "source": "helper_inventory",
-        "writable": False,
-    },
-    "deep_scan_completed": {
-        "device_id": "DJI_MIC",
-        "files": 64,
-        "new_parts": 32,
-        "elapsed_s": 1.4,
-    },
+    "service_started": {"version": "0.1.0"},
     "part_discovered": {
         "recording_id": 42,
         "tx": "TX01",
         "mic": 2,
         "started_at": "2026-08-29T07:12:04+09:00",
         "duration": 1800.0,
-        "variants": 2,
     },
-    "session_opened": {"session_id": 12, "session_key": "DJI_MIC:20260829"},
+    "part_skipped": {"recording_id": 43, "reason": "variant_not_orig"},
     "normalize_completed": {
         "recording_id": 42,
         "in_bytes": 345600044,
@@ -66,7 +54,6 @@ TEXT_EXAMPLE_FIELDS: dict[str, dict[str, log.LogValue]] = {
         "bytes": 12844,
     },
     "source_delete_skipped": {"session_id": 12, "reason": "delete_source_audio_disabled"},
-    "session_completed": {"session_id": 12, "total_elapsed_s": 11592.0},
 }
 
 TS_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$")
@@ -157,7 +144,7 @@ def test_text_without_fields_has_no_trailing_space() -> None:
 
 def test_text_quotes_only_when_needed() -> None:
     line = _emit(
-        "session_opened",
+        "session_merged",
         {
             "session_key": "DJI_MIC:20260829",
             "reason": "a b",
@@ -176,12 +163,12 @@ def test_text_quotes_only_when_needed() -> None:
 
 
 def test_text_spells_bool_and_none_like_json() -> None:
-    line = _emit("device_detected", {"writable": False, "readable": True, "label": None})
+    line = _emit("helper_recovered", {"writable": False, "readable": True, "label": None})
     assert "writable=false readable=true label=null" in line
 
 
 def test_json_keeps_non_ascii_readable() -> None:
-    line = _emit("session_opened", {"reason": "日本語"}, fmt="json")
+    line = _emit("session_merged", {"reason": "日本語"}, fmt="json")
     assert '"reason":"日本語"' in line
 
 
@@ -316,11 +303,11 @@ def test_level_filtering() -> None:
     logger.debug("service_started")
     logger.info("service_started")
     assert buf.getvalue() == ""
-    logger.warning("device_unreadable")
-    logger.error("device_lost")
+    logger.warning("helper_heartbeat_stale")
+    logger.error("normalize_failed")
     assert buf.getvalue().count("\n") == 2
-    assert "WARNING device_unreadable" in buf.getvalue()
-    assert "ERROR device_lost" in buf.getvalue()
+    assert "WARNING helper_heartbeat_stale" in buf.getvalue()
+    assert "ERROR normalize_failed" in buf.getvalue()
 
 
 def test_level_column_is_five_wide() -> None:

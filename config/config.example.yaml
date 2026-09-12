@@ -18,8 +18,7 @@ device:
 
 # --- 音声 ---------------------------------------------------
 audio:
-  # 読み込む Variant。denoised | orig（もう一方は一度も読まない）
-  transcribe_variant: denoised
+  # 読み込むのは _orig のみ。denoised は取り込まない（§5.3）
   ffmpeg: /usr/bin/ffmpeg
   ffprobe: /usr/bin/ffprobe
   # whisper.cpp の入力要件。変更不可（§10.5）
@@ -163,11 +162,10 @@ cleanup:
 
 # --- リトライ（§15.2） ---------------------------------------
 retry:
-  max_attempts: 3
+  max_attempts: 3                # 1 工程あたりの試行回数（§15.2）
   backoff_seconds: [3, 10, 30]
-  # FAILED を自動で再投入するまでの時間。0 で無効（手動 retry のみ）
-  auto_retry_failed_after_hours: 24
-  auto_retry_max_rounds: 3
+  # FAILED はデバイス再接続とサービス起動で無条件に再評価する。
+  # タイマーもラウンド上限も持たない（§15.2）
 
 # --- ログ（§16） --------------------------------------------
 logging:
