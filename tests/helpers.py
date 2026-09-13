@@ -22,6 +22,7 @@ from voicedock.config import Config, parse_config
 REPO_ROOT = Path(__file__).parents[1]
 EXAMPLE_PATH = REPO_ROOT / "config" / "config.example.yaml"
 PROMPTS_ROOT = REPO_ROOT / "prompts"
+LLM_RESPONSES_ROOT = REPO_ROOT / "tests" / "fixtures" / "llm_responses"
 """§12.5 のプロンプト（コンテナでは `/app/prompts`、CI ではリポジトリ直下）。"""
 
 
@@ -99,3 +100,14 @@ def write_heartbeat(state_root: Path, **fields: Any) -> Path:
     path = state_root / "heartbeat.json"
     path.write_text(json.dumps(fields), encoding="utf-8")
     return path
+
+
+def llm_response(name: str) -> dict[str, Any]:
+    """`tests/fixtures/llm_responses/<name>.json` を読む（§20.2）。
+
+    **応答をテストの中に直書きしない。**§12.2 の項目が増えたときに直す場所が 1 つになる。
+    """
+    document: dict[str, Any] = json.loads(
+        (LLM_RESPONSES_ROOT / f"{name}.json").read_text(encoding="utf-8")
+    )
+    return document

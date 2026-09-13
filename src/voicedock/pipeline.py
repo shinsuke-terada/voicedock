@@ -25,11 +25,18 @@ from pydantic import BaseModel, ValidationError
 
 from voicedock import audio, daily, llm, paths, raw, session, transcribe, wiki
 from voicedock.config import Config
-from voicedock.db import Database, EntityType, Recording, Session
-from voicedock.errors import ErrorCode
+from voicedock.db import Database, EntityType, Recording, Session, TransitionConflict
+from voicedock.errors import ErrorCode, counts_against_max_attempts
 from voicedock.log import Logger
 from voicedock.paths import InboxPath, PartKey, SessionKey, StagingPath
-from voicedock.states import PART_RECOVERY, SESSION_RECOVERY, PartStatus, SessionStatus
+from voicedock.states import (
+    PART_RECOVERY,
+    PART_RETRYABLE_FROM_FAILED,
+    SESSION_RECOVERY,
+    SESSION_RETRYABLE_FROM_FAILED,
+    PartStatus,
+    SessionStatus,
+)
 
 
 class PartOutcome(StrEnum):
@@ -944,3 +951,161 @@ def process_session(runner: Pipeline, session_key: SessionKey) -> SessionOutcome
     `delete_sources_if_safe()` を呼ばないのは、**まだ無いから**であって順序の問題ではない。
     """
     return runner.process_session(session_key)
+
+
+# ============================================================
+# リトライ（§15.2）
+# ============================================================
+
+
+def retry_delay(attempt: int, cfg: Config) -> float | None:
+    """`attempt` 回目の失敗のあと待つ秒数（§15.2 の `backoff_seconds`）。
+
+    `attempt` は失敗の回数（`retry_count`）で、1 回目の失敗のあとは `backoff_seconds[0]` を
+    待つ。**`max_attempts` に達していれば `None`**（もう試さない）。
+
+    **リストが `max_attempts` より短いことは V-9 が起動時に弾く**ので、添字は必ず引ける。
+    """
+    if attempt < 1 or attempt >= cfg.retry.max_attempts:
+        return None
+    return float(cfg.retry.backoff_seconds[attempt - 1])
+
+
+def in_process_retry(
+    database: Database,
+    entity: EntityType,
+    key: str,
+    *,
+    cfg: Config,
+    now: datetime | None = None,
+) -> float | None:
+    """工程内リトライの可否と待機秒を返す（§15.2）。**状態は変えない。**
+
+    戻り値が `None` なら試さない。理由は 4 つある。
+
+    | 理由 | 判定 |
+    |---|---|
+    | `FAILED` ではない | 行の状態 |
+    | `max_attempts` に達した | `retry_count >= max_attempts` |
+    | **`ATTEMPTS` 以外のエラー** | §15.1 の「リトライ」列。契機を待つものは回さない |
+    | 戻り先が分からない | `events` に `FAILED` への遷移が無い |
+
+    **待つのは呼び手である。**`pipeline` は時間を持たない（テストが `sleep` を差し替える）。
+    """
+    row = _status_and_retry(database, entity, key)
+    if row is None:
+        return None
+    status, retry_count, error_code = row
+    if status != PartStatus.FAILED:
+        return None
+    if error_code is None or not _is_attempt_retryable(error_code):
+        # **契機待ちのものは工程内で回さない**（§15.1 / §15.2）。`DISK_SPACE_LOW` を
+        # 3 秒後に試し直しても空かない
+        return None
+    if _resume_target(database, entity, key) is None:
+        return None
+    return retry_delay(retry_count, cfg)
+
+
+def resume_failed(
+    database: Database,
+    entity: EntityType,
+    key: str,
+    *,
+    log: Logger,
+    reset_retry: bool,
+    now: datetime | None = None,
+) -> bool:
+    """`FAILED` を**直前の進行中状態**へ戻す（§9.3 / §15.2）。
+
+    **リトライは最初からやり直さない**（§15.2）。戻り先は `events` が持つ
+    「どの進行中状態から落ちたか」であり、§9.4 の再開規則が完了済みステップを飛ばす。
+
+    `reset_retry` が真なら `retry_count = 0`（**再評価**。デバイス再接続 / サービス起動）。
+    偽なら据え置き（**工程内リトライ**。`max_attempts` を効かせる）。
+    """
+    target = _resume_target(database, entity, key)
+    if target is None:
+        return False
+    try:
+        database.record_transition(
+            entity,
+            key,
+            from_status=PartStatus.FAILED,
+            to_status=target,
+            detail="requeue" if reset_retry else "retry",
+            reset_retry=reset_retry,
+            now=now,
+        )
+    except TransitionConflict:
+        # 別の経路が先に動かした。**握って次へ進む**（1 件で全体を止めない）
+        return False
+    return True
+
+
+def requeue_failed(database: Database, *, log: Logger, now: datetime | None = None) -> int:
+    """`FAILED` の Part / Session を `retry_count = 0` で再投入する（§15.2）。
+
+    **上限を持たないのは意図である。**v4.6 は 3 ラウンドを超えた行を「以降は自動で
+    触らない」状態に置いていたが、**原因が直っても人が手を動かすまで永久に戻らない。**
+    `retry` コマンドも v5.0 で削除したので、上限を残すと復帰経路が無くなる。
+
+    **時間を見ない。**`updated_at` も `backoff_seconds` も参照しない — 契機（呼ばれたこと）
+    そのものが判定である。
+    """
+    moved = 0
+    for entity in (EntityType.RECORDING, EntityType.SESSION):
+        for key, _count, _code in database.rows_with_status(entity, PartStatus.FAILED):
+            if resume_failed(database, entity, key, log=log, reset_retry=True, now=now):
+                moved += 1
+    if moved:
+        log.info("recovery_completed", requeued=moved)
+    return moved
+
+
+def delete_evaluation_delay(attempts: int, cfg: Config) -> float:
+    """`SAVED` で削除条件が偽のときの待機秒（§15.2 / §9.3）。
+
+    **5 秒ごとに実ファイル検証を繰り返すビジーループを避ける。**`delete_attempts` が
+    リストより大きくなったら最後の値を使い続ける（**無限に伸ばさない**）。
+
+    #36 の `cleaner.py` が使う。**ここに置くのは §15.2 の規定が 1 箇所に集まるようにする
+    ため**であり、削除そのものは行わない。
+    """
+    backoff = cfg.cleanup.delete_evaluation_backoff_seconds
+    if not backoff:
+        return 0.0
+    index = min(max(attempts, 1), len(backoff)) - 1
+    return float(backoff[index])
+
+
+def _status_and_retry(
+    database: Database, entity: EntityType, key: str
+) -> tuple[str, int, str | None] | None:
+    row = database.conn.execute(
+        f"SELECT status, retry_count, error_code FROM {entity.table} "  # noqa: S608
+        f"WHERE {entity.key_column} = ?",
+        (key,),
+    ).fetchone()
+    return None if row is None else (row["status"], row["retry_count"], row["error_code"])
+
+
+def _is_attempt_retryable(error_code: str) -> bool:
+    """§15.1 の「リトライ」列が `ATTEMPTS` か。**未知のコードは偽**（安全側）。"""
+    try:
+        return counts_against_max_attempts(ErrorCode(error_code))
+    except ValueError:
+        return False
+
+
+def _resume_target(database: Database, entity: EntityType, key: str) -> str | None:
+    """`FAILED` からの戻り先（§9.3 の 2 行）。**戻れない状態なら `None`。**"""
+    origin = database.failed_from(entity, key)
+    if origin is None:
+        return None
+    allowed = (
+        PART_RETRYABLE_FROM_FAILED
+        if entity is EntityType.RECORDING
+        else SESSION_RETRYABLE_FROM_FAILED
+    )
+    return origin if origin in {status.value for status in allowed} else None
