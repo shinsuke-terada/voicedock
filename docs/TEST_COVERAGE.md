@@ -54,8 +54,8 @@
 | 偽 inbox / 偽ボリュームの組み立て | `tests/unit/test_fake_tree.py` `tests/unit/test_make_wav.py` |
 | ホスト側 doctor（§19.2 の DH 表 5 件） | `tests/unit/test_doctor_host.py`（`docker` / `launchctl` は `PATH` の偽物に差し替える） |
 | 削除禁止 ND-01〜17 / 21〜23 / 30 / 31（コンテナ層。§20.4） | `tests/unit/test_no_delete.py`（CI の `no-delete` job で必須） |
-| 削除禁止 ND-18〜20 / 24〜29（reaper 層。§20.4） | #54 |
-| reaper 本体（§20.4） | #54 |
+| 削除禁止 ND-18〜20 / 24〜29（reaper 層。§20.4） | `tests/unit/test_reaper.py`（CI の `no-delete` job で必須） |
+| reaper 本体（§14.1.1 の 12 項目） | `tests/unit/test_reaper.py` `tests/unit/test_helper_portability.py` |
 
 > **統合テストは `needs_ffmpeg` が付いている。**§10.5 の変換は本物の ffmpeg が要るので、
 > CI では自動 skip され `make test`（コンテナ内）で走る。**ffmpeg を偽物にしてはならない** —
