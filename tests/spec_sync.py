@@ -142,6 +142,24 @@ def spec_body_event_mentions() -> dict[str, list[int]]:
     return found
 
 
+def spec_tree_modules() -> set[str]:
+    """§6 の木が列挙している `src/voicedock/` のモジュール名（`.py` を除く）。
+
+    **木は「どこに何があるか」の唯一の索引である。**古いと読み手が存在しないファイルを
+    探す。v5.3 まで 6 モジュール（`heartbeat` / `discover` / `raw` / `wiki` / `status` /
+    `health`）が載っていなかった（v5.3→v5.4 の変更 P-3）。
+
+    **`src/voicedock/` の範囲に限って拾う。**木には `tests/` や `poc/` の `.py` も
+    並ぶので、全体から正規表現で集めると別の層のファイルが混ざる。
+    """
+    text = spec_text()
+    start = text.index("## 6. ")
+    block = text[start : text.index("## 7. ", start)]
+    src_start = block.index("voicedock/")
+    src_block = block[src_start : block.index("config/", src_start)]
+    return set(re.findall(r"([a-z_]+)\.py", src_block))
+
+
 def spec_subcommands() -> list[str]:
     """§17.1 の 1 つめの表（残すサブコマンド）から名前を出現順に返す。
 
