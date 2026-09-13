@@ -1,7 +1,10 @@
 # ============================================================
 # Stage 1: whisper.cpp のビルド（SPEC §18.3）
 # ============================================================
-FROM debian:bookworm-slim AS whisper-builder
+# **base image は digest で固定する**（§18.5）。`latest` / `master` / `main` への
+# 無条件依存を禁止し、更新は手動 PR としてのみ行う。tag を併記するのは人が読むためで、
+# **解決に使われるのは digest だけ**である。
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS whisper-builder
 
 ARG WHISPER_CPP_REF=v1.9.4
 
@@ -25,7 +28,7 @@ RUN cmake -B build \
 # ============================================================
 # Stage 2: runtime（本番イメージ）
 # ============================================================
-FROM python:3.12-slim-bookworm AS runtime
+FROM python:3.12-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254 AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg ca-certificates tini \
