@@ -154,23 +154,53 @@ def test_the_host_checks_are_five_rows(host: dict[str, Path]) -> None:
     assert len(rows(result.stdout)) == 5, result.stdout
 
 
+LABELS: tuple[str, ...] = (
+    "Virtualization",
+    "Compose config",
+    "Helper config",
+    "LaunchAgent",
+    "Compose safety",
+)
+"""DH の 5 行のラベル。**順序も §19.2 の実行順（DH-1 → 10 → 13 → 12 → 15）である。**"""
+
+
 def test_the_row_format_matches_the_spec(host: dict[str, Path]) -> None:
     """`[<記号>] <ラベル（21 桁左詰め）><詳細>`（§19.2）。
 
     **`doctor.py` と同じ桁で出す。**片方だけ変えると 17 行が揃わない。
+
+    **詳細が始まる桁を直接見る。**「ラベルを切り出して右端を詰めたら同じ」だけだと、
+    桁をずらしても詰め直した結果が一致してしまい**通る**（意図的に壊して確かめたら
+    実際に通った）。
     """
     from voicedock.doctor import DETAIL_INDENT, LABEL_WIDTH, SEPARATOR
 
     result = run(host)
-    for line in rows(result.stdout):
+    printed = rows(result.stdout)
+    assert [_label_of(line) for line in printed] == list(LABELS), printed
+
+    for line in printed:
         assert line[3] == " ", line
-        label = line[4 : 4 + LABEL_WIDTH]
-        assert label == label.rstrip().ljust(LABEL_WIDTH), line
+        label = _label_of(line)
+        padding = line[4 + len(label) : 4 + LABEL_WIDTH]
+        assert padding == " " * (LABEL_WIDTH - len(label)), f"ラベルの桁が違う: {line!r}"
+        detail_at = 4 + LABEL_WIDTH
+        assert line[detail_at] != " ", f"詳細が {detail_at} 桁目から始まらない: {line!r}"
+
     assert SEPARATOR in result.stdout
     continuation = [
         line for line in result.stdout.splitlines() if line.startswith(" " * DETAIL_INDENT)
     ]
     assert continuation, "続き行が 1 つも無い"
+    for line in continuation:
+        assert line[DETAIL_INDENT] != " ", f"続き行のインデントが違う: {line!r}"
+
+
+def _label_of(line: str) -> str:
+    for label in LABELS:
+        if line[4:].startswith(label):
+            return label
+    raise AssertionError(f"未知のラベル: {line!r}")
 
 
 def test_the_summary_counts_the_rows(host: dict[str, Path]) -> None:
@@ -422,3 +452,35 @@ def test_the_removed_host_checks_stay_removed(removed: str) -> None:
     足すなら §19.2 の表を先に直すこと。
     """
     assert removed not in spec_dh_ids()
+
+
+def test_the_doctor_writes_nothing(host: dict[str, Path]) -> None:
+    """**検査のみを行い、ホスト設定は変更しない**（§19.2）。**静的に見る。**
+
+    実行して差分が無いことを見るだけでは足りない。`rm -f` は対象が無ければ何も
+    変えないので、**削除を書き足しても通ってしまう**（意図的に壊して確かめたら
+    実際に通った）。
+
+    v3.1 は `setup.sh` と `doctor.sh` に同じ検査を二重に書き、片方だけ更新して
+    食い違う事故を起こした。**doctor が設定を直せるようにすると、また同じ形になる。**
+    """
+    body = DOCTOR.read_text(encoding="utf-8")
+    lines = [re.sub(r"(^|\s)#.*$", "", line) for line in body.splitlines()]
+
+    forbidden = {
+        "rm": r"\brm\b",
+        "mv": r"\bmv\b",
+        "mkdir": r"\bmkdir\b",
+        "chmod / chown": r"\bch(mod|own)\b",
+        "defaults write": r"\bdefaults\s+write\b",
+        "launchctl の load / bootstrap": r"\blaunchctl\s+(load|unload|bootstrap|bootout)\b",
+        "diskutil": r"\bdiskutil\b",
+        "docker compose up / down": r"\bcompose\s+(up|down|restart)\b",
+        "tee": r"\btee\b",
+        # `>/dev/null` と、文字列中の `Settings > General` は除く。
+        # **行き先がパス（`/` か `$` 始まり）のものだけを拾う**
+        "ファイルへのリダイレクト": r"(?<![0-9<>])>>?\s*(?!/dev/)[\"']?[$/]",
+    }
+    for label, pattern in forbidden.items():
+        offenders = [line.strip() for line in lines if re.search(pattern, line)]
+        assert offenders == [], f"doctor.sh がホストを変更しうる（{label}）: {offenders}"
