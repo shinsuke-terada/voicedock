@@ -3733,8 +3733,14 @@ docker compose exec voicedock voicedock <subcommand> [options]
 > すべて持っているので、必要なときは SQL で読む。**CLI に整形表示を持つと、列を増やすたびに
 > §17.2 の出力例と実装の二重管理になる。**
 >
+> **`sqlite3` CLI は使わない。**runtime イメージに入っていない（§18.3 は必要なものだけを
+> 入れる）。**v5.13 まで本節は `sqlite3 -box` と書いており、そのとおり打つと
+> `executable file not found` になった**（2026-09-14 に実機で踏んだ）。
+> `python -m sqlite3` は Python 3.12 標準の対話シェルであり、**追加の依存が要らない**
+> （SQLite を標準ライブラリで使うという §8 の方針と揃う）。
+>
 > ```bash
-> docker compose exec voicedock sqlite3 -box /data/voicedock.db \
+> docker compose exec voicedock python -m sqlite3 /data/voicedock.db \
 >   "SELECT created_at, entity_type, entity_key, from_status, to_status, error_code
 >      FROM events ORDER BY id DESC LIMIT 20;"
 > ```

@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -137,6 +138,53 @@ def test_every_scenario_has_a_procedure(scenario: str) -> None:
     assert re.search(rf"^### 3\.\d+ {re.escape(scenario)} — ", body, re.M), (
         f"{scenario} の手順の節が無い"
     )
+
+
+# --- 手順が呼ぶプログラムがイメージに在ること ----------------------------
+
+# `docker compose exec voicedock <プログラム>` の <プログラム>。
+# **`docker` の引数（`-T` など）は拾わない**ので `voicedock` の直後だけを見る
+EXEC_PROGRAM = re.compile(r"docker compose exec (?:-\S+ )*voicedock ([a-z][\w.-]*)")
+
+
+def test_the_extraction_finds_the_program() -> None:
+    """陽性対照。**先に検査自体を確かめる。**"""
+    assert EXEC_PROGRAM.findall("docker compose exec voicedock python -m sqlite3 /data/x.db") == [
+        "python"
+    ]
+    assert EXEC_PROGRAM.findall("docker compose exec voicedock voicedock status") == ["voicedock"]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [E2E_PATH, POC_PATH, REPO_ROOT / "README.md", REPO_ROOT / "docs" / "SPEC.md"],
+    ids=lambda p: p.name,
+)
+def test_every_documented_program_exists_in_the_image(path: Path) -> None:
+    """**手順が呼ぶプログラムがイメージに在ること。**
+
+    §17.1 は `history` / `show` を削った代替として `events` を SQL で読む手順を載せている。
+    **v5.13 まで `sqlite3 -box` と書いてあり、そのとおり打つと
+    `executable file not found` になった**（2026-09-14 に実機で踏んだ）。
+    runtime イメージに `sqlite3` CLI は入っていない。
+
+    **`dev` は `FROM runtime` なので、ここで見つからないものは本番にも無い。**
+    """
+    if not path.is_file():
+        pytest.skip(f"{path.name} がマウントされていない")
+    programs = sorted(set(EXEC_PROGRAM.findall(path.read_text(encoding="utf-8"))))
+    missing = [name for name in programs if shutil.which(name) is None]
+    assert missing == [], (
+        f"{path.relative_to(REPO_ROOT)}: イメージに無いプログラムを手順が呼んでいる {missing}"
+    )
+
+
+def test_the_check_would_catch_a_missing_program() -> None:
+    """陽性対照。**`sqlite3` CLI が無いことを確かめる** — 在るなら検査が意味を失う。"""
+    assert shutil.which("sqlite3") is None, (
+        "sqlite3 CLI がイメージに入った。手順を戻してよいか §18.3 と照らして判断すること"
+    )
+    assert shutil.which("python") is not None
 
 
 # --- 手順が参照するスクリプトが実在すること ------------------------------
