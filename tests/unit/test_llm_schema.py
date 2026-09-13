@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from tests.helpers import PROMPTS_ROOT
 from tests.spec_sync import spec_section_code, spec_text
 from voicedock import llm
 from voicedock.config import Config
@@ -28,8 +29,12 @@ from voicedock.llm import (
     system_prompt,
 )
 
-PROMPTS_ROOT = Path("/app/prompts")
-"""コンテナ内のプロンプト置き場（`compose.yaml` / `Makefile` が bind mount する）。"""
+"""プロンプト置き場は `tests.helpers.PROMPTS_ROOT` を使う。
+
+**絶対パスを書いてはならない。**コンテナでは `/app/prompts`、CI ではリポジトリ直下で、
+`Path("/app/prompts")` と書くと **`make test` は通るのに CI だけが落ちる**（実際に落ちた）。
+`REPO_ROOT` から導けばどちらでも解決する。
+"""
 
 
 @pytest.fixture
