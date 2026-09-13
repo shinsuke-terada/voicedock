@@ -212,7 +212,7 @@ def collect(
     return Snapshot(
         helper=_helper_text(beat, cfg, moment),
         devices=inventory,
-        device_free=_bytes_text(beat.device_free_bytes if beat else None),
+        device_free=_free_space_text(state_root),
         inbox=_inbox_text(cfg),
         delete_queue=_queue_text(),
         locks=Locks(
@@ -400,14 +400,20 @@ def _free_disk_text(cfg: Config) -> str:
     return f"{free / GIB:.1f} GiB"
 
 
-def _bytes_text(value: int | None) -> str:
-    """**`heartbeat.json` に項目が無ければ `unknown`。**
+def _free_space_text(state_root: Path) -> str:
+    """§17.2 の `Device free space` 行。`inventory.json` の `device_free_bytes`（§7.5）。
 
-    §17.2 は `Device free space` を出すと書いているが、§7.5 の表にその項目が無く
-    `voicedock-ingest` も書いていない。**コンテナはデバイスに到達できない**（N-3）ので
-    自分で測る経路は作らない。§7.5 への追加は後続 PR。
+    **デバイスごとに出す。**複数のデバイスが同時に接続されうる（§5.4 の同名衝突の注記が
+    前提にしている）ので、1 つの数では表せない。**コンテナはデバイスに到達できない**
+    （§14.4 N-3）ため、Helper が報告しなければ `unknown` である。
     """
-    return UNKNOWN if value is None else f"{value / GIB:.1f} GiB"
+    found = read_inventory(state_root)
+    if found is None or not found.free_bytes:
+        return UNKNOWN
+    return ", ".join(
+        f"{device_id} {value / GIB:.1f} GiB"
+        for device_id, value in sorted(found.free_bytes.items())
+    )
 
 
 # --- 整形（§17.2） ------------------------------------------------------
