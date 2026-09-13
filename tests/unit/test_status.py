@@ -98,7 +98,11 @@ def session_row(database: Database, *, state: str = SessionStatus.OPEN) -> None:
 
 
 def write_inventory(
-    state_root: Path, *, devices: dict[str, list[str]], readonly: bool = True
+    state_root: Path,
+    *,
+    devices: dict[str, list[str]],
+    readonly: bool = True,
+    free_bytes: dict[str, int] | None = None,
 ) -> None:
     """§7.5 の `inventory.json`。**コンテナの唯一のデバイス視界**である。"""
     state_root.mkdir(parents=True, exist_ok=True)
@@ -108,6 +112,7 @@ def write_inventory(
                 "schema": 1,
                 "generated_at": NOW.isoformat(),
                 "mount_readonly": readonly,
+                "device_free_bytes": free_bytes or {},
                 "devices": devices,
             }
         ),
@@ -421,19 +426,32 @@ def test_the_inbox_counts_wav_files_only(cfg: Config, state_root: Path) -> None:
 
 
 def test_device_free_space_is_unknown_without_the_field(cfg: Config, state_root: Path) -> None:
-    """**`heartbeat.json` にその項目が無ければ `unknown`。**
+    """**`inventory.json` に項目が無ければ `unknown`**（§7.5 / §17.2）。
 
-    §17.2 は `Device free space` を出すと書いているが、§7.5 の表に項目が無く
-    `voicedock-ingest` も書いていない。**コンテナはデバイスに到達できない**（N-3）ので
-    自分で測る経路は作らない。
+    **コンテナはデバイスに到達できない**（N-3）ので、自分で測る経路は作らない。
     """
-    write_heartbeat(state_root, updated_at=NOW.isoformat())
+    write_inventory(state_root, devices={DEVICE: []})
     assert row_value(text(cfg, state_root), "Device free space") == status.UNKNOWN
 
 
 def test_device_free_space_is_shown_when_reported(cfg: Config, state_root: Path) -> None:
-    write_heartbeat(state_root, updated_at=NOW.isoformat(), device_free_bytes=int(4.2 * 1024**3))
-    assert row_value(text(cfg, state_root), "Device free space") == "4.2 GiB"
+    write_inventory(state_root, devices={DEVICE: []}, free_bytes={DEVICE: int(4.2 * 1024**3)})
+    assert row_value(text(cfg, state_root), "Device free space") == f"{DEVICE} 4.2 GiB"
+
+
+def test_device_free_space_lists_every_device(cfg: Config, state_root: Path) -> None:
+    """**デバイスごとに出す。**複数が同時に接続されうる（§5.4 の同名衝突の注記）。
+
+    1 つの数では表せないので、`heartbeat.json`（Helper 1 つの状態）ではなく
+    `inventory.json`（デバイスごと）に置いた（v5.3→v5.4 の変更 P-2）。
+    """
+    write_inventory(
+        state_root,
+        devices={DEVICE: [], "NO NAME": []},
+        free_bytes={DEVICE: 4 * 1024**3, "NO NAME": 1024**3},
+    )
+    value = row_value(text(cfg, state_root), "Device free space")
+    assert value == f"{DEVICE} 4.0 GiB, NO NAME 1.0 GiB"
 
 
 def test_the_delete_queue_is_counted(cfg: Config, state_root: Path) -> None:

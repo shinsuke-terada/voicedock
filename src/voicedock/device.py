@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, tzinfo
 from pathlib import Path, PurePosixPath
 from typing import Final, Literal
@@ -141,6 +141,14 @@ class DeviceInventory:
 
     devices: dict[str, frozenset[DevicePath]]
 
+    free_bytes: dict[str, int] = field(default_factory=dict)
+    """デバイスごとの空き容量（§7.5 / §17.2）。**表示だけに使う。**
+
+    **`heartbeat.json` ではなくここに在る。**値がデバイスごとに決まるのに対し
+    `heartbeat.json` は Helper 1 つの状態を表す（v5.3→v5.4 の変更 P-2）。
+    Helper が報告しなければ欠ける（**コンテナはデバイスに到達できない。**§14.4 N-3）。
+    """
+
     def is_connected(self, device_id: str) -> bool:
         """そのデバイスが現在接続されているか（§10.12）。
 
@@ -195,6 +203,16 @@ def read_inventory(state_root: Path = DEFAULT_STATE_ROOT) -> DeviceInventory | N
     if not isinstance(mount_readonly, bool):
         mount_readonly = None
 
+    free_bytes: dict[str, int] = {}
+    raw_free = document.get("device_free_bytes")
+    if isinstance(raw_free, dict):
+        for device_id, value in raw_free.items():
+            # **`bool` は数値として採らない**（Python では `int` の一種である）
+            if isinstance(value, bool) or not isinstance(value, int):
+                continue  # **`bool` は数値として採らない**（Python では `int` の一種）
+            if isinstance(device_id, str):
+                free_bytes[device_id] = value
+
     devices: dict[str, frozenset[DevicePath]] = {}
     raw_devices = document.get("devices")
     if isinstance(raw_devices, dict):
@@ -206,7 +224,10 @@ def read_inventory(state_root: Path = DEFAULT_STATE_ROOT) -> DeviceInventory | N
             )
 
     return DeviceInventory(
-        generated_at=generated_at, mount_readonly=mount_readonly, devices=devices
+        generated_at=generated_at,
+        mount_readonly=mount_readonly,
+        devices=devices,
+        free_bytes=free_bytes,
     )
 
 
