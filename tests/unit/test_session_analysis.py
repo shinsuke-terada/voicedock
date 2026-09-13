@@ -199,7 +199,9 @@ def test_a_ready_session_reaches_analyzed(
     add_part(database)
     stub_analysis(monkeypatch, cfg)
     assert runner.process_session(SESSION_KEY) is SessionOutcome.SAVED
-    assert status_of(database) == SessionStatus.SAVED
+    # **削除が無効なので `SAVED → CLEANUP → COMPLETED` まで進む**（§9.3 / §14.3）。
+    # 元音声はデバイスに残ったままである
+    assert status_of(database) == SessionStatus.COMPLETED
 
 
 def test_failed_and_skipped_parts_are_excluded(
@@ -517,6 +519,9 @@ def test_every_transition_is_recorded(
         (SessionStatus.ANALYZING, SessionStatus.ANALYZED),
         (SessionStatus.ANALYZED, SessionStatus.WRITING),
         (SessionStatus.WRITING, SessionStatus.SAVED),
+        # `delete_source_audio: false` の経路（§9.3 の `SAVED` 行）
+        (SessionStatus.SAVED, SessionStatus.CLEANUP),
+        (SessionStatus.CLEANUP, SessionStatus.COMPLETED),
     ]
 
 
