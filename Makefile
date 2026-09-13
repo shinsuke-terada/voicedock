@@ -43,6 +43,7 @@ test:
 	  -v "$(CURDIR)/docs:/app/docs:ro" \
 	  -v "$(CURDIR)/config:/app/config:ro" \
 	  -v "$(CURDIR)/helper:/app/helper:ro" \
+	  -v "$(CURDIR)/prompts:/app/prompts:ro" \
 	  -v "$(CURDIR)/compose.yaml:/app/compose.yaml:ro" \
 	  voicedock:dev pytest -q
 
