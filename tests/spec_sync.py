@@ -330,6 +330,59 @@ def spec_retry_reset_statuses() -> set[str]:
 _TRANSITION_SKIP_SOURCES: Final = frozenset({"現状態", "---", "—", "各工程通過"})
 
 
+def spec_retry_settings() -> dict[str, object]:
+    """§15.2 冒頭の `retry:` ブロック（`max_attempts` / `backoff_seconds`）。
+
+    **`config.example.yaml` との一致は V-* が見ているが、規定そのものは §15.2 にある。**
+    ここを読むことで「SPEC の数字を変えたのにテストが通る」を防ぐ。
+    """
+    document = yaml.safe_load(spec_section_code("15.2", "yaml"))
+    if not isinstance(document, dict) or "retry" not in document:
+        pytest.fail("SPEC §15.2 の retry ブロックを読み取れませんでした")
+    retry = document["retry"]
+    if not isinstance(retry, dict):
+        pytest.fail("SPEC §15.2 の retry ブロックが辞書ではありません")
+    return retry
+
+
+def spec_delete_evaluation_backoff() -> list[int]:
+    """§15.2 の `delete_evaluation_backoff_seconds`（`SAVED` の再評価間隔）。"""
+    matched = re.search(
+        r"`cleanup\.delete_evaluation_backoff_seconds`（`\[([\d, ]+)\]`）", _section("15.2")
+    )
+    if matched is None:
+        pytest.fail("SPEC §15.2 の delete_evaluation_backoff_seconds を読み取れませんでした")
+    return [int(value) for value in matched.group(1).split(",")]
+
+
+def spec_max_attempts_exempt_codes() -> set[str]:
+    """§15.2 が「`max_attempts` の対象外」と名指しするエラーコードと状態。
+
+    **工程内リトライで回してはならないもの**であり、契機（Helper の復帰 / デバイスの
+    再接続）を待って無期限に再評価する。
+    """
+    codes: set[str] = set()
+    for line in _section("15.2").splitlines():
+        head, marker, _ = line.partition("は `max_attempts` の対象外")
+        if marker:
+            codes.update(re.findall(r"`([A-Z_]+)`", head))
+    if not codes:
+        pytest.fail("SPEC §15.2 の max_attempts 対象外を読み取れませんでした")
+    return codes
+
+
+def spec_retry_count_is_unchanged_on_retry() -> list[str]:
+    """§9.3 の「工程内リトライ」行が `retry_count` をどう書いているか（S-1）。
+
+    **増やす場所は `FAILED` への遷移だけである。**両方で増やすと二重に数え、
+    `max_attempts: 3` で実際には 4 回試すことになる。
+    """
+    found = re.findall(r"^\| `FAILED` \| 工程内リトライ \|.*\| (.*?) \|$", spec_text(), re.M)
+    if len(found) != 2:
+        pytest.fail(f"§9.3 の工程内リトライ行が 2 行ありません（{len(found)} 行）")
+    return found
+
+
 def spec_states(section: str) -> list[str]:
     """§9.1 / §9.2 の状態表から状態名を出現順に返す。"""
     found = re.findall(r"^\| `([A-Z_]+)` \|", _section(section), re.M)
