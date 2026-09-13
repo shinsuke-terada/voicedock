@@ -211,8 +211,47 @@ conf_value() {
 }
 
 conf_array() {
-    # `NAME=("a" "b")` の中身を 1 行で。**bash 3.2 に連想配列は無い**ので文字列で扱う
-    sed -n "s/^[[:space:]]*$2=(\(.*\))[[:space:]]*$/\1/p" "$1" | tail -1
+    # `NAME=("a" "b")` の中身を 1 行で。**bash 3.2 に連想配列は無い**ので文字列で扱う。
+    #
+    # **1 行形式と複数行形式の両方を読む。**`helper.example.conf`（§7.4 の規範ブロック）は
+    #
+    #     EXCLUDE_VOLUMES=(
+    #       "Macintosh HD"
+    #       ...
+    #     )
+    #
+    # と**複数行で書かれており、`install.sh` はそれをそのまま配る。**1 行形式だけを
+    # 読んでいた頃は **DH-13 が実機で常に `(none)` と表示していた** — ingest は
+    # ちゃんと効かせているのに、**デバイスが検出されないときに真っ先に見る欄が嘘をつく。**
+    #
+    # 値の中に `)` を含む場合はそこで切れる。ボリューム名に `)` は使わない前提である。
+    awk -v name="$2" '
+        BEGIN { inside = 0; out = "" }
+        {
+            line = $0
+            sub(/^[ \t]+/, "", line)
+            if (substr(line, 1, 1) == "#") next
+            if (inside == 0) {
+                if (substr(line, 1, length(name) + 2) != name "=(") next
+                line = substr(line, length(name) + 3)
+                inside = 1
+                buf = ""
+            }
+            p = index(line, ")")
+            if (p > 0) {
+                buf = buf " " substr(line, 1, p - 1)
+                out = buf
+                inside = 0
+            } else {
+                buf = buf " " line
+            }
+        }
+        END {
+            gsub(/[ \t]+/, " ", out)
+            sub(/^ /, "", out); sub(/ $/, "", out)
+            print out
+        }
+    ' "$1"
 }
 
 # --- DH-12: LaunchAgent（§19.2） ---------------------------------------

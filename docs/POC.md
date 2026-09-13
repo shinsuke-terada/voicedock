@@ -461,34 +461,137 @@ P0-6 / P0-7 / P0-9 が問うていた前提そのものが無くなった。**�
 ---
 
 ## 10. DJI Mic 3 実機 残り（#3 で記入）
-
-**`./scripts/probe.sh` を実機で 1 回叩き、出力をこの節へそのまま貼る。**
-§0 の記録の規約どおり、要約した数値だけを書かない。
-
-```bash
-./helper/install.sh              # #53。まだなら
-# DJI を USB 接続する（launchd の StartOnMount で ingest が走る）
-./scripts/probe.sh > /tmp/probe-ro.md
-```
-
-**P0-8 は probe が機械判定する。**`mount` の read-only と `heartbeat.json` の
-`mount_readonly` が食い違えば `✗` を出し、**終了コードが非 0 になる。**
-一致しないなら実装のバグであり、**その場で採り直しても直らない。**
-
 | # | 項目 | 判定 | 根拠 |
 |---|---|---|---|
-| P0-8 | `MOUNT_MODE=ro` で `mount` が read-only、`heartbeat.json` が `mount_readonly: true`。**両者が一致する** | ⬜ 未実施 | |
+| P0-8 | `MOUNT_MODE=ro` で `mount` が read-only、`heartbeat.json` が `mount_readonly: true`。**両者が一致する** | ✅ **PASS** | §10.1。`probe.sh` が機械判定し EXIT=0 |
 | P0-8b | `MOUNT_MODE=rw` で read-write になり `mount_readonly: false` になる | ⬜ 未実施 | |
-| P0-10 | 送信機 2 台の見え方。2 個なら `inventory.json` の `devices` が 2 エントリ | ⬜ 未実施 | |
-| P0-11 | 録音中ファイルの mtime の進み方。`STABILITY_*` の既定が実挙動に合うか | ⬜ 未実施 | |
+| P0-10 | 送信機 2 台の見え方。2 個なら `inventory.json` の `devices` が 2 エントリ | ⚠ 1 台のみ | §10.1。2 台同時は未検証 |
+| P0-11 | 録音中ファイルの mtime の進み方。`STABILITY_*` の既定が実挙動に合うか | ⚠ 静止のみ | §10.1。**録音中のファイルでは未検証** |
 | P0-12 | 受信機（RX）側にもストレージが見えるか（任意。R-7 へ記録するだけ） | ⬜ 未実施 | |
-| P0-13 | `_orig` 保存をオフにできるか。**denoised が生成される設定があるか**（R-28） | ⬜ 未実施 | |
+| P0-13 | `_orig` 保存をオフにできるか。**denoised が生成される設定があるか**（R-28） | ✅ **denoised 無し** | §10.1。2 件とも `_orig` のみ |
 | P0-14 | バッテリー交換・充電で中断したときのファイルの分かれ方（§13.4 の Block） | ⬜ 未実施 | |
-| P0-15 | 64 ファイルでの ingest 1 回の所要時間。`StartInterval`（300 秒）で間に合うか | ⬜ 未実施 | |
+| P0-15 | 64 ファイルでの ingest 1 回の所要時間。`StartInterval`（300 秒）で間に合うか | ⚠ 2 件で 0.84 秒 | §10.1。64 ファイルは未検証 |
 
-### 10.1 `ro` での採取
+### 10.0 TCC — リムーバブルボリュームへのアクセス（**最初に踏む壁**）
 
-⬜ 未実施。`./scripts/probe.sh` の出力を貼る。
+**DJI を接続しても `volume_skipped reason=no DJI recordings` が出続けた。**
+実際は macOS の TCC がボリュームの列挙を拒んでいた。
+
+```text
+$ mount | grep -i djimic3
+/dev/disk4 on /Volumes/DJIMIC3 (msdos, local, nodev, nosuid, noowners, noatime, fskit)
+
+$ [ -r /Volumes/DJIMIC3 ] && echo "-r: true"
+-r: true                                    ← 規則 4 は通る
+
+$ find /Volumes/DJIMIC3 -maxdepth 1 >/dev/null 2>&1; echo $?
+1                                           ← 実際は列挙できない
+
+$ ls -la /Volumes/DJIMIC3
+ls: /Volumes/DJIMIC3: Operation not permitted
+```
+
+**`[ -r ]` は TCC の拒否を見抜けない**（`access(2)` は成功し `opendir(3)` で初めて `EPERM`）。
+そのため規則 5 の glob が空になり、**権限が無いのに「録音が無い」と報告していた。**
+v5.12（Z-1 / Z-2）で §3.4(7) を足し、理由を区別するようにした。
+
+**ターミナルへの許可と LaunchAgent への許可は別である。**フルディスクアクセスに
+ターミナルアプリを追加した後の実測:
+
+```text
+（ターミナルから手動実行）
+2026-09-14T00:43:18+09:00 INFO  device_detected name=DJIMIC3
+2026-09-14T00:43:19+09:00 INFO  remounted_readonly name=DJIMIC3
+2026-09-14T00:43:19+09:00 INFO  scanned name=DJIMIC3 files=2 candidates=2
+2026-09-14T00:43:19+09:00 INFO  copied relpath=TX_MIC001_20260912_163444/TX00_MIC001_20260912_163444_orig.wav bytes=856456
+2026-09-14T00:43:19+09:00 INFO  copied relpath=TX_MIC001_20260912_163444/TX00_MIC002_20260913_233420_orig.wav bytes=2963176
+2026-09-14T00:43:19+09:00 INFO  ingest_finished devices=1
+
+（launchctl kickstart -k gui/$UID/com.voicedock.ingest）
+2026-09-14T00:44:52+09:00 INFO  volume_skipped name=DJIMIC3 reason=volume not listable — macOS のプライバシー設定を確認してください（§3.4(7)）
+2026-09-14T00:44:52+09:00 INFO  ingest_finished devices=0
+```
+
+> **`voicedock-ingest` はシェルスクリプトである。**TCC の許可対象としてスクリプトを
+> 登録できるかは未確認。**Helper の配備方式に関わる論点**なので #95 に残す。
+
+**副作用として `heartbeat.json` が上書きされる。**列挙できない実行でも Helper は
+`mount_readonly: false` を書くため、**直前の成功した採取が 300 秒以内に消える。**
+`probe.sh` を「接続したらまず叩く」と定めているのはこのためである（§10.2 の註記）。
+
+### 10.1 `ro` での採取（P0-8 / P0-10 / P0-11 / P0-13 / P0-15）
+
+**`./scripts/probe.sh` の出力**（2026-09-14 00:43:19 の ingest 直後。EXIT=0）:
+
+```text
+## P0-8 マウントモードと heartbeat の一致
+
+- `helper.conf` の `MOUNT_MODE` : `ro`
+- `heartbeat.json` の `mount_readonly` : `true`
+- `heartbeat.json` の `updated_at` : `2026-09-14T00:43:19+09:00`
+
+| デバイス | `mount` | 読み取り専用 |
+|---|---|---|
+| `DJIMIC3` | `/dev/disk4 on /Volumes/DJIMIC3 (msdos, local, nodev, nosuid, read-only, noowners, noatime, fskit)` | true |
+
+- `mount` からの観測 : `true`（デバイス 1 個の論理積）
+- 判定: ✅ **PASS** — 一致した（ロック 2-B が実際に効いている。§14.2）
+
+## P0-10 デバイスの見え方
+
+- `inventory.json` の `devices` : **1 個**
+
+| デバイス | 録音 | 空き容量 | `df -Pk` |
+|---|---|---|---|
+| `DJIMIC3` | 2 | 30017847296 | `/dev/disk4    29344000 29696  29314304     1%    /Volumes/DJIMIC3` |
+
+## P0-11 安定性判定
+
+- `STABILITY_FAST_PATH_SECONDS` : `60`
+- `STABILITY_INTERVAL_SECONDS`  : `3`
+- `STABILITY_CHECKS`            : `2`
+
+対象: `/Volumes/DJIMIC3/TX_MIC001_20260912_163444/TX00_MIC002_20260913_233420_orig.wav`
+
+| # | size mtime |
+|---|---|
+| 1 | `2963176 1789310060` |
+| 2 | `2963176 1789310060` |
+
+## P0-13 `_orig` 以外の有無
+
+- `inventory.json` の録音 : **2 件**
+- うち `_orig` 以外 : **0 件**
+```
+
+**P0-8 の意味**: `voicedock-ingest` は `diskutil` の終了コードを信用せず、`mount` の出力で
+読み取り専用を独立確認してから `true` を書く（`_is_mounted_readonly()`）。`probe.sh` は
+同じ式を `mount` から**独立に**組み立てて突き合わせる。**一致したということは、
+安全ロック 2-B が実機の上で OS レベルに効いていることの実証である**（§14.2）。
+
+**P0-13 の意味**: 2 件とも `_orig` であり、**denoised は 1 件も生成されていない。**
+#2 の P0-4（録音 2 本とも `_orig` のみ）と一致する。§5.3 で `_orig` 固定にした代償
+（読まなかったファイルがデバイスに溜まり続ける）は、**この設定では現実になっていない。**
+§22 R-28 は当面顕在化しない。
+
+**P0-15**: 取り込み済み 2 件の再走査で **0.84 秒**（`candidates=0`）。
+`StartInterval`（300 秒）に対しては桁で余裕がある。**ただし 64 ファイルでは未計測。**
+
+### 10.1.1 フォルダ名の日付は中身を縛らない（**新しい発見**）
+
+```text
+TX_MIC001_20260912_163444/
+  TX00_MIC001_20260912_163444_orig.wav     ← 9/12
+  TX00_MIC002_20260913_233420_orig.wav     ← 9/13（同じフォルダ）
+```
+
+**フォルダ名は最初の録音の時刻であり、中身の録音日を縛らない。**
+`session_key` を**フォルダ名**から導いていたら、9/13 の録音が 9/12 の Daily ノートへ
+混ざるところだった。
+
+実装は `started_at=parsed.started_at`（`device.py`）で**ファイル名**の時刻を使っており
+（§5.2）、`session.group_parts()` はその `started_at` から `session_key` を作る（§10.4）。
+**正しい。**§5.1 に「フォルダ名の日付は中身を代表しない」ことを明記する対象とする。
 
 ### 10.2 `rw` での採取（P0-8b）
 
@@ -496,8 +599,6 @@ P0-6 / P0-7 / P0-9 が問うていた前提そのものが無くなった。**�
 
 > **`rw` にしても削除は起きない。**ロック 2-A（`voicedock-reaper` が未配置）が残っており、
 > **削除できるプログラムが存在しない**（§14.2）。削除の有効化は #39 の運用判断である。
-
----
 
 ## 11. Model Runner と LLM スループット（#13 で記入）
 
