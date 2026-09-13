@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+from voicedock import paths
 from voicedock.paths import DevicePath, InboxPath, StagingPath, VaultPath
 
 SRC_DIR = Path(__file__).parents[2] / "src" / "voicedock"
@@ -146,3 +147,39 @@ def test_device_path_is_a_pure_posix_path() -> None:
 @pytest.mark.parametrize("newtype", [InboxPath, StagingPath, VaultPath])
 def test_container_paths_are_path(newtype: object) -> None:
     assert _supertype(newtype) is Path
+
+
+# --- safe_unlink_queue（N-10 の 4 本目。§10.12 / §14.3） ----------------
+
+
+def test_safe_unlink_queue_only_touches_delete_and_result(tmp_path: Path) -> None:
+    """**`delete/` か `result/` 直下の `.json` に限る**（§14.3）。
+
+    `cleanup.queue_root` は設定値なのでモジュール定数に固定できない。**場所の条件を
+    外すと、設定を変えれば何でも消せる**（意図的に外したらテストが緑のまま通った）。
+    """
+    root = tmp_path / "queue"
+    for name in ("delete", "result"):
+        (root / name).mkdir(parents=True)
+
+    good = root / "delete" / "a.json"
+    good.write_text("{}", encoding="utf-8")
+    paths.safe_unlink_queue(paths.QueuePath(good), root=root)
+    assert not good.exists()
+
+    for bad in (root / "other" / "a.json", root / "delete" / "a.txt", root / "a.json"):
+        bad.parent.mkdir(parents=True, exist_ok=True)
+        bad.write_text("{}", encoding="utf-8")
+        with pytest.raises(ValueError):
+            paths.safe_unlink_queue(paths.QueuePath(bad), root=root)
+        assert bad.exists(), bad
+
+
+def test_safe_unlink_queue_refuses_paths_outside_the_root(tmp_path: Path) -> None:
+    """**封じ込めは `root` と `/queue` の両方で見る。**"""
+    outside = tmp_path / "elsewhere" / "delete" / "a.json"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError):
+        paths.safe_unlink_queue(paths.QueuePath(outside), root=tmp_path / "queue")
+    assert outside.exists()
