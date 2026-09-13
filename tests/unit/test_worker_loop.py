@@ -20,7 +20,8 @@ import pytest
 
 from tests.helpers import write_heartbeat
 from voicedock.config import Config
-from voicedock.db import Database, Recording, Session
+from voicedock.db import Database, EntityType, Recording, Session
+from voicedock.errors import ErrorCode
 from voicedock.log import Logger
 from voicedock.paths import DevicePath, partkey_for
 from voicedock.states import PART_TERMINAL, PartStatus, SessionStatus
@@ -363,9 +364,8 @@ def test_requeue_failed_goes_through_should_requeue(
 ) -> None:
     """`requeue_failed()` が判定を飛ばさないこと。
 
-    **判定を独立させた理由がこれである。**中身が #32 待ちの TODO なので、判定を
-    まとめていると「毎周回走らせる」壊し方をしても戻り値が変わらず**テストが通る**
-    （実際に通った）。
+    **判定を独立させた理由がこれである。**判定と中身をまとめていると「毎周回走らせる」
+    壊し方をしても戻り値が変わらず**テストが通る**（実際に通った）。
     """
     runner = build(database, cfg, logger, alive)
     asked: list[bool] = []
@@ -533,6 +533,159 @@ def test_a_session_with_no_parts_is_not_ready(
     assert build(database, cfg, logger, alive).ready_session_keys() == []
 
 
+# --- §15.2 工程内リトライ（待つのは worker） ----------------------------
+
+
+def failing_pipeline(
+    database: Database, calls: list[str], *, code: str = ErrorCode.WHISPER_FAILED
+) -> Callable[[str], None]:
+    """呼ばれるたびに `NORMALIZING → FAILED` を記録する偽 Pipeline の中身。"""
+
+    def process_part(partkey: str) -> None:
+        calls.append(partkey)
+        row = database.get_recording(partkey)
+        assert row is not None
+        if row.status != PartStatus.NORMALIZING:
+            database.record_transition(
+                EntityType.RECORDING,
+                partkey,
+                from_status=row.status,
+                to_status=PartStatus.NORMALIZING,
+            )
+        database.record_transition(
+            EntityType.RECORDING,
+            partkey,
+            from_status=PartStatus.NORMALIZING,
+            to_status=PartStatus.FAILED,
+            error_code=code,
+        )
+
+    return process_part
+
+
+def run_with_stub(runner: Worker, process_part: Callable[[str], None]) -> None:
+    import voicedock.pipeline as pipeline_module
+
+    original = pipeline_module.Pipeline
+    try:
+        pipeline_module.Pipeline = lambda **_kwargs: type(  # type: ignore[assignment, misc]
+            "Stub", (), {"process_part": staticmethod(process_part)}
+        )()
+        runner.process_pending_parts()
+    finally:
+        pipeline_module.Pipeline = original  # type: ignore[misc]
+
+
+def test_the_worker_waits_the_backoff_between_attempts(
+    database: Database, cfg: Config, logger: tuple[Logger, io.StringIO], alive: Path
+) -> None:
+    """**待つのは worker である**（§15.2）。`pipeline` は時間を持たない。
+
+    `max_attempts` 回だけ試し、間に `backoff_seconds` を待つ。**回数と待機の両方を
+    見る** — 片方だけだと「待たずに 3 回」も「1 回で 2 回待つ」も通る。
+    """
+    _add_part(database, hour=9)
+    slept: list[float] = []
+    runner = Worker(
+        cfg=cfg,
+        log=logger[0],
+        database=database,
+        state_root=alive,
+        sleep=lambda seconds: slept.append(seconds),
+        clock=lambda: NOW,
+    )
+    calls: list[str] = []
+    run_with_stub(runner, failing_pipeline(database, calls))
+
+    assert len(calls) == cfg.retry.max_attempts
+    assert slept == [float(s) for s in cfg.retry.backoff_seconds[: cfg.retry.max_attempts - 1]]
+
+
+def test_the_worker_does_not_retry_an_exempt_error(
+    database: Database, cfg: Config, logger: tuple[Logger, io.StringIO], alive: Path
+) -> None:
+    """`max_attempts` の対象外は工程内で回さない（§15.2）。1 回で終わる。"""
+    _add_part(database, hour=9)
+    slept: list[float] = []
+    runner = Worker(
+        cfg=cfg,
+        log=logger[0],
+        database=database,
+        state_root=alive,
+        sleep=lambda seconds: slept.append(seconds),
+        clock=lambda: NOW,
+    )
+    calls: list[str] = []
+    run_with_stub(runner, failing_pipeline(database, calls, code=ErrorCode.HELPER_UNAVAILABLE))
+
+    assert len(calls) == 1
+    assert slept == []
+
+
+def test_the_retry_loop_stops_on_request(
+    database: Database, cfg: Config, logger: tuple[Logger, io.StringIO], alive: Path
+) -> None:
+    """**停止要求は待機の前後で見る**（§18.3）。30 秒の backoff を挟んで止まれないと
+    `docker compose stop` の猶予を食い潰す。
+    """
+    _add_part(database, hour=9)
+    slept: list[float] = []
+    runner = Worker(
+        cfg=cfg,
+        log=logger[0],
+        database=database,
+        state_root=alive,
+        sleep=lambda seconds: slept.append(seconds),
+        clock=lambda: NOW,
+    )
+    calls: list[str] = []
+    inner = failing_pipeline(database, calls)
+
+    def stop_after_first(partkey: str) -> None:
+        inner(partkey)
+        runner.stopper.request()
+
+    run_with_stub(runner, stop_after_first)
+    assert len(calls) == 1
+    assert slept == [], "停止要求のあとに待ってはならない"
+
+
+def test_requeue_failed_resumes_rows(
+    database: Database, cfg: Config, logger: tuple[Logger, io.StringIO], alive: Path
+) -> None:
+    """起動の契機で `FAILED` が直前の進行中状態へ戻ること（§15.2 / §9.4）。
+
+    **`worker` は件数を返すだけで、規則は `pipeline` が持つ。**
+    """
+    partkey = _add_part(database, hour=9)
+    _fail(database, partkey)
+    database.update_recording(partkey, retry_count=3)
+
+    runner = build(database, cfg, logger, alive)
+    assert runner.requeue_failed(None, startup=True) == 1
+    row = database.get_recording(partkey)
+    assert row is not None
+    assert (row.status, row.retry_count) == (PartStatus.NORMALIZING, 0)
+
+
+def test_requeue_does_nothing_without_a_trigger(
+    database: Database, cfg: Config, logger: tuple[Logger, io.StringIO], alive: Path
+) -> None:
+    """**契機が無ければ 1 件も触らない**（§15.2）。接続中の毎周回で引き直さない。"""
+    from voicedock.device import read_inventory
+
+    partkey = _add_part(database, hour=9)
+    _fail(database, partkey)
+    runner = build(database, cfg, logger, alive)
+    runner.last_inventory_empty = False
+    set_devices(alive, {"DJIMIC3": ["a.wav"]})
+
+    assert runner.requeue_failed(read_inventory(alive)) == 0
+    row = database.get_recording(partkey)
+    assert row is not None
+    assert row.status == PartStatus.FAILED
+
+
 # --- 補助 ----------------------------------------------------------------
 
 
@@ -563,3 +716,20 @@ def _add_part(
         )
     )
     return key
+
+
+def _fail(database: Database, partkey: str) -> None:
+    """`DISCOVERED → NORMALIZING → FAILED` を実際に通す（`events` を残すため）。"""
+    database.record_transition(
+        EntityType.RECORDING,
+        partkey,
+        from_status=PartStatus.DISCOVERED,
+        to_status=PartStatus.NORMALIZING,
+    )
+    database.record_transition(
+        EntityType.RECORDING,
+        partkey,
+        from_status=PartStatus.NORMALIZING,
+        to_status=PartStatus.FAILED,
+        error_code=ErrorCode.NORMALIZE_VERIFY_FAILED,
+    )
