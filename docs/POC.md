@@ -628,17 +628,115 @@ docker compose exec voicedock env | grep VOICEDOCK_LLM   # 注入の確認
 
 ## 12. 文字起こし性能（#22 で記入）
 
-⬜ 未実施。
+⬜ **判定は保留**（測った音声が 26 秒しかない）。ただし**初めて実音声がパイプラインを通った。**
 
 ```bash
-docker compose logs voicedock | ./scripts/perf-report.sh
+docker compose logs voicedock | ./scripts/perf-report.sh --asr
 ```
 
-| # | 項目 | 実測 |
-|---|---|---|
-| `rtf` | Part ごとの real-time factor | ⬜ |
-| `speech_ratio` | VAD 有効時 / 無効時 | ⬜ |
-| 1 日分（32 Part） | **実 `elapsed_s` の合計と外挿。8 時間以内か**（§21.2 Phase 2） | ⬜ |
-| `threads` | 4 / 6 / 7 の比較（Docker VM は 7 CPU 割当） | ⬜ |
-| 採用モデル | 未達なら `large-v3-turbo-q5_0` → `medium-q5_0` → `small-q5_1` | ⬜ |
-| 幻覚（R-15） | 無音区間で VAD がどの程度抑制するか（定性） | ⬜ |
+### 12.0 起動までに踏んだ 2 件
+
+**(1) named volume の名前が食い違っていた。**`scripts/fetch-models.sh` は
+`voicedock-models` へ 574 MB を書き込むが、`compose.yaml` は `volumes:` に
+`voicedock-models:` と書いただけだったので、**Compose がプロジェクト名を前置して
+`voicedock_voicedock-models` を作り、空の volume をマウントしていた。**
+
+```text
+$ docker volume ls | grep voicedock
+local     voicedock-models              ← fetch-models.sh が入れた（574 MB）
+local     voicedock_voicedock-models    ← compose が作ってマウントした（空）
+```
+
+**症状は「取得したのに D-8 がモデルを見つけない」であり、取得の失敗と区別がつかない。**
+v5.13（AA-1）で `name:` を明示した。
+
+**(2) `config.yaml` が v5.0 以前のままだった。**V-1（設定検証）が起動を中止した。
+
+```text
+voicedock: 設定エラー（SPEC §7.3）。起動を中止します: /app/config/config.yaml
+  V-1  CONFIG_UNKNOWN_KEY  audio.transcribe_variant
+  V-1  CONFIG_UNKNOWN_KEY  retry.auto_retry_failed_after_hours
+  V-1  CONFIG_UNKNOWN_KEY  retry.auto_retry_max_rounds
+```
+
+3 つとも v5.0 で削除したキーである（§5.3 の `_orig` 固定、§15.2 の無条件再評価）。
+**これは製品の不具合ではない。**未知キーを拒んで起動を止める V-1 が設計どおり働き、
+**何が古いかを名指しした。**`config.example.yaml` から作り直して解決。
+
+### 12.1 実音声での通し（E2E-01 の前半）
+
+```text
+2026-09-14T00:59:33+09:00 INFO  service_started version=0.1.0 schema_version=1
+2026-09-14T00:59:33+09:00 INFO  part_discovered recording_key=DJIMIC3/TX_MIC001_20260912_163444/TX00_MIC001_20260912_163444_orig.wav tx=TX00 mic=1 started_at=2026-09-12T16:34:44+09:00 duration=5.72
+2026-09-14T00:59:33+09:00 INFO  part_discovered recording_key=DJIMIC3/TX_MIC001_20260912_163444/TX00_MIC002_20260913_233420_orig.wav tx=TX00 mic=2 started_at=2026-09-13T23:34:20+09:00 duration=20.35
+2026-09-14T00:59:33+09:00 INFO  normalize_completed recording_key=.../TX00_MIC001_..._orig.wav in_bytes=856456 out_bytes=183176 elapsed_s=0.0
+2026-09-14T01:00:00+09:00 INFO  transcription_completed recording_key=.../TX00_MIC001_..._orig.wav elapsed_s=27.2 chars=11 rtf=4.76 speech_ratio=0.708
+2026-09-14T01:00:00+09:00 INFO  raw_note_saved session_key=DJIMIC3:20260912 parts=1 bytes=390
+2026-09-14T01:00:00+09:00 INFO  normalize_completed recording_key=.../TX00_MIC002_..._orig.wav in_bytes=2963176 out_bytes=651336 elapsed_s=0.0
+2026-09-14T01:00:29+09:00 INFO  transcription_completed recording_key=.../TX00_MIC002_..._orig.wav elapsed_s=29.0 chars=79 rtf=1.423 speech_ratio=0.765
+2026-09-14T01:00:29+09:00 INFO  raw_note_saved session_key=DJIMIC3:20260913 parts=1 bytes=596
+2026-09-14T01:00:29+09:00 INFO  session_merged session_key=DJIMIC3:20260912 parts=1 excluded=0 chars=11
+2026-09-14T01:00:29+09:00 ERROR llm_failed session_key=DJIMIC3:20260912 error_code=LLM_UNAVAILABLE
+```
+
+**確かめられたこと:**
+
+| | |
+|---|---|
+| ffmpeg 変換 | 48 kHz/24 bit → 16 kHz/16 bit（856,456 → 183,176 B）。実機の Broadcast Wave を読めた |
+| Whisper | 日本語の transcript を生成。**VAD も動作**（`speech_ratio` が出ている） |
+| Raw ノート | Vault に 2 枚（`Daily/Voice/Raw/20260912/`・`20260913/`）。frontmatter に自然キー・Timeline 見出し |
+| **§10.1.1 の裏づけ** | **同じフォルダの 2 件が `DJIMIC3:20260912` と `DJIMIC3:20260913` の別セッションになった。**フォルダ名（`20260912`）ではなく**ファイル名**の時刻で分組されている |
+| LLM 未接続時の振る舞い | `llm_failed error_code=LLM_UNAVAILABLE`。**クラッシュせず名前の付いた誤りとして残る**（§15.1） |
+
+Raw ノート（実物）:
+
+```markdown
+---
+type: "voice-raw"
+voicedock_session_key: "DJIMIC3:20260913"
+voicedock_recording_keys:
+  - "DJIMIC3/TX_MIC001_20260912_163444/TX00_MIC002_20260913_233420_orig.wav"
+date: "2026-09-13"
+parts: 1
+source: "DJI Mic 3"
+---
+
+# 2026-09-13 の文字起こし（生データ）
+
+> 自動文字起こしの生データ。未編集。
+
+## 23:34–23:34
+
+### 23:34:21
+
+（文字起こし本文）
+```
+
+### 12.2 文字起こし性能（#22 の第一報。**判定は保留**）
+
+| # | 音声 | elapsed | rtf | speech_ratio |
+|---|---|---|---|---|
+| 1 | 5.7 s | 27.2 s | 4.76 | 0.708 |
+| 2 | 20.4 s | 29.0 s | 1.423 | 0.765 |
+
+**この 2 点から固定費と可変費を分離できる。**
+
+```text
+音声の差   20.38 - 5.71 = 14.67 s
+所要の差   29.0  - 27.2 =  1.8  s
+→ 限界レート   1.8 / 14.67 = 0.123 s/s
+→ 1 回の固定費 27.2 - 0.123 × 5.71 ≈ 26.5 s
+```
+
+**固定費の正体は whisper-cli が毎回 574 MB のモデルを読むことである。**
+30 分 Part なら 1 本あたり `26.5 + 0.123 × 1800 ≈ 247 s`、32 本で **約 2.2 時間**。
+§21.2 Phase 2 の 8 時間には収まる見込みだが、**26 秒の実測からの推定にすぎない。**
+
+> **`perf-report.sh` はここで一度嘘をついた。**Part 数で外挿していたため
+> 「1 Part = 13 秒」として 32 倍し、**0.25 時間で ✅ PASS** と答えた。
+> 音声長で外挿すると固定費が効いて **34.46 時間で ✗ FAIL** になる。**どちらも当てにならない。**
+> 1 日分の 10% に満たない実測では**判定しない**（`⬜ 保留`、終了コード 8）ように直した（#95）。
+> **偽の PASS を掴むくらいなら「足りない」と言う。**
+
+**判定には 30 分程度の Part を数本流す必要がある**（1 日分の 10% ＝ 約 1.6 時間の音声）。
