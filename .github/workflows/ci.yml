@@ -44,3 +44,25 @@ jobs:
 
       - name: pytest
         run: uv run pytest -q
+
+  # **削除禁止テストを独立した job にする**（SPEC §20.4 / #37）。
+  # §20.4 は「このテスト群は CI で必ず実行し、1 件でも失敗したらリリースしない」と
+  # 規定している。`check` に混ぜると、他の失敗に紛れて**どれが落ちたのか一目で
+  # 分からない。**`main` の required check にするのもこの job である。
+  #
+  # **正の対照（`test_deletion_actually_happens_when_everything_is_valid`）を
+  # 同じ job で回す。**これが落ちれば「ND が緑なのは何も検証していないから」だと分かる。
+  no-delete:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: "0.12.13"
+          enable-cache: true
+
+      - run: uv sync --frozen
+
+      - name: ND (削除禁止テスト)
+        run: uv run pytest tests/unit/test_no_delete.py tests/unit/test_no_device_delete.py -q
