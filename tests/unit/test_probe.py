@@ -1,279 +1,308 @@
-"""`voicedock.audio.probe` が SPEC §10.5(1) のとおりに動くことを固定する。
+"""`scripts/probe.sh` が P0-8 の一致を機械判定することを固定する（#93）。
 
-**最重要の性質は「例外を投げない」ことである。**§10.5 は失敗時に
-`duration_seconds = NULL` のまま続行すると規定しており、例外にすると全呼び手が
-try/except を持つことになる。**1 箇所忘れた時点でその Part の記録が失われる**
-（§1.3 の優先順位 1）。
+**`ro` で繋いだ瞬間は採り直しが効かない。**`heartbeat.json` は次の ingest で上書きされる。
+だから判定を人の目視に委ねず、**食い違いを終了コードで出す。**
 
-実物の `ffprobe` を使うテストは `needs_ffmpeg` を付ける（CI には無い）。
-それ以外は**偽の ffprobe スクリプト**で動かすので CI でも走る。
+issue #3 は P0-8 を「`mount` が read-only であり、`heartbeat.json` の `mount_readonly` が
+`true` であること。**両者が一致すること**」と規定し、**一致しなければ実装のバグである**と
+している。ingest は `mount` の出力を `diskutil` とは独立に読んで `mount_readonly` を書くので
+（`_is_mounted_readonly()`）、**両者は必ず一致する。**
+
+`mount` は `PATH` ではなく `VOICEDOCK_MOUNT_CMD` で差し替える。**本物を呼ばない。**
 """
 
 from __future__ import annotations
 
 import json
-import stat
+import re
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from tests.fixtures.make_wav import Content, WavFormat, write_wav
-from tests.spec_sync import spec_section_code
-from voicedock.audio import FFPROBE_ARGS, ProbeResult, parse_output, probe
+from tests.helpers import REPO_ROOT
 
-SPEECH_SECONDS = 1.5
+PROBE = REPO_ROOT / "scripts" / "probe.sh"
 
+pytestmark = pytest.mark.skipif(not PROBE.is_file(), reason="scripts/ がマウントされていない")
 
-def fake_ffprobe(tmp_path: Path, body: str, *, name: str = "ffprobe") -> Path:
-    """`sh` で書いた偽 ffprobe。**呼ばれた回数を `calls` ファイルへ追記する。**"""
-    script = tmp_path / name
-    script.write_text(f"#!/bin/sh\necho call >> '{tmp_path}/calls'\n{body}\n", encoding="utf-8")
-    script.chmod(script.stat().st_mode | stat.S_IEXEC)
-    return script
+EXIT_PROBE_MISMATCH = 5
 
-
-def call_count(tmp_path: Path) -> int:
-    log = tmp_path / "calls"
-    return len(log.read_text(encoding="utf-8").splitlines()) if log.exists() else 0
+DEVICE = "DJIMIC3"
+FOLDER = "TX_MIC001_20260912_163444"
+ORIG = f"{FOLDER}/TX00_MIC001_20260912_163444_orig.wav"
+DENOISED = f"{FOLDER}/TX00_MIC001_20260912_163444.wav"
 
 
-def ffprobe_json(**overrides: object) -> str:
-    """実物の ffprobe が返す形（**数値は文字列である**）。"""
-    document: dict[str, object] = {
-        "streams": [
-            {
-                "codec_name": "pcm_s24le",
-                "sample_rate": "48000",
-                "channels": 2,
-                "sample_fmt": "s32",
-            }
+def write_mount_stub(tmp_path: Path, lines: list[str]) -> Path:
+    """`mount` の偽物。**1 行の形は実機と同じにする**（`<dev> on <path> (<opts>)`）。"""
+    path = tmp_path / "fake-mount"
+    body = "\n".join(f'echo "{line}"' for line in lines)
+    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def build_home(
+    tmp_path: Path,
+    *,
+    mount_readonly: bool | None = True,
+    devices: dict[str, list[str]] | None = None,
+    heartbeat_text: str | None = None,
+) -> Path:
+    """`<VOICEDOCK_HOME>` を組み立てる。`mount_readonly=None` で heartbeat を置かない。"""
+    home = tmp_path / "VoiceDock"
+    (home / "state").mkdir(parents=True)
+    (home / "log").mkdir()
+    (home / "helper.conf").write_text(
+        'MOUNT_MODE="ro"\n'
+        "STABILITY_FAST_PATH_SECONDS=60\n"
+        "STABILITY_INTERVAL_SECONDS=0\n"
+        "STABILITY_CHECKS=2\n",
+        encoding="utf-8",
+    )
+
+    if heartbeat_text is not None:
+        (home / "state" / "heartbeat.json").write_text(heartbeat_text, encoding="utf-8")
+    elif mount_readonly is not None:
+        (home / "state" / "heartbeat.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "updated_at": "2026-09-13T07:00:12+09:00",
+                    "helper_version": "5.9.0",
+                    "mount_mode": "ro",
+                    "mount_readonly": mount_readonly,
+                    "delete_source_audio": False,
+                    "reaper_installed": False,
+                    "config_error": None,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    payload = {DEVICE: [ORIG]} if devices is None else devices
+    (home / "state" / "inventory.json").write_text(_render_inventory(payload), encoding="utf-8")
+    return home
+
+
+def _render_inventory(devices: dict[str, list[str]]) -> str:
+    """`voicedock-ingest` の `write_inventory()` と**同じ字面**で書く。
+
+    probe は `jq` を使わずインデントで読む（macOS に `jq` が無い。§3.3）ので、
+    **テストが本物と違う字面で書くと、probe の読み取りを検査したことにならない。**
+    """
+    lines = [
+        "{",
+        '  "schema": 1,',
+        '  "generated_at": "2026-09-13T07:00:12+09:00",',
+        '  "mount_readonly": true,',
+        '  "device_free_bytes": {',
+    ]
+    free = [f'    "{name}": 4509715660' for name in devices]
+    lines.append(",\n".join(free))
+    lines.append("  },")
+    lines.append('  "devices": {')
+    blocks = []
+    for name, relpaths in devices.items():
+        entries = ",\n".join(f'      "{rel}"' for rel in relpaths)
+        blocks.append(f'    "{name}": [\n{entries}\n    ]')
+    lines.append(",\n".join(blocks))
+    lines.append("  }")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def run_probe(
+    tmp_path: Path, *, home: Path, mount_lines: list[str], args: tuple[str, ...] = ()
+) -> subprocess.CompletedProcess[str]:
+    volumes = tmp_path / "Volumes"
+    for name in (DEVICE,):
+        (volumes / name / FOLDER).mkdir(parents=True, exist_ok=True)
+    return subprocess.run(  # noqa: S603
+        ["/bin/bash", str(PROBE), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(tmp_path),
+            "VOICEDOCK_HOME": str(home),
+            "VOICEDOCK_VOLUMES_ROOT": str(volumes),
+            "VOICEDOCK_MOUNT_CMD": str(write_mount_stub(tmp_path, mount_lines)),
+            "PROBE_SAMPLES": "2",
+        },
+    )
+
+
+def mounted(tmp_path: Path, name: str, *, readonly: bool) -> str:
+    options = "msdos, local, nodev, nosuid" + (", read-only" if readonly else "")
+    return f"/dev/disk4s1 on {tmp_path / 'Volumes' / name} ({options}, noowners)"
+
+
+def p0_8_section(stdout: str) -> str:
+    return stdout.split("## P0-8", 1)[1].split("## P0-10", 1)[0]
+
+
+# --- P0-8 の一致判定 -----------------------------------------------------
+
+
+def test_agreement_passes(tmp_path: Path) -> None:
+    """`ro` マウントと `mount_readonly: true` が一致すれば PASS。"""
+    home = build_home(tmp_path, mount_readonly=True)
+    result = run_probe(tmp_path, home=home, mount_lines=[mounted(tmp_path, DEVICE, readonly=True)])
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "✅ **PASS**" in p0_8_section(result.stdout)
+
+
+def test_a_readwrite_mount_with_a_true_heartbeat_fails(tmp_path: Path) -> None:
+    """**これが実装のバグの形である。**`mount` は rw なのに `heartbeat` は `true`。
+
+    `_is_mounted_readonly()` が `diskutil` の終了コードを信用してしまうと、
+    再マウントに失敗したのに `true` を書く。**そのまま Phase 7 に入ると、
+    安全ロック 2-B が掛かっていないのに掛かっていると信じることになる。**
+    """
+    home = build_home(tmp_path, mount_readonly=True)
+    result = run_probe(tmp_path, home=home, mount_lines=[mounted(tmp_path, DEVICE, readonly=False)])
+    assert result.returncode == EXIT_PROBE_MISMATCH
+    assert "✗ **FAIL**" in p0_8_section(result.stdout)
+
+
+def test_a_readonly_mount_with_a_false_heartbeat_fails(tmp_path: Path) -> None:
+    """**逆向きの食い違いも落とす。**片方向だけの検査では半分しか守れない。"""
+    home = build_home(tmp_path, mount_readonly=False)
+    result = run_probe(tmp_path, home=home, mount_lines=[mounted(tmp_path, DEVICE, readonly=True)])
+    assert result.returncode == EXIT_PROBE_MISMATCH
+    assert "✗ **FAIL**" in p0_8_section(result.stdout)
+
+
+def test_a_device_missing_from_mount_is_undecidable(tmp_path: Path) -> None:
+    """`inventory.json` に在るデバイスが `mount` に無ければ**判定しない。**
+
+    2 つのスナップショットがずれているだけで、実装のバグとは限らない。
+    **「分からない」を「FAIL」と言わない。**
+    """
+    home = build_home(tmp_path, mount_readonly=True)
+    result = run_probe(tmp_path, home=home, mount_lines=["/dev/disk1s1 on / (apfs, local)"])
+    assert result.returncode == 0
+    assert "判定不能" in p0_8_section(result.stdout)
+    assert "FAIL" not in p0_8_section(result.stdout)
+
+
+def test_no_device_is_undecidable(tmp_path: Path) -> None:
+    """デバイスが `inventory.json` に 1 つも無ければ判定しない。"""
+    home = build_home(tmp_path, mount_readonly=True, devices={})
+    result = run_probe(tmp_path, home=home, mount_lines=["/dev/disk1s1 on / (apfs, local)"])
+    assert result.returncode == 0
+    assert "判定不能" in p0_8_section(result.stdout)
+
+
+def test_a_missing_heartbeat_is_undecidable(tmp_path: Path) -> None:
+    """`heartbeat.json` が無ければ判定しない（Helper が未実行なだけかもしれない）。"""
+    home = build_home(tmp_path, mount_readonly=None)
+    result = run_probe(tmp_path, home=home, mount_lines=[mounted(tmp_path, DEVICE, readonly=True)])
+    assert result.returncode == 0
+    assert "判定不能" in p0_8_section(result.stdout)
+
+
+def test_a_broken_heartbeat_does_not_crash(tmp_path: Path) -> None:
+    """**壊れた JSON で落ちない**（§7.5）。Helper の書き込み途中を読む可能性がある。"""
+    home = build_home(tmp_path, heartbeat_text='{"schema": 1, "mount_rea')
+    result = run_probe(tmp_path, home=home, mount_lines=[mounted(tmp_path, DEVICE, readonly=True)])
+    assert result.returncode == 0, result.stderr
+    assert "判定不能" in p0_8_section(result.stdout)
+
+
+def test_the_volume_name_is_matched_exactly(tmp_path: Path) -> None:
+    """**部分一致で拾わない。**`DJIMIC3` の検査が `DJIMIC30` の行に当たってはならない。"""
+    home = build_home(tmp_path, mount_readonly=True)
+    result = run_probe(
+        tmp_path,
+        home=home,
+        mount_lines=[
+            mounted(tmp_path, DEVICE + "0", readonly=True),
+            mounted(tmp_path, DEVICE, readonly=False),
         ],
-        "format": {"duration": "1.500000"},
-    }
-    document.update(overrides)
-    return json.dumps(document)
-
-
-def run(
-    script: Path, target: Path, *, max_attempts: int = 1, timeout_seconds: int = 5
-) -> ProbeResult:
-    return probe(target, ffprobe=script, timeout_seconds=timeout_seconds, max_attempts=max_attempts)
-
-
-# --- SPEC 整合 -----------------------------------------------------------
-
-
-def test_arguments_match_the_spec_command() -> None:
-    """§10.5(1) の `ffprobe` コマンドラインと `FFPROBE_ARGS` が一致すること。
-
-    **SPEC のオプションを 1 つ変えたらここが落ちる。**`-select_streams a:0` を落とすと
-    映像ストリームを持つファイルで別のストリームを読み、`sample_rate` が音声のものでなくなる。
-    """
-    block = spec_section_code("10.5", "bash")
-    # 末尾の `<inbox のファイル>` はプレースホルダなので落とす（空白を含む点に注意）
-    command, _sep, _placeholder = block.partition("<inbox")
-    tokens = command.replace("\\\n", " ").split()
-    assert tokens[0] == "ffprobe"
-    assert tuple(tokens[1:]) == FFPROBE_ARGS
-
-
-# --- 正常系 --------------------------------------------------------------
-
-
-def test_reads_duration_and_format(tmp_path: Path) -> None:
-    script = fake_ffprobe(tmp_path, f"cat <<'EOF'\n{ffprobe_json()}\nEOF")
-    result = run(script, tmp_path / "a.wav")
-    assert result.ok
-    assert result.format is not None
-    assert result.format.duration_seconds == pytest.approx(1.5)
-    assert result.format.sample_rate == 48000
-    assert result.format.channels == 2
-    assert result.format.sample_fmt == "s32"
-    assert result.format.codec_name == "pcm_s24le"
-    assert result.error is None
-    assert result.attempts == 1
-
-
-def test_a_string_duration_becomes_a_float(tmp_path: Path) -> None:
-    """**ffprobe は数値を文字列で返す。**`"1.500000"` をそのまま DB へ入れてはならない。"""
-    script = fake_ffprobe(tmp_path, f"cat <<'EOF'\n{ffprobe_json()}\nEOF")
-    duration = run(script, tmp_path / "a.wav").duration_seconds
-    assert isinstance(duration, float)
-
-
-def test_succeeds_on_the_first_attempt_without_retrying(tmp_path: Path) -> None:
-    script = fake_ffprobe(tmp_path, f"cat <<'EOF'\n{ffprobe_json()}\nEOF")
-    run(script, tmp_path / "a.wav", max_attempts=3)
-    assert call_count(tmp_path) == 1
-
-
-# --- duration が取れない場合（**probe 自体は成功**） ---------------------
-
-
-@pytest.mark.parametrize("duration", ["N/A", "", "abc", None, "-1.0"])
-def test_an_unusable_duration_is_none_but_the_probe_succeeds(
-    tmp_path: Path, duration: str | None
-) -> None:
-    """`duration` だけが読めない場合、**probe は成功扱いで duration が `None`** になる。
-
-    sample_rate などは取れているので、#18 の検証（16000 Hz / 1 ch / `s16`）は実行できる。
-    負の duration は壊れたヘッダで、**採ると `ended_at` が開始より前になる。**
-    """
-    payload = {} if duration is None else {"duration": duration}
-    script = fake_ffprobe(tmp_path, f"cat <<'EOF'\n{ffprobe_json(format=payload)}\nEOF")
-    result = run(script, tmp_path / "a.wav")
-    assert result.ok, "duration だけが読めないのは probe の失敗ではない"
-    assert result.duration_seconds is None
-
-
-def test_a_missing_format_object_is_tolerated(tmp_path: Path) -> None:
-    script = fake_ffprobe(tmp_path, f"cat <<'EOF'\n{ffprobe_json(format=None)}\nEOF")
-    result = run(script, tmp_path / "a.wav")
-    assert result.ok
-    assert result.duration_seconds is None
-
-
-# --- 失敗系: **例外を投げない** -----------------------------------------
-
-
-def test_no_audio_stream_is_a_failure(tmp_path: Path) -> None:
-    """音声ストリームが 1 本も無いものは失敗にする。
-
-    そのまま進めば #18 の ffmpeg が必ず落ちる。ここで失敗にすれば
-    `duration_seconds = NULL` として**記録だけは残る。**
-    """
-    script = fake_ffprobe(tmp_path, f"cat <<'EOF'\n{ffprobe_json(streams=[])}\nEOF")
-    result = run(script, tmp_path / "a.wav")
-    assert not result.ok
-    assert result.duration_seconds is None
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        "exit 1",
-        "echo 'not json'",
-        "echo '[]'",
-        "echo ''",
-        ">&2 echo 'boom'; exit 3",
-    ],
-)
-def test_a_failure_returns_a_result_instead_of_raising(tmp_path: Path, body: str) -> None:
-    script = fake_ffprobe(tmp_path, body)
-    result = run(script, tmp_path / "a.wav")  # 例外を投げない
-    assert not result.ok
-    assert result.error
-
-
-def test_a_missing_ffprobe_returns_a_result(tmp_path: Path) -> None:
-    """**`ffprobe` が無くても落ちない。**`audio.ffprobe` の設定ミスは V-* が起動時に弾くが、
-    ここで例外にすると **1 件の設定ミスがその日の記録全体を止める。**
-    """
-    result = run(tmp_path / "does-not-exist", tmp_path / "a.wav")
-    assert not result.ok
-    assert result.error is not None
-    assert "FileNotFoundError" in result.error
-
-
-def test_a_timeout_returns_a_result(tmp_path: Path) -> None:
-    script = fake_ffprobe(tmp_path, "sleep 5")
-    result = run(script, tmp_path / "a.wav", timeout_seconds=1)
-    assert not result.ok
-    assert result.error is not None
-    assert "1 秒" in result.error
-
-
-# --- リトライ（§15.1 AUDIO_PROBE_FAILED は「可（3 回）」） --------------
-
-
-def test_retries_up_to_max_attempts(tmp_path: Path) -> None:
-    script = fake_ffprobe(tmp_path, "exit 1")
-    result = run(script, tmp_path / "a.wav", max_attempts=3)
-    assert call_count(tmp_path) == 3
-    assert result.attempts == 3
-    assert not result.ok
-
-
-def test_stops_retrying_once_it_succeeds(tmp_path: Path) -> None:
-    """**成功したらそこで止める。**失敗 → 成功の順で返す偽 ffprobe を使う。"""
-    body = (
-        f"if [ -f '{tmp_path}/once' ]; then cat <<'EOF'\n{ffprobe_json()}\nEOF\n"
-        f"else touch '{tmp_path}/once'; exit 1; fi"
     )
-    script = fake_ffprobe(tmp_path, body)
-    result = run(script, tmp_path / "a.wav", max_attempts=3)
-    assert result.ok
-    assert result.attempts == 2
-    assert call_count(tmp_path) == 2
+    assert result.returncode == EXIT_PROBE_MISMATCH
 
 
-@pytest.mark.parametrize("max_attempts", [0, -1])
-def test_a_nonsense_max_attempts_still_runs_once(tmp_path: Path, max_attempts: int) -> None:
-    """**0 回で「失敗」を返してはならない。**probe を 1 回も試さずに
-    `duration_seconds = NULL` になると、設定ミスが静かに全 Part の duration を消す。
-    """
-    script = fake_ffprobe(tmp_path, f"cat <<'EOF'\n{ffprobe_json()}\nEOF")
-    assert run(script, tmp_path / "a.wav", max_attempts=max_attempts).ok
-    assert call_count(tmp_path) == 1
+# --- P0-10 / P0-13 -------------------------------------------------------
 
 
-# --- 子プロセスの標準入力 -----------------------------------------------
-
-
-def test_the_child_does_not_inherit_stdin(tmp_path: Path) -> None:
-    """**`stdin` は `DEVNULL` である。**常駐サービスの標準入力を子が奪わないようにする。
-
-    §10.5 の「`-nostdin` を付けてはならない」は **ffmpeg が `pipe:0` から WAV を
-    受け取る**ための規定であり、ファイルパスを読む ffprobe には当たらない。
-    """
-    body = f"cat > '{tmp_path}/stdin.txt'\ncat <<'EOF'\n{ffprobe_json()}\nEOF"
-    script = fake_ffprobe(tmp_path, body)
-    run(script, tmp_path / "a.wav")
-    assert (tmp_path / "stdin.txt").read_text(encoding="utf-8") == ""
-
-
-# --- 出力パーサ単体 -----------------------------------------------------
-
-
-@pytest.mark.parametrize("stdout", ["", "null", "[]", "{}", '{"streams": {}}', '{"streams":[1]}'])
-def test_parse_output_returns_none_for_unusable_output(stdout: str) -> None:
-    assert parse_output(stdout) is None
-
-
-def test_parse_output_ignores_a_boolean_sample_rate() -> None:
-    """`True` は Python では `int` の一種である。**`bool` を数値として採らない。**"""
-    parsed = parse_output(json.dumps({"streams": [{"sample_rate": True}], "format": {}}))
-    assert parsed is not None
-    assert parsed.sample_rate is None
-
-
-# --- 実物の ffprobe -----------------------------------------------------
-
-
-@pytest.mark.needs_ffmpeg
-def test_reads_a_real_wav(tmp_path: Path) -> None:
-    """fixture が作る 48 kHz / 24 bit WAV を実物の ffprobe で読む（§8 の実測形式）。"""
-    wav = write_wav(
-        tmp_path / "TX00_MIC001_20260912_120950_orig.wav",
-        seconds=SPEECH_SECONDS,
-        fmt=WavFormat.PCM24,
-        content=Content.SPEECH,
+def test_two_devices_are_counted_separately(tmp_path: Path) -> None:
+    """**P0-10**: 送信機 2 台なら `devices` が 2 エントリ。**録音数はデバイスごとに数える。**"""
+    home = build_home(
+        tmp_path,
+        mount_readonly=True,
+        devices={DEVICE: [ORIG], "DJIMIC3B": [ORIG, DENOISED]},
     )
-    result = probe(wav, ffprobe=Path(_which("ffprobe")), timeout_seconds=30)
-    assert result.ok
-    assert result.format is not None
-    assert result.format.sample_rate == 48000
-    assert result.format.duration_seconds == pytest.approx(SPEECH_SECONDS, abs=0.05)
+    (tmp_path / "Volumes" / "DJIMIC3B" / FOLDER).mkdir(parents=True)
+    result = run_probe(
+        tmp_path,
+        home=home,
+        mount_lines=[
+            mounted(tmp_path, DEVICE, readonly=True),
+            mounted(tmp_path, "DJIMIC3B", readonly=True),
+        ],
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    section = result.stdout.split("## P0-10", 1)[1].split("## P0-11", 1)[0]
+    assert "**2 個**" in section
+    rows = dict(re.findall(r"^\| `([^`]+)` \| (\d+) \|", section, re.M))
+    assert rows == {DEVICE: "1", "DJIMIC3B": "2"}, section
 
 
-def _which(name: str) -> str:
-    import shutil
+def test_a_denoised_file_is_reported(tmp_path: Path) -> None:
+    """**P0-13**: `_orig` 以外が在れば §5.3 の代償が現実になっている。"""
+    home = build_home(tmp_path, mount_readonly=True, devices={DEVICE: [ORIG, DENOISED]})
+    result = run_probe(tmp_path, home=home, mount_lines=[mounted(tmp_path, DEVICE, readonly=True)])
+    section = result.stdout.split("## P0-13", 1)[1].split("## P0-15", 1)[0]
+    assert "うち `_orig` 以外 : **1 件**" in section
+    assert DENOISED in section
 
-    found = shutil.which(name)
-    assert found is not None, f"{name} が無い"
-    return found
+
+def test_only_orig_reports_nothing_accumulating(tmp_path: Path) -> None:
+    """陰性対照。`_orig` だけなら「溜まっていない」と言い切れること。"""
+    home = build_home(tmp_path, mount_readonly=True, devices={DEVICE: [ORIG]})
+    result = run_probe(tmp_path, home=home, mount_lines=[mounted(tmp_path, DEVICE, readonly=True)])
+    section = result.stdout.split("## P0-13", 1)[1].split("## P0-15", 1)[0]
+    assert "うち `_orig` 以外 : **0 件**" in section
+    assert "denoised は生成されていない" in section
 
 
-def test_calls_file_is_isolated_per_test(tmp_path: Path) -> None:
-    """`fake_ffprobe` の呼び出し記録が `tmp_path` 配下に閉じていること（§20.2）。"""
-    assert not (Path.cwd() / "calls").exists()
+# --- §14.4 の禁則（静的に見えるもの） ------------------------------------
+
+
+def source_without_comments() -> str:
+    return "\n".join(
+        re.sub(r"(^|\s)#.*$", "", line) for line in PROBE.read_text(encoding="utf-8").splitlines()
+    )
+
+
+def test_probe_never_calls_diskutil() -> None:
+    """**N-19 と同じ理由**: マウント操作は `voicedock-ingest` だけが行う。
+
+    probe が `diskutil` を呼ぶと、**測ろうとしている状態そのものを変えてしまう。**
+    """
+    assert "diskutil" not in source_without_comments()
+
+
+def test_probe_never_writes_to_the_device() -> None:
+    """**N-18**: デバイス上のパスへ破壊的操作を書かないこと。"""
+    body = source_without_comments()
+    for line in body.splitlines():
+        if not re.search(r"\b(rm|mv|rmdir|truncate|chmod|chown|touch)\b", line):
+            continue
+        assert "VOLUMES_ROOT" not in line, f"デバイスへ書いている: {line.strip()}"
+
+
+def test_probe_does_not_run_ingest() -> None:
+    """**probe は ingest を実行しない。**走らせると他の項目が採り直しになる。"""
+    body = source_without_comments()
+    assert not re.search(r"^[^#]*[^/\w]bin/voicedock-ingest[\"']?\s*$", body, re.M), (
+        "probe が ingest を実行している"
+    )

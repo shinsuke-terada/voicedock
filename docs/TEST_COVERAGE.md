@@ -56,6 +56,9 @@
 | 削除禁止 ND-01〜17 / 21〜23 / 30 / 31（コンテナ層。§20.4） | `tests/unit/test_no_delete.py`（CI の `no-delete` job で必須） |
 | 削除禁止 ND-18〜20 / 24〜29（reaper 層。§20.4） | `tests/unit/test_reaper.py`（CI の `no-delete` job で必須） |
 | reaper 本体（§14.1.1 の 12 項目） | `tests/unit/test_reaper.py` `tests/unit/test_helper_portability.py` |
+| 実機採取（P0-8 の `mount` と `heartbeat.json` の一致） | `tests/unit/test_probe.py`（`mount` は `VOICEDOCK_MOUNT_CMD` の偽物に差し替える） |
+| 性能判定（§21.2 Phase 2 の 8 時間 / Phase 3 の 30 分） | `tests/unit/test_perf_report.py` |
+| 実機手順書（§20.3 との 1 対 1、`voicedock <sub>` の実在） | `tests/unit/test_runbook.py` |
 
 > **統合テストは `needs_ffmpeg` が付いている。**§10.5 の変換は本物の ffmpeg が要るので、
 > CI では自動 skip され `make test`（コンテナ内）で走る。**ffmpeg を偽物にしてはならない** —
