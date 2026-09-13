@@ -120,7 +120,7 @@ def group_parts(
 
     for part in database.ungrouped_recordings():
         started = datetime.fromisoformat(part.started_at)
-        key = paths.session_key_for(part.device_id, started, tz=cfg.tz)
+        key = _target_key(database, part, started, cfg=cfg)
         session = database.get_session(key)
         if session is None:
             database.insert_session(_new_session(key, part.device_id, now=moment), now=moment)
@@ -145,6 +145,38 @@ def group_parts(
         assigned.append((PartKey(part.partkey), key))
 
     return GroupResult(assigned=tuple(assigned), created=tuple(created))
+
+
+def _target_key(
+    database: Database, part: Recording, started: datetime, *, cfg: Config
+) -> SessionKey:
+    """この Part を入れるセッションの鍵（§10.4 / v5.7→v5.8 の変更 T-2）。
+
+    **空きのある最も小さい `n` を選ぶ。**`session.max_parts` / `max_duration_seconds` を
+    超える場合だけ `<device_id>:<YYYYMMDD>#<n>`（`n` ≥ 2）へ回す。
+
+    上限の扱いには 3 つの選択肢があった。**入れ続ける**と上限が無いのと同じであり、
+    **拒む**とその Part が永久に処理されない（§1.3 の優先順位 2 に反する）。
+    **分ける**なら記録は全部残り、ノートは §13.5 の同名衝突規則で ` (2)` になる。
+
+    **`duration_seconds` が NULL の Part は 0 として数える。**長さが分からない録音を
+    「上限いっぱい」と見なすと、ffprobe が 1 回失敗しただけでセッションが割れる。
+    件数の上限（`max_parts`）が別に効くので、時間側を甘くしても暴走はしない。
+    """
+    key = paths.session_key_for(part.device_id, started, tz=cfg.tz)
+    while True:
+        session = database.get_session(key)
+        if session is None or _has_room(session, part, cfg=cfg):
+            return key
+        key = paths.next_overflow(key)
+
+
+def _has_room(session: Session, part: Recording, *, cfg: Config) -> bool:
+    """`session` にこの Part を足せるか（§10.4 の上限）。"""
+    if session.part_count >= cfg.session.max_parts:
+        return False
+    recorded = session.recorded_seconds or 0.0
+    return recorded + (part.duration_seconds or 0.0) <= cfg.session.max_duration_seconds
 
 
 def _new_session(key: SessionKey, device_id: str, *, now: datetime) -> Session:
