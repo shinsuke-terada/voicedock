@@ -52,6 +52,7 @@
 | 通しフロー（inbox → 変換 → Whisper → Raw → merge → LLM → Daily → 保存検証） | `tests/integration/test_pipeline_flow.py` |
 | ネットワークを使わないこと（§14.5 / §14.4 N-7） | `tests/unit/test_no_network.py`（遮断は `tests/conftest.py` の `no_network` が autouse で掛ける） |
 | 偽 inbox / 偽ボリュームの組み立て | `tests/unit/test_fake_tree.py` `tests/unit/test_make_wav.py` |
+| ホスト側 doctor（§19.2 の DH 表 5 件） | `tests/unit/test_doctor_host.py`（`docker` / `launchctl` は `PATH` の偽物に差し替える） |
 | reaper（§20.4） | #54 |
 
 > **統合テストは `needs_ffmpeg` が付いている。**§10.5 の変換は本物の ffmpeg が要るので、
