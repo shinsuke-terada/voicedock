@@ -268,15 +268,20 @@ class Worker:
             )
 
     def ready_session_keys(self) -> list[str]:
-        """`READY` で全 Part が終端状態のセッション（§9.3 の `READY → MERGING` のガード）。
+        """統合へ進めるセッション（§9.3 の `READY → MERGING` のガード）。
+
+        **`MERGING` も拾う。**再オープン（§9.3 の `SAVED` / `COMPLETED` 行）は `MERGING` へ
+        戻すので、`READY` だけを見ると**作り直しが次の起動まで動かない**
+        （`recover_interrupted()` が巻き戻すのは起動時の 1 回だけである）。
 
         **中身の処理は #27 が実装する。**ここはガード条件だけを確定させる —
         「全 Part が終端状態」を取り違えると、**進行中の Part を含むセッションを統合して
         本文が欠けたノートを書く**（§14.1 の削除根拠になる）。
         """
         ready: list[str] = []
-        for row in self.database.sessions_with_status(SessionStatus.READY):
-            parts = self.database.recordings_for_session(row.session_key)
-            if parts and all(part.status in PART_TERMINAL for part in parts):
-                ready.append(row.session_key)
-        return ready
+        for status in (SessionStatus.READY, SessionStatus.MERGING):
+            for row in self.database.sessions_with_status(status):
+                parts = self.database.recordings_for_session(row.session_key)
+                if parts and all(part.status in PART_TERMINAL for part in parts):
+                    ready.append(row.session_key)
+        return sorted(ready)

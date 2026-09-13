@@ -99,6 +99,21 @@ DELETE_EVALUATED: Final[frozenset[str]] = frozenset(
 が毎周回増え続ける。
 """
 
+MERGEABLE: Final[frozenset[str]] = frozenset({SessionStatus.READY, SessionStatus.MERGING})
+"""`ensure_merged()` が進められるセッションの状態。
+
+**`MERGING` を含める。**再オープンは §9.3 に従って `MERGING` へ戻すので、`READY` だけを
+受け付けると作り直しが次の起動まで動かない。クラッシュで `MERGING` のまま残った行も
+同じ経路で進む（§9.4 の巻き戻しは起動時の 1 回だけである）。
+"""
+
+REOPENABLE: Final[frozenset[str]] = frozenset({SessionStatus.SAVED, SessionStatus.COMPLETED})
+"""再オープンできるセッションの状態（§9.3 の `SAVED / COMPLETED → MERGING` 行）。
+
+**`READY` や `MERGING` を入れてはならない。**まだ確定していないセッションは、そのまま
+次の統合で新しい Part を拾う。戻す必要があるのは**一度 Daily ノートを書き終えたもの**だけである。
+"""
+
 SKIP_REASONS: Final[dict[ErrorCode, str]] = {
     ErrorCode.SOURCE_MISSING: "source_missing",
     ErrorCode.DUPLICATE_CONTENT: "duplicate_content",
@@ -397,6 +412,50 @@ class Pipeline:
             parts=len(parts),
             bytes=Path(result.path).stat().st_size,
         )
+        self.reopen_session(session_key)
+        return True
+
+    # --- §9.2 再オープン ---------------------------------------------------
+
+    def reopen_session(self, session_key: SessionKey) -> bool:
+        """確定済みのセッションへ新しい Part が入ったら作り直す（§9.2 / §9.3）。
+
+        **契機は `RAW_SAVED` である。**分組（§10.4）ではない — 分組は `DISCOVERED` の
+        時点で走るので、そこで `MERGING` へ戻すと**まだ文字起こししていない Part を
+        含んだまま統合し、本文が欠けた Daily ノートを書く**（§14.1 の削除根拠になる）。
+
+        `allow_reopen` が偽なら何もしない。**その日のノートは最初の確定時のまま残り、
+        あとから来た Part は載らない。**（既定は真である）
+
+        Daily ノートは同じファイル名へ atomic write で上書きされるので**増殖しない**
+        （§13.6）。`regenerated_count` が何回作り直したかを持つ。
+        """
+        if not self.cfg.session.allow_reopen:
+            return False
+        session = self.database.get_session(session_key)
+        if session is None or session.status not in REOPENABLE:
+            return False
+
+        try:
+            self.database.record_transition(
+                EntityType.SESSION,
+                session_key,
+                from_status=session.status,
+                to_status=SessionStatus.MERGING,
+                detail="reopen",
+                now=self.now,
+            )
+        except TransitionConflict:
+            # 別の経路が先に動かした。**握って次へ進む**（1 件で全体を止めない）
+            return False
+        self.database.update_session(
+            session_key, regenerated_count=session.regenerated_count + 1, now=self.now
+        )
+        self.log.info(
+            "session_reopened",
+            session_key=session_key,
+            regenerated_count=session.regenerated_count + 1,
+        )
         return True
 
     def _raw_parts(self, session_key: SessionKey) -> list[raw.RawPart]:
@@ -558,18 +617,23 @@ class Pipeline:
     def ensure_merged(self, row: Session, transcript: session.SessionTranscript | None) -> bool:
         """`READY → MERGING → MERGED`（§9.3 / §10.8）。**冪等。**
 
+        **既に `MERGING` の行も進める。**再オープン（§9.3 の `SAVED` / `COMPLETED` 行）は
+        `MERGING` へ戻すので、`READY` だけを受け付けると**作り直しが次の起動まで動かない**
+        （`recover_interrupted()` が巻き戻すのは起動時の 1 回だけである）。
+
         **有効な Part が 0 件なら、ノートを作らずセッションを `COMPLETED` にする**
         （`session_empty`。§10.8）。**`FAILED` にしない** — 無音だけの日は異常ではない。
         """
         session_key = SessionKey(row.session_key)
         if row.status in MERGED_OR_BEYOND:
             return True
-        if row.status != SessionStatus.READY:
+        if row.status not in MERGEABLE:
             return False
 
         parts = self.database.recordings_for_session(session_key)
         excluded = [p for p in parts if p.status in session.EXCLUDED_FROM_MERGE]
-        self._session_transition(session_key, SessionStatus.READY, SessionStatus.MERGING)
+        if row.status == SessionStatus.READY:
+            self._session_transition(session_key, SessionStatus.READY, SessionStatus.MERGING)
 
         if transcript is None:
             self._session_transition(session_key, SessionStatus.MERGING, SessionStatus.COMPLETED)
