@@ -346,3 +346,56 @@ def test_ensure_merged_continues_from_merging(
     assert after is not None
     assert after.status == SessionStatus.COMPLETED
     assert "session_empty" in logger[1].getvalue()
+
+
+def test_reaching_raw_saved_reopens_the_session(
+    database: Database,
+    make_config: Callable[..., Config],
+    vault: object,
+    logger: tuple[Logger, io.StringIO],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**`ensure_raw_note()` が再オープンを呼ぶこと**（§9.3 の `SAVED` → `MERGING` 行）。
+
+    **配線そのものを見る。**`reopen_session()` を直接呼ぶテストだけだと、
+    **呼び出しを消しても全部緑のまま通る**（意図的に壊して確かめたら実際に通った）。
+    #31 で直した不具合とまったく同じ種類の穴である。
+
+    レンダリングは別のテスト（`test_raw_render.py`）が見るので、ここでは
+    `write_raw_note()` を差し替えて「`RAW_SAVED` に達したあと何が起きるか」だけを見る。
+    """
+    from pathlib import Path
+
+    from voicedock import notes, raw
+
+    cfg = make_config({"timezone": "Asia/Tokyo", "obsidian": {"root": str(vault)}})
+    add_session(database, status=SessionStatus.SAVED)
+    part = add_part(database, index=0)
+    database.conn.execute(
+        "UPDATE recordings SET session_key = ?, status = ? WHERE partkey = ?",
+        (KEY, PartStatus.TRANSCRIBED, part.partkey),
+    )
+    database.conn.commit()
+
+    written = Path(cfg.obsidian.root) / "raw.md"
+    written.write_text("# raw\n", encoding="utf-8")
+    result = raw.RawNoteResult(
+        path=written,  # type: ignore[arg-type]
+        sha256="0" * 64,
+        verification=(notes.CheckResult(rule="R-1", ok=True, detail=""),),
+    )
+    monkeypatch.setattr(
+        pipeline.Pipeline,
+        "_raw_parts",
+        lambda _self, _key: [object()],
+    )
+    monkeypatch.setattr(raw, "write_raw_note", lambda *_args, **_kwargs: result)
+
+    record = database.get_recording(part.partkey)
+    assert runner(database, cfg, logger[0]).ensure_raw_note(record)
+
+    assert database.get_recording(part.partkey).status == PartStatus.RAW_SAVED  # type: ignore[union-attr]
+    row = database.get_session(KEY)
+    assert row is not None
+    assert row.status == SessionStatus.MERGING, "RAW_SAVED に達しても再オープンしていない"
+    assert "session_reopened" in logger[1].getvalue()
