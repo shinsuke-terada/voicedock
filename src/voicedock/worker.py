@@ -31,7 +31,7 @@ from voicedock.device import DeviceInventory
 from voicedock.heartbeat import DEFAULT_STATE_ROOT, read_heartbeat
 from voicedock.log import Logger
 from voicedock.paths import PartKey, SessionKey
-from voicedock.states import PART_TERMINAL, SessionStatus
+from voicedock.states import PART_TERMINAL
 
 STOP_SIGNALS: Final[tuple[signal.Signals, ...]] = (signal.SIGTERM, signal.SIGINT)
 """`tini` が転送する停止シグナル（§18.3）。"""
@@ -268,18 +268,22 @@ class Worker:
             )
 
     def ready_session_keys(self) -> list[str]:
-        """統合へ進めるセッション（§9.3 の `READY → MERGING` のガード）。
+        """`process_session()` に渡すセッション（§9.3）。
 
-        **`MERGING` も拾う。**再オープン（§9.3 の `SAVED` / `COMPLETED` 行）は `MERGING` へ
-        戻すので、`READY` だけを見ると**作り直しが次の起動まで動かない**
-        （`recover_interrupted()` が巻き戻すのは起動時の 1 回だけである）。
+        **走査対象は `pipeline.PROCESSABLE` である。**ここはセッションの唯一の入口なので、
+        **この集合から漏れた状態に座った行は誰にも拾われない。**
 
-        **中身の処理は #27 が実装する。**ここはガード条件だけを確定させる —
-        「全 Part が終端状態」を取り違えると、**進行中の Part を含むセッションを統合して
-        本文が欠けたノートを書く**（§14.1 の削除根拠になる）。
+        v5.13 までは `{READY, MERGING}` だけを見ていた。`resume_failed()` は `FAILED` を
+        **落ちた工程へ**戻すので（§15.2）、LLM で落ちた行は `ANALYZING` に戻ってくるが
+        走査されない。**再起動しても直らない** — §9.4 の巻き戻しは `ANALYZING → MERGED`
+        へ移すだけで、`MERGED` もまた走査対象外だったからである。
+        LLM が一度落ちると、その日のセッションは二度と進まなかった（#97）。
+
+        **ガード条件「全 Part が終端状態」は変えない。**取り違えると**進行中の Part を
+        含むセッションを統合して本文が欠けたノートを書く**（§14.1 の削除根拠になる）。
         """
         ready: list[str] = []
-        for status in (SessionStatus.READY, SessionStatus.MERGING):
+        for status in sorted(pipeline.PROCESSABLE):
             for row in self.database.sessions_with_status(status):
                 parts = self.database.recordings_for_session(row.session_key)
                 if parts and all(part.status in PART_TERMINAL for part in parts):
