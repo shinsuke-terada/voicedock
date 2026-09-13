@@ -3,8 +3,13 @@ name: CI
 on:
   push:
     branches: [main, develop]
+  # feat/** も対象にする。**積み上げた PR（stacked PR）で CI が走らないのを避けるため。**
+  # develop へ直接向けられない PR（マージ前の別ブランチを base にするもの）は
+  # base が main / develop でないため、この行が無いと 1 度も検証されないまま
+  # マージ可能な状態に見える。base が先にマージされれば GitHub が自動で
+  # develop へ張り替えるので、そのときは通常の経路で再度走る。
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, "feat/**", "docs/**"]
 
 permissions:
   contents: read
