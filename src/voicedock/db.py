@@ -474,6 +474,27 @@ class Database:
             size_bytes=file_size(self.path),
         )
 
+    def recording_by_normalized_path(self, normalized_path: str) -> Recording | None:
+        """その `normalized_path` を使っている行（§10.5 の slug 衝突の確認）。
+
+        **索引は要らない。**`slug` は `partkey` から決まるので 1 件引くだけである
+        （v5.0→v5.1 の変更 M-7 の注記）。**確率で安全を担保しない** — 衝突したまま進むと
+        別 Part の音声を自分のものとして文字起こしし、その結果で §14.1 が真になる。
+        """
+        row = self.conn.execute(
+            "SELECT * FROM recordings WHERE normalized_path = ?", (normalized_path,)
+        ).fetchone()
+        return None if row is None else _from_row(Recording, row)
+
+    def recording_by_sha256(self, digest: str) -> Recording | None:
+        """同じ `sha256` を持つ行（§10.5 の二重処理防止）。
+
+        `idx_recordings_sha` が UNIQUE なので INSERT でも弾けるが、**変換の直後に
+        確かめて `SKIPPED` へ倒す**ほうが `IntegrityError` を状態遷移に変換するより素直である。
+        """
+        row = self.conn.execute("SELECT * FROM recordings WHERE sha256 = ?", (digest,)).fetchone()
+        return None if row is None else _from_row(Recording, row)
+
     def _count(self, table: str) -> int:
         row = self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()  # noqa: S608
         return int(row[0])
