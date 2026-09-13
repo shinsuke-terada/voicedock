@@ -23,7 +23,7 @@
 | **スキーマ（§8.2〜§8.5）** | `tests/unit/test_db.py` `tests/unit/test_migration_rules.py` |
 | 状態遷移 | `tests/unit/test_states.py` `tests/unit/test_db.py` |
 | クラッシュリカバリ | `tests/unit/test_pipeline_contract.py` |
-| リトライ | `tests/unit/test_db.py` `tests/unit/test_worker_loop.py` |
+| リトライ | `tests/unit/test_retry.py` `tests/unit/test_db.py` `tests/unit/test_worker_loop.py` |
 | JSON 抽出 | `tests/unit/test_json_extract.py` |
 | スキーマ生成 | `tests/unit/test_llm_schema.py` |
 | Pydantic 検証 | `tests/unit/test_llm_schema.py` |
