@@ -15,7 +15,12 @@ from pathlib import Path
 
 import pytest
 
-from tests.spec_sync import spec_event_names, spec_log_json_example, spec_log_text_examples
+from tests.spec_sync import (
+    spec_body_event_mentions,
+    spec_event_names,
+    spec_log_json_example,
+    spec_log_text_examples,
+)
 from voicedock import log
 from voicedock.log import EVENTS, MAX_VALUE_CHARS, REDACTED, Logger, get_logger
 
@@ -109,6 +114,26 @@ def _emit(
 def test_event_registry_matches_spec() -> None:
     """§16.4 の一覧と EVENTS が 1 対 1 であること（過不足の両方を検出する）。"""
     assert frozenset(spec_event_names()) == EVENTS
+
+
+def test_every_event_the_spec_body_asks_for_is_registered() -> None:
+    """**本文が出力を指示している名前が §16.4 の一覧に在ること**（v5.2→v5.3 の変更 O-5）。
+
+    `Logger._emit` は未登録の名前に `ValueError` を投げる。**食い違いは文書の問題ではなく、
+    書けば必ず落ちるコードである。**v5.0 で一覧を 68 件から 28 件へ削ったとき
+    `already_known`（§9.3 / §10.2）と `audio_probe_failed`（§10.5）が落ち、
+    **3 版にわたって誰も気づかなかった。**#16 の実装で初めて分かった。
+
+    足りない側だけを見る。逆（一覧に在るが本文が触れない）は、§16.2 の例だけに
+    現れるイベントが正当に存在するため落とせない。
+    """
+    mentioned = spec_body_event_mentions()
+    missing = {name: lines for name, lines in mentioned.items() if name not in EVENTS}
+    assert not missing, (
+        "SPEC の本文が §16.4 に無いイベント名の出力を指示しています"
+        f"（{{名前: 行番号}} = {missing}）。"
+        "§16.4 の原則に従い、名前を増やさず reason= / error_code= で表すこと"
+    )
 
 
 def test_event_order_follows_spec() -> None:
