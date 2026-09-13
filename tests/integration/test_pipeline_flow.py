@@ -219,23 +219,24 @@ def test_only_orig_parts_are_registered(flow: Flow) -> None:
 def test_every_part_reaches_a_terminal_state(flow: Flow) -> None:
     """F-1: Part が終端状態まで進む（§9.1）。**無音は `SKIPPED`、失敗ではない**（§10.6）。
 
-    **終端は `RAW_SAVED` である。**`RAW_SAVED → COMPLETED` は §9.3 の「削除要求」行で、
-    `delete_source_audio == false` なら `COMPLETED` へ進むが、**その評価は #36 の
-    `cleaner.py` が入ってからである。**セッションの進行判定には `RAW_SAVED` で足りる
-    （§9.1 の終端状態一覧）。
+    **`delete_source_audio: false` なので `COMPLETED` まで行く**（§9.3 の
+    `RAW_SAVED → COMPLETED` 行）。元音声はデバイスに残ったままである。
     """
     terminal = {status.value for status in PART_TERMINAL}
     rows = flow.database.conn.execute("SELECT partkey, status FROM recordings").fetchall()
     assert all(row["status"] != PartStatus.FAILED for row in rows), [dict(r) for r in rows]
     assert all(row["status"] in terminal for row in rows), [dict(r) for r in rows]
-    assert {row["status"] for row in rows} == {PartStatus.RAW_SAVED}, [dict(r) for r in rows]
+    assert {row["status"] for row in rows} == {PartStatus.COMPLETED}, [dict(r) for r in rows]
 
 
 @pytest.mark.needs_ffmpeg
 def test_the_session_is_saved(flow: Flow) -> None:
-    """F-2: セッションが `SAVED` まで進む（削除は無効なのでここが終端。§9.2）。"""
+    """F-2: セッションが `COMPLETED` まで進む（§9.2）。
+
+    **削除が無効なので `SAVED → CLEANUP → COMPLETED` を通る**（§9.3）。元音声は残る。
+    """
     session = flow.session()
-    assert session.status == SessionStatus.SAVED, session.status  # type: ignore[attr-defined]
+    assert session.status == SessionStatus.COMPLETED, session.status  # type: ignore[attr-defined]
     assert session.part_count == len(ORIG_RECORDINGS)  # type: ignore[attr-defined]
     assert session.failed_part_count == 0  # type: ignore[attr-defined]
 
