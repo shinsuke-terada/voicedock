@@ -362,9 +362,10 @@ def test_the_second_tick_changes_nothing(flow: Flow) -> None:
     before = {p: p.read_bytes() for p in sorted(flow.vault.rglob("*.md"))}
     calls_before = len(flow.requests)
 
+    stream = io.StringIO()
     runner = worker.Worker(
         cfg=flow.cfg,
-        log=Logger(level="DEBUG", fmt="text", stream=io.StringIO(), tz=JST),
+        log=Logger(level="DEBUG", fmt="text", stream=stream, tz=JST),
         database=flow.database,
         state_root=flow.data.parent / "state",
         clock=lambda: NOW,
@@ -374,6 +375,15 @@ def test_the_second_tick_changes_nothing(flow: Flow) -> None:
     after = {p: p.read_bytes() for p in sorted(flow.vault.rglob("*.md"))}
     assert after == before, "2 周目でノートが書き換わった"
     assert len(flow.requests) == calls_before, "2 周目で LLM を呼び直している"
+    # **走査が動いたうえで何も登録されなかったこと**を見る。「何も起きない」だけだと、
+    # 走査そのものが壊れていても通る。
+    #
+    # **既に取り込んだ Part は 2 周目の inbox に無い。**`inbox_retain: normalized` が
+    # `NORMALIZED` で原本を消すので、`already_known` ではなく「そもそも見えない」に
+    # なる（`already_known` の経路は `tests/unit/test_discover.py` が見る）。
+    second = stream.getvalue()
+    assert "part_skipped" in second, "2 周目に走査が動いていない"
+    assert "part_discovered" not in second, second
 
 
 @pytest.mark.needs_ffmpeg

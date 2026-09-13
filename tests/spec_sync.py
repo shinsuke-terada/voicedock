@@ -229,6 +229,18 @@ def spec_config_example() -> dict[str, object]:
     return document
 
 
+def spec_skip_reasons() -> set[str]:
+    """本文が `reason=<name>` として名指しする理由（§5.3 / §10.2 / §16.4 / §20.1）。
+
+    **`reason=` の値は実装の定数ではなく SPEC の語である。**定数を持っているだけだと、
+    値を書き換えてもテストが一緒に動いて通ってしまう（実際に通った）。
+    """
+    found = set(re.findall(r"reason=([a-z_]+)", spec_text()))
+    if not found:
+        pytest.fail("SPEC の reason= を読み取れませんでした")
+    return found
+
+
 def spec_unit_test_targets() -> list[str]:
     """§20.1 の表の「対象」列を出現順に返す。
 
