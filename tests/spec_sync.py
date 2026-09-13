@@ -121,6 +121,27 @@ def spec_event_names() -> list[str]:
     return [name.strip() for name in re.split(r"[/\n]", m.group(1)) if name.strip()]
 
 
+def spec_body_event_mentions() -> dict[str, list[int]]:
+    """本文（§16.4 より前）が `LEVEL event_name` の形で出力を指示している名前を返す。
+
+    **v5.0 で §16.4 を 68 件から 28 件へ削ったとき、本文がまだ名前を指示している
+    2 件（`already_known` / `audio_probe_failed`）が一覧から落ちた。**`log.py` は
+    未登録のイベント名に `ValueError` を投げるので、**これは文書の食い違いではなく
+    「書けば必ず落ちるコード」である。**3 版にわたって誰も気づかなかった
+    （v5.2→v5.3 の変更 O-5）。
+
+    戻り値は `{イベント名: [SPEC の行番号, ...]}`。
+    """
+    text = spec_text()
+    body = text[: text.index("### 16.4")]
+    found: dict[str, list[int]] = {}
+    for match in re.finditer(r"`?(?:DEBUG|INFO|WARN|ERROR)[ \t]+([a-z][a-z0-9_]{4,})`?", body):
+        # **同じ行に限る。**`logging:` の設定例は `level: INFO` の次の行が `format: text`
+        # なので、改行をまたぐと "INFO format" を拾ってしまう
+        found.setdefault(match.group(1), []).append(body[: match.start()].count("\n") + 1)
+    return found
+
+
 def spec_subcommands() -> list[str]:
     """§17.1 の 1 つめの表（残すサブコマンド）から名前を出現順に返す。
 
