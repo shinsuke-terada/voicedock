@@ -702,16 +702,29 @@ def test_a_key_that_disagrees_with_the_path_blocks_the_request(scene: Scene) -> 
 
 
 def test_the_watchdog_terms_are_present_in_the_formula() -> None:
-    """**`len(parts) >= 1` と `source_path != ""` が論理式に在ること。**
+    """**振る舞いでは単独で落とせない項が論理式に在ること。**
 
-    この 2 つは**冗長な番犬として意図的に置かれている**（§14.1）。
-    `_orig` 固定でスカラーに退化し、他の条件が先に受け止めるので、
-    **削ってもどのテストも落ちない。**だから「在ること」そのものを固定する。
+    §14.1 は**冗長な番犬を意図的に置いている。**他の条件が必ず先に受け止めるので、
+    削ってもどのテストも落ちない。だから「在ること」そのものを固定する。
+    **消したくなったら §14.1 の本文を先に直すこと。**
 
-    消したくなったら §14.1 の本文を先に直すこと。**空集合の `all()` は真になり、
-    `os.path.join(volume, "")` はボリュームのルートを指す**（v3.0 の欠陥 A-14 と同型）。
+    | 項 | なぜ振る舞いで落とせないか |
+    |---|---|
+    | `len(parts) >= 1` | 空集合だと保存検証（W-7 の完全一致）が先に偽になる |
+    | `part.source_path != ""` | 空文字は `target_is_identical()` が先に偽にする |
+    | Raw / Daily の鍵の包含 | `verify_note()` の R-6 / W-7 が**同じ鍵の集合**を見ている |
+
+    **鍵の包含を残す理由。**R-6 / W-7 が見るのは `expected_keys`（この Session の
+    全 Part から導く集合）であり、**この Part 1 件の話ではない。**導き方が変われば
+    重なりは消える。§14.1 が両方を並べているのはそのためである。
+
+    **空集合の `all()` は真になり、`os.path.join(volume, "")` はボリュームのルートを
+    指す**（v3.0 の欠陥 A-14 と同型）。
     """
     source = inspect.getsource(cleaner.can_delete_source)
     assert "len(parts) >= 1" in source
     assert 'part.source_path != ""' in source
     assert "all(" in source, "全 Part 終端条件が消えている"
+    assert source.count("_note_contains(") == 2, "Raw と Daily の両方で鍵の包含を見ること"
+    assert "session.raw_output_path, part.partkey" in source
+    assert "session.output_path, part.partkey" in source
