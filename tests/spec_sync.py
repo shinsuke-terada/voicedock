@@ -269,6 +269,15 @@ def spec_rule_ids(section: str, prefix: str) -> list[str]:
     return found
 
 
+def spec_section_text(section: str) -> str:
+    """`### <section>` の本文をそのまま返す。
+
+    **表にもコードブロックにも入っていない規定を固定するために使う。**§10.4 の
+    「再オープンの契機」のように、散文でしか書けない規則がある。
+    """
+    return _section(section)
+
+
 def spec_section_code(section: str, language: str, index: int = 0) -> str:
     """`### <section>` の `index` 番目の ```<language> ブロックを返す。
 
