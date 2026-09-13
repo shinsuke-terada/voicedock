@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,6 +50,55 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         for marker, ok in available.items():
             if marker in item.keywords and not ok:
                 item.add_marker(pytest.mark.skip(reason=f"{marker} が無い{_MARKER_REASON}"))
+
+
+# --- ネットワーク遮断（§14.5 / §14.4 N-7） -------------------------------
+
+
+class NetworkBlocked(RuntimeError):
+    """テストが外部へ繋ごうとした（§14.5）。"""
+
+
+_BLOCKED_FAMILIES = (socket.AF_INET, socket.AF_INET6)
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """**すべてのテストでネットワークを遮断する**（§14.5 / §14.4 N-7）。
+
+    §14.5 は「**コンテナは外部ネットワークへ出ない**」と規定している。外部 LLM API への
+    フォールバックを書くと**音声の内容が外へ出る。**「書いていない」ではなく
+    **「書いたら落ちる」**状態にするために、統合テストだけでなく**全テストに掛ける。**
+    正当にネットワークが要るテストは 1 つも無い（LLM は `httpx.MockTransport`。§20.2）。
+
+    **遮断するのは `AF_INET` / `AF_INET6` だけである。**`AF_UNIX` を塞ぐと pytest や
+    coverage の内部まで巻き添えにする（**遮断しすぎてテスト基盤ごと落とすほうが害が大きい**）。
+
+    **`socket()` の生成そのものは許す。**生成を禁じると `httpx` の初期化が落ち、
+    「繋ごうとした」ではなく理由の分からないエラーになる。
+
+    **子プロセスには掛からない**（monkeypatch は自プロセスのみ）。Helper / whisper /
+    ffmpeg がネットワークを使わないことは `test_helper_portability.py` と §20.4 が別に見る。
+    """
+
+    def blocked_connect(self: socket.socket, address: Any) -> None:
+        if self.family in _BLOCKED_FAMILIES:
+            raise NetworkBlocked(f"テストが外部へ繋ごうとした: {address!r}（§14.5）")
+        _real_connect(self, address)
+
+    def blocked_connect_ex(self: socket.socket, address: Any) -> int:
+        if self.family in _BLOCKED_FAMILIES:
+            raise NetworkBlocked(f"テストが外部へ繋ごうとした: {address!r}（§14.5）")
+        return int(_real_connect_ex(self, address))
+
+    def blocked_create_connection(address: Any, *_args: object, **_kwargs: object) -> None:
+        raise NetworkBlocked(f"テストが外部へ繋ごうとした: {address!r}（§14.5）")
+
+    _real_connect = socket.socket.connect
+    _real_connect_ex = socket.socket.connect_ex
+    monkeypatch.setattr(socket.socket, "connect", blocked_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", blocked_connect_ex)
+    monkeypatch.setattr(socket, "create_connection", blocked_create_connection)
 
 
 # --- 時刻 ----------------------------------------------------------------

@@ -1,0 +1,7 @@
+{
+  "summary": "VoiceDock の削除条件を論理式へ落とした。",
+  "key_points": ["削除の根拠をテキストの保全に置く"],
+  "tasks": [{"text": "ND テストを 31 件書く", "due": "2026-09-20"}],
+  "decisions": [],
+  "ideas": []
+}
