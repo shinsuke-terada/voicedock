@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 import pytest
 import yaml
 
+from tests.spec_sync import spec_section_code
 from voicedock import paths
 from voicedock.paths import (
     DATA_ROOT,
@@ -384,6 +385,20 @@ def test_partkey_is_pinned() -> None:
     """
     key = paths.partkey_for(PINNED_DEVICE_ID, DevicePath(PurePosixPath(PINNED_RELPATH)))
     assert key == PINNED_PARTKEY
+
+
+def test_the_spec_names_partkey_for_as_the_only_source() -> None:
+    """§5.3 の Part キーが `partkey_for()` であること（v5.2→v5.3 の変更 O-4）。
+
+    **v5.2 まで §5.3 は `part_key = (transmitter_id, mic_index, started_at)` と書いていた。**
+    v5.1 で §8.1 が自然キーへ移ったのに、§5.3 は v4.x の複合キーのままだった。しかも
+    **`transmitter_id` は §5.2 自身が「弱い識別子。恒久 ID として使わない」と書いている値**
+    である。素直に読んだ実装者は二重処理防止をこの組で書き、**主キー制約とは別の
+    同一性判定が 2 系統できる。**
+    """
+    block = spec_section_code("5.3", "python")
+    assert "partkey_for" in block, "§5.3 が partkey_for() 以外の算出規則を示している"
+    assert "transmitter_id" not in block, "§5.3 に v4.x の複合キーが戻っている"
 
 
 def test_key_slug_is_pinned() -> None:
