@@ -33,6 +33,9 @@ StagingPath = NewType("StagingPath", Path)
 """`/data` 配下。変換後の 16 kHz 音声や transcript JSON。"""
 
 VaultPath = NewType("VaultPath", Path)
+
+QueuePath = NewType("QueuePath", Path)
+"""`/queue` 配下（削除要求と結果）。**デバイス上のパスではない**（§14.3）。"""
 """`/obsidian` 配下。**削除しない**（`os.replace()` で上書きするだけ）。"""
 
 PartKey = NewType("PartKey", str)
@@ -316,7 +319,7 @@ def key_slug(key: PartKey | SessionKey) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
-# --- 削除（§14.4 N-10 が許す 3 本） --------------------------------------
+# --- 削除（§14.4 N-10 が許す 4 本） --------------------------------------
 
 
 def safe_unlink_inbox(path: InboxPath, *, missing_ok: bool = False) -> None:
@@ -331,6 +334,30 @@ def safe_unlink_inbox(path: InboxPath, *, missing_ok: bool = False) -> None:
 def safe_unlink_staging(path: StagingPath, *, missing_ok: bool = False) -> None:
     """`/data` 配下の中間ファイルを削除する。"""
     _unlink(path, (DATA_ROOT,), missing_ok=missing_ok)
+
+
+QUEUE_SUBDIRS: Final = ("delete", "result")
+"""`/queue` の下で消してよいディレクトリ（§14.3）。"""
+
+
+def safe_unlink_queue(path: QueuePath, *, root: Path, missing_ok: bool = True) -> None:
+    """`<queue_root>` 配下の削除要求・結果を削除する（§10.12 / §14.3）。
+
+    **デバイス上の削除とは別物である。**キューはコンテナと reaper のあいだの受け渡しで
+    あり、要求の取り下げ（`request_id` を変えて再投入する）と結果の回収はコンテナの
+    責務である（§9.3 の `SOURCE_DELETING` 行）。
+
+    **`root` を引数で受けるのは `cleanup.queue_root` が設定値だからである**
+    （`INBOX_ROOT` / `DATA_ROOT` と違ってモジュール定数に固定できない）。そのぶん
+    **`delete/` か `result/` の直下にある `.json` に限る**という条件を足してある —
+    設定を変えれば何でも消せる、という抜け道を作らない。
+
+    `missing_ok` の既定が真なのは、**reaper が同じファイルを同時に片付けうる**ためである。
+    """
+    target = _as_path(path)
+    if target.suffix != ".json" or target.parent.name not in QUEUE_SUBDIRS:
+        raise ValueError(f"queue の delete/ か result/ 配下の .json ではありません: {target}")
+    _unlink(target, (root, QUEUE_ROOT), missing_ok=missing_ok)
 
 
 def safe_unlink_tmp(path: Path, *, missing_ok: bool = True) -> None:

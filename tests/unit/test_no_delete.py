@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from voicedock import cleaner, device, llm, notes, paths
+from voicedock import cleaner, device, llm, notes, paths, pipeline
 from voicedock.config import Config
 from voicedock.db import Database, Recording, Session
 from voicedock.device import DeviceInventory
@@ -805,3 +805,134 @@ def test_the_reaper_layer_lives_in_its_own_file() -> None:
     found = re.findall(r"^def test_nd(\d+)", other.read_text(encoding="utf-8"), re.M)
     covered = {f"ND-{int(number):02d}" for number in found}
     assert reaper_layer <= covered, sorted(reaper_layer - covered)
+
+
+# --- §10.12 結果の回収（reaper との往復） ------------------------------
+
+
+def write_result(scene: Scene, *, status: str = "DELETED", detail: str = "", **extra: str) -> Path:
+    """reaper が書いた体の結果を置く（§14.1.1 の結果の形式。v5.9→v5.10 の変更 X-1）。"""
+    directory = scene.queue / cleaner.RESULT_DIRNAME
+    directory.mkdir(parents=True, exist_ok=True)
+    request_id = extra.pop("request_id", "20260913T090000-slug-a1b2c3")
+    payload = {
+        "schema": 1,
+        "request_id": request_id,
+        "completed_at": "2026-09-13T09:00:00+09:00",
+        "reaper_version": "5.9.0",
+        "device_id": DEVICE_ID,
+        "partkey": extra.pop("partkey", PARTKEY),
+        "status": status,
+        "detail": detail,
+    }
+    path = directory / f"{request_id}.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def gone(scene: Scene) -> DeviceInventory:
+    """デバイス上からそのファイルが消えた状態の `inventory.json`。"""
+    return DeviceInventory(generated_at=NOW, mount_readonly=False, devices={DEVICE_ID: frozenset()})
+
+
+def test_a_successful_result_completes_the_part(scene: Scene) -> None:
+    """§10.12: 結果が成功 ∧ `inventory.json` でも不在 → `COMPLETED`。"""
+    assert scene.part().status == PartStatus.SOURCE_DELETING
+    result = write_result(scene)
+    moved = scene.runner.collect_delete_results([scene.part()], gone(scene))
+
+    assert moved == 1
+    assert scene.part().status == PartStatus.COMPLETED
+    assert scene.part().source_deleted_at is not None, "不可逆操作の記録が入らない"
+    assert not result.exists(), "回収した結果を捨てていない"
+    assert "source_deleted" in scene.log.getvalue()
+
+
+def test_a_result_the_inventory_disagrees_with_goes_pending(scene: Scene) -> None:
+    """**reaper の自己申告だけを信じない**（§10.12 / N-12）。
+
+    `queue/result/` は reaper の申告であり、`state/inventory.json` は ingest が
+    **独立に**走査した結果である。**両方が一致して初めて `COMPLETED` にする。**
+    """
+    write_result(scene)
+    scene.runner.collect_delete_results([scene.part()], scene.inventory)
+
+    assert scene.part().status == PartStatus.SOURCE_DELETE_PENDING
+    assert scene.part().source_deleted_at is None, "消えていないのに記録している"
+    assert "source_delete_pending" in scene.log.getvalue()
+
+
+def test_an_identity_mismatch_goes_pending(scene: Scene) -> None:
+    """reaper が同定に失敗 → `SOURCE_DELETE_PENDING`。**削除しない**（§10.12）。"""
+    write_result(scene, status="SOURCE_IDENTITY_MISMATCH", detail="size_mismatch")
+    scene.runner.collect_delete_results([scene.part()], gone(scene))
+
+    assert scene.part().status == PartStatus.SOURCE_DELETE_PENDING
+    assert "reason=size_mismatch" in scene.log.getvalue()
+
+
+def test_an_unknown_inventory_does_not_complete(scene: Scene) -> None:
+    """`inventory.json` が読めないときは `COMPLETED` にしない（§7.5 の「不明は安全側」）。"""
+    write_result(scene)
+    scene.runner.collect_delete_results([scene.part()], None)
+    assert scene.part().status == PartStatus.SOURCE_DELETE_PENDING
+
+
+def test_a_result_for_another_part_is_left_alone(scene: Scene) -> None:
+    """**別の Part の結果は捨てない。**そのセッションを処理する周回で回収される。"""
+    result = write_result(scene, partkey=f"{DEVICE_ID}/other/other.wav")
+    moved = scene.runner.collect_delete_results([scene.part()], gone(scene))
+
+    assert moved == 0
+    assert result.exists()
+    assert scene.part().status == PartStatus.SOURCE_DELETING
+
+
+def test_a_result_for_a_part_that_moved_on_is_left_alone(scene: Scene) -> None:
+    """**`SOURCE_DELETING` でない Part の結果には触れない。**
+
+    **`partkey` が一致するかどうかだけでは足りない**（意図的に状態の条件を外したら
+    テストが緑のまま通った）。再投入で新しい要求を出したあとに古い結果が届くと、
+    **1 回の削除で 2 回 `COMPLETED` へ進めてしまう。**
+    """
+    scene.set_part(status=PartStatus.COMPLETED)
+    result = write_result(scene)
+    moved = scene.runner.collect_delete_results([scene.part()], gone(scene))
+
+    assert moved == 0
+    assert result.exists(), "別の周回で回収されるべき結果を捨てている"
+    assert scene.part().status == PartStatus.COMPLETED
+    assert scene.part().source_deleted_at is None
+
+
+def test_a_missing_result_expires_and_withdraws_the_request(scene: Scene) -> None:
+    """結果が来ないまま `delete_result_timeout_seconds` を過ぎたら取り下げる（§9.3）。
+
+    **reaper が存在しない場合もここへ落ちる**（安全ロック 2-A）。§10.12 は
+    「**これは正常な状態である**（Phase 7 前）」と規定している。
+
+    **要求をキューに残したままにしない** — 再試行は新しい `request_id` で投入する
+    （reaper の検証 11 がリプレイを拒むので、同じ ID では 2 度と通らない）。
+    """
+    assert scene.requests(), "要求が無い"
+    old = datetime.fromisoformat(scene.part().updated_at)
+    later = old.timestamp() + scene.cfg.cleanup.delete_result_timeout_seconds + 1
+
+    runner = pipeline.Pipeline(
+        database=scene.database,
+        cfg=scene.cfg,
+        log=Logger(level="DEBUG", fmt="text", stream=scene.log),
+        now=datetime.fromtimestamp(later, tz=JST),
+        state_root=scene.runner.state_root,
+    )
+    assert runner.collect_delete_results([scene.part()], scene.inventory) == 1
+
+    assert scene.part().status == PartStatus.SOURCE_DELETE_PENDING
+    assert scene.requests() == [], "古い要求がキューに残っている"
+
+
+def test_a_fresh_request_is_not_expired(scene: Scene) -> None:
+    """**タイムアウト前に取り下げない。**reaper は接続のたびにしか動かない。"""
+    assert scene.runner.collect_delete_results([scene.part()], scene.inventory) == 0
+    assert scene.part().status == PartStatus.SOURCE_DELETING
+    assert len(scene.requests()) == 1

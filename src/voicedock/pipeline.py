@@ -26,6 +26,7 @@ from pydantic import BaseModel, ValidationError
 from voicedock import audio, cleaner, daily, device, llm, paths, raw, session, transcribe, wiki
 from voicedock.config import Config
 from voicedock.db import Database, EntityType, Recording, Session, TransitionConflict
+from voicedock.device import DeviceInventory
 from voicedock.errors import ErrorCode, counts_against_max_attempts
 from voicedock.heartbeat import DEFAULT_STATE_ROOT
 from voicedock.log import Logger
@@ -551,11 +552,16 @@ class Pipeline:
             return False
         parts = self.database.recordings_for_session(session_key)
 
+        # **先に結果を回収する。**`SOURCE_DELETING` のまま残った行を片付けてから
+        # 新しい要求を評価しないと、同じ Part の要求が二重に並ぶ（§10.12）
+        inventory = device.read_inventory(self.state_root)
+        self.collect_delete_results(parts, inventory)
+        parts = self.database.recordings_for_session(session_key)
+
         if not self.cfg.cleanup.delete_source_audio:
             # **安全ロック 1 が掛かっている。**元音声を残したまま完了する（§9.3）
             return self._complete_without_deleting(row, parts)
 
-        inventory = device.read_inventory(self.state_root)
         requested = 0
         for part in parts:
             if part.status not in {status.value for status in PART_DELETABLE}:
@@ -587,6 +593,88 @@ class Pipeline:
 
         self._session_transition(session_key, row.status, SessionStatus.SOURCE_DELETING)
         return False
+
+    def collect_delete_results(
+        self, parts: list[Recording], inventory: DeviceInventory | None
+    ) -> int:
+        """reaper の結果を回収し、`SOURCE_DELETING` を進める（§10.12 / §9.3）。
+
+        **結果を 2 系統で確認する。**`queue/result/` は reaper の自己申告であり、
+        `state/inventory.json` は ingest が**独立に**走査した結果である。
+        **両方が一致して初めて `COMPLETED` にする**（§14.4 N-12 と同じ考え方）。
+
+        タイムアウト（`delete_result_timeout_seconds`）を超えた要求は取り下げ、
+        `SOURCE_DELETE_PENDING` にする。**reaper が存在しない場合もここへ落ちる** —
+        それは Phase 7 前の正常な状態である。
+
+        戻り値は状態を進めた件数。
+        """
+        by_key = {part.partkey: part for part in parts}
+        moved = 0
+        for result in cleaner.read_results(self.cfg):
+            part = by_key.get(result.partkey)
+            if part is None or part.status != PartStatus.SOURCE_DELETING:
+                # 別のセッションのもの、または既に片付いたもの。**捨てない** —
+                # そのセッションを処理する周回で回収される
+                continue
+            if not result.deleted:
+                self._delete_pending(part, ErrorCode.SOURCE_IDENTITY_MISMATCH, result.detail)
+            elif not cleaner.source_is_gone(part, inventory):
+                # **reaper は消したと言うが `inventory.json` にまだ在る**（§10.12）
+                self._delete_pending(part, ErrorCode.SOURCE_DELETE_FAILED, "still_in_inventory")
+            else:
+                self.database.update_recording(
+                    PartKey(part.partkey),
+                    source_deleted_at=self._moment().isoformat(timespec="seconds"),
+                    now=self.now,
+                )
+                self._transition(
+                    PartKey(part.partkey), PartStatus.SOURCE_DELETING, PartStatus.COMPLETED
+                )
+                self.log.info(
+                    "source_deleted", recording_key=part.partkey, request_id=result.request_id
+                )
+            cleaner.discard_result(result, cfg=self.cfg)
+            moved += 1
+
+        moved += self._expire_delete_requests(parts)
+        return moved
+
+    def _expire_delete_requests(self, parts: list[Recording]) -> int:
+        """結果が来ないまま `delete_result_timeout_seconds` を過ぎた要求を取り下げる。
+
+        **reaper が存在しない場合もここへ落ちる**（安全ロック 2-A）。§10.12 は
+        「**これは正常な状態である**（Phase 7 前）」と規定している。
+        """
+        limit = self.cfg.cleanup.delete_result_timeout_seconds
+        moment = self._moment()
+        expired = 0
+        for part in parts:
+            if part.status != PartStatus.SOURCE_DELETING:
+                continue
+            age = (moment - datetime.fromisoformat(part.updated_at)).total_seconds()
+            if age < limit:
+                continue
+            cleaner.withdraw_request(part.partkey, cfg=self.cfg)
+            self._delete_pending(part, ErrorCode.DELETE_TIMEOUT, "no_result")
+            expired += 1
+        return expired
+
+    def _delete_pending(self, part: Recording, code: ErrorCode, reason: str) -> None:
+        """`SOURCE_DELETING → SOURCE_DELETE_PENDING`（§9.3）。**ノートは残す。**"""
+        self.database.record_transition(
+            EntityType.RECORDING,
+            part.partkey,
+            from_status=PartStatus.SOURCE_DELETING,
+            to_status=PartStatus.SOURCE_DELETE_PENDING,
+            error_code=code,
+            detail=reason,
+            now=self.now,
+        )
+        self.log.warning("source_delete_pending", recording_key=part.partkey, reason=reason)
+
+    def _moment(self) -> datetime:
+        return self.now if self.now is not None else datetime.now(self.cfg.tz)
 
     def _complete_without_deleting(self, row: Session, parts: list[Recording]) -> bool:
         """`delete_source_audio == false` の経路（§9.3）。**元音声を残したまま完了する。**"""

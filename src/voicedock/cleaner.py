@@ -31,7 +31,7 @@ from voicedock.config import Config
 from voicedock.db import Recording, Session
 from voicedock.device import DeviceInventory
 from voicedock.log import Logger
-from voicedock.paths import DevicePath, PartKey, SessionKey, StagingPath
+from voicedock.paths import DevicePath, PartKey, QueuePath, SessionKey, StagingPath
 from voicedock.states import PART_DELETABLE, PART_TERMINAL, SESSION_DELETABLE
 
 QUEUE_SCHEMA: Final = 1
@@ -330,3 +330,98 @@ def cleanup_staging(part: Recording) -> None:
     for column in (part.normalized_path,):
         if column:
             paths.safe_unlink_staging(StagingPath(Path(column)), missing_ok=True)
+
+
+# --- §10.12 結果の回収 ---------------------------------------------------
+
+
+DELETED_STATUS: Final = "DELETED"
+"""reaper が削除に成功したときの `status`（§14.1.1 の結果の形式）。"""
+
+
+@dataclass(frozen=True)
+class DeleteResult:
+    """`queue/result/<request_id>.json`（§14.1.1 / v5.9→v5.10 の変更 X-1）。"""
+
+    path: Path
+    request_id: str
+    partkey: str
+    status: str
+    detail: str
+
+    @property
+    def deleted(self) -> bool:
+        return self.status == DELETED_STATUS
+
+
+def read_results(cfg: Config) -> list[DeleteResult]:
+    """`queue/result/` を読む。**壊れた結果は無視して先へ進む**（§7.5 と同じ方針）。
+
+    **`request_id` を解析して Part を引かない。**結果に載っている `partkey` を使う
+    （X-1）。組み立て規則に依存させると、規則を変えた瞬間に結果が迷子になる。
+    """
+    directory = Path(cfg.cleanup.queue_root) / RESULT_DIRNAME
+    if not directory.is_dir():
+        return []
+    found: list[DeleteResult] = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(document, dict):
+            continue
+        partkey = str(document.get("partkey", ""))
+        request_id = str(document.get("request_id", ""))
+        if not partkey or not request_id:
+            continue
+        found.append(
+            DeleteResult(
+                path=path,
+                request_id=request_id,
+                partkey=partkey,
+                status=str(document.get("status", "")),
+                detail=str(document.get("detail", "")),
+            )
+        )
+    return found
+
+
+def source_is_gone(part: Recording, inventory: DeviceInventory | None) -> bool:
+    """`state/inventory.json` でも不在を確認する（§10.12）。
+
+    **reaper の自己申告だけを信じない。**`inventory.json` は ingest が**独立に**走査した
+    結果なので、両方が一致して初めて `COMPLETED` にできる（§14.4 N-12 と同じ考え方）。
+
+    **読めない（`None`）ときは偽。**不明は安全側へ倒す — 確認できていないものを
+    「消えた」ことにしない。
+    """
+    if inventory is None or not part.source_path:
+        return False
+    return not inventory.contains(part.device_id, DevicePath(PurePosixPath(part.source_path)))
+
+
+def withdraw_request(partkey: str, *, cfg: Config) -> int:
+    """その Part 宛の削除要求をキューから取り下げる（§9.3 / §10.12）。
+
+    **要求をキューに残したままにしない。**再試行は**新しい `request_id`** で投入する
+    （reaper の検証 11 がリプレイを拒むので、同じ ID では 2 度と通らない）。
+    """
+    directory = Path(cfg.cleanup.queue_root) / DELETE_DIRNAME
+    if not directory.is_dir():
+        return 0
+    removed = 0
+    for path in sorted(directory.glob("*.json")):
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(document, dict) and document.get("partkey") == partkey:
+            paths.safe_unlink_queue(QueuePath(path), root=Path(cfg.cleanup.queue_root))
+            removed += 1
+    return removed
+
+
+def discard_result(result: DeleteResult, *, cfg: Config) -> None:
+    """回収済みの結果を捨てる。**`queue/` はコンテナが rw で持つ**（§18.2）。"""
+    paths.safe_unlink_queue(QueuePath(result.path), root=Path(cfg.cleanup.queue_root))
