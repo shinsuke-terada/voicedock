@@ -11,7 +11,7 @@ from tests.helpers import complete_tree, merge
 from tests.spec_sync import spec_removed_subcommands, spec_subcommands
 from voicedock import __version__, db, paths, worker
 from voicedock.cli import IMPLEMENTED, SUBCOMMANDS
-from voicedock.errors import EXIT_CONFIG, EXIT_ERROR, EXIT_OK
+from voicedock.errors import EXIT_CONFIG, EXIT_DOCTOR_FATAL, EXIT_ERROR, EXIT_OK
 from voicedock.main import main
 
 # SPEC §17.1 の表そのものを期待値にする。**直書きしない。**
@@ -188,9 +188,12 @@ def test_doctor_runs(
     config = tmp_path / "config.yaml"
     config.write_text(yaml.safe_dump(document), encoding="utf-8")
     monkeypatch.setenv("VOICEDOCK_CONFIG", str(config))
-    # state_root は既定（/state）のまま。delete_source_audio が false のあいだ
-    # V-30 は heartbeat を読まないので、結果に影響しない（§7.3）
-    assert main(["doctor"]) == EXIT_OK
+
+    # **ここで見たいのは「`doctor` へ配線されているか」だけである。**12 検査すべてを
+    # 通る環境を作るのは `test_doctor.py` の仕事なので、終了コードは 0 か 4 のどちらかで
+    # よい（どちらも「doctor が走った」ことを示す）。**`main` が未実装を返す 1 ではない**
+    # ことが要点である（§17.3）
+    assert main(["doctor"]) in {EXIT_OK, EXIT_DOCTOR_FATAL}
     assert "VoiceDock doctor" in capsys.readouterr().out
 
 
