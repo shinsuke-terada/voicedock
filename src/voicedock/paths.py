@@ -58,6 +58,8 @@ INBOX_ROOT: Final = Path("/inbox")
 DATA_ROOT: Final = Path("/data")
 VAULT_ROOT: Final = Path("/obsidian")
 QUEUE_ROOT: Final = Path("/queue")
+TRANSCRIPTS_ROOT: Final = DATA_ROOT / "transcripts" / "parts"
+"""Part transcript の置き場（§10.6 / §4.1）。**設定キーではない** — SPEC が固定している。"""
 
 # 一時ファイルの命名（§13.6）。`.` 始まりは検証途中のファイルを Obsidian に拾わせないため
 TMP_PREFIX: Final = "."
@@ -224,6 +226,15 @@ def relpath_of(key: PartKey) -> DevicePath:
     if not separator:
         raise ValueError(f"partkey に '/' がありません: {key!r}")
     return DevicePath(PurePosixPath(rest))
+
+
+def transcript_path_for(key: PartKey) -> Path:
+    """`/data/transcripts/parts/<slug>.json`（§10.6）。
+
+    **`partkey` をそのままファイル名にしない。**`/` と空白を含みうる（§5.4）。
+    `key_slug()` を通すのは §10.5 / §10.6 / §11.2 に共通の規約である（v5.0→v5.1 の変更 M-7）。
+    """
+    return TRANSCRIPTS_ROOT / f"{key_slug(key)}.json"
 
 
 def key_slug(key: PartKey | SessionKey) -> str:
