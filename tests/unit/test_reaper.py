@@ -419,3 +419,57 @@ def test_the_reaper_never_recurses_or_mounts() -> None:
     assert re.search(r"rm\s+-[a-zA-Z]*[rR]", body) is None
     assert "rmdir" not in body
     assert "shutil" not in body
+
+
+# --- 結果の形式（§14.1.1 / v5.9→v5.10 の変更 X-1） ---------------------
+
+
+def spec_result_keys() -> set[str]:
+    """§14.1.1 の「削除結果の形式」の JSON 例からキーを読む。"""
+    from tests.spec_sync import spec_text
+
+    text = spec_text()
+    start = text.index("**削除結果の形式**")
+    block = text[start : text.index("```", text.index("```json", start) + 7)]
+    document = json.loads(block[block.index("{") :])
+    assert isinstance(document, dict)
+    return set(document)
+
+
+def test_the_result_matches_the_spec_shape(bench: Bench) -> None:
+    """**結果の形式が §14.1.1 の例と一致すること**（X-1）。
+
+    **`partkey` が要る。**コンテナは `request_id` を解析せずに対応する Part を
+    引けなければならない — 組み立て規則に依存させると、**規則を変えた瞬間に結果が
+    迷子になる。**
+    """
+    bench.request()
+    bench.run()
+    written = bench.results()
+    assert len(written) == 1
+    assert set(written[0]) == spec_result_keys()
+    assert written[0]["partkey"] == PARTKEY
+    assert written[0]["device_id"] == DEVICE_ID
+    assert written[0]["status"] == "DELETED"
+
+
+def test_a_rejected_result_also_carries_the_key(bench: Bench) -> None:
+    """**拒否したときも `partkey` を載せる。**載せないと `SOURCE_DELETE_PENDING` へ
+    落とす相手が分からない（§10.12）。
+    """
+    bench.request(size=len(CONTENT) + 1)
+    bench.run()
+    written = bench.results()[0]
+    assert written["partkey"] == PARTKEY
+    assert written["status"] == "SOURCE_IDENTITY_MISMATCH"
+
+
+def test_a_replayed_result_also_carries_the_key(bench: Bench) -> None:
+    """リプレイの拒否でも同じ（**要求を読む前に落ちる経路**）。"""
+    bench.request()
+    bench.run()
+    bench.request()
+    bench.run()
+    written = bench.results()[0]
+    assert written["partkey"] == PARTKEY
+    assert written["detail"] == "replayed"
