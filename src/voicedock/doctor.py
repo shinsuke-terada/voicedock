@@ -1,7 +1,11 @@
 """環境診断（SPEC §19.2）。
 
 **検査は 1 チケット 1 行ずつ増える。**「新しい PR をマージしたら doctor の行が 1 本増える」
-ことを毎回の動作確認手段にしている。現在は D-1（設定）/ D-2（DB）/ D-3（データ領域）。
+ことを毎回の動作確認手段にしている。現在は D-1（設定）/ D-2（DB）/ D-3（データ領域）/
+D-7（whisper）/ D-8・D-9（モデル）。
+
+**番号は詰めない**（§19.2 の方針）。v5.0 で 34 検査から 17 検査へ削ったときも番号を
+詰めなかった（v4.6→v5.0 の変更 L-5）ので、D-4〜D-6 は欠番である。
 
 **診断は副作用を持ってはならない。**D-2 は `migrate=False` で接続する — doctor が
 スキーマを作ってしまうと「DB が無い」ことを「DB が無い」と報告できなくなる。
@@ -20,7 +24,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import IO, Any, Final
 
-from voicedock import db, paths
+from voicedock import db, paths, transcribe
 from voicedock.config import (
     ConfigError,
     ConfigUnreadable,
@@ -196,10 +200,62 @@ def check_data_volume(ctx: Context) -> list[Row]:
     return [Row(Status.OK, "Data volume", f"{root} writable, {free / GIB:.1f} GiB free")]
 
 
+def check_whisper_executable(ctx: Context) -> list[Row]:
+    """D-7: `whisper-cli` が存在し `--help` が成功する。**VAD オプションの有無を表示。**
+
+    §10.6 の注記が「`WHISPER_CPP_REF` を上げる際は、このフラグ群が残っていることを
+    D-7 で確認する」と指定している。**バージョン文字列では判定しない** —
+    VAD はビルド設定で落ちうる。
+    """
+    found = transcribe.is_available(ctx.config.transcription)
+    if not found.ok:
+        return [Row(Status.FAIL, "Whisper executable", found.detail)]
+    vad = "supported" if found.vad_supported else "NOT supported"
+    status = Status.OK if found.vad_supported else Status.NOTICE
+    return [Row(status, "Whisper executable", f"{found.detail} (VAD: {vad})")]
+
+
+def check_whisper_model(ctx: Context) -> list[Row]:
+    """D-8: Whisper モデルが存在し、サイズが 0 でない。"""
+    return [_model_row("Whisper model", Path(ctx.config.transcription.model))]
+
+
+def check_vad_model(ctx: Context) -> list[Row]:
+    """D-9: VAD モデルが存在する（`vad.enabled` が true のとき）。
+
+    **無効なら skip にする。**`vad.enabled: false` は §10.6 が認めた運用であり、
+    そのときモデルが無いことは異常ではない。
+    """
+    vad = ctx.config.transcription.vad
+    if not vad.enabled:
+        return [Row(Status.SKIP, "VAD model", "transcription.vad.enabled: false")]
+    return [_model_row("VAD model", Path(vad.model))]
+
+
+def _model_row(label: str, path: Path) -> Row:
+    """モデルファイル 1 件の行。**サイズ 0 を「在る」と報告しない** —
+    取得が途中で止まったファイルは存在するが使えない。
+    """
+    if not path.is_file():
+        return Row(Status.FAIL, label, f"{path}  （ありません）")
+    size = path.stat().st_size
+    if size == 0:
+        return Row(Status.FAIL, label, f"{path.name}  （0 バイト。取得が途中で止まっている）")
+    return Row(Status.OK, label, f"{path.name} ({size / MIB:.1f} MiB)")
+
+
 CHECKS: Final[tuple[Check, ...]] = (
     Check(id="D-1", fatal=True, labels=("Config file", "Config validation"), run=check_config),
     Check(id="D-2", fatal=True, labels=("Database",), run=check_database),
     Check(id="D-3", fatal=True, labels=("Data volume",), run=check_data_volume),
+    Check(
+        id="D-7",
+        fatal=True,
+        labels=("Whisper executable",),
+        run=check_whisper_executable,
+    ),
+    Check(id="D-8", fatal=True, labels=("Whisper model",), run=check_whisper_model),
+    Check(id="D-9", fatal=True, labels=("VAD model",), run=check_vad_model),
 )
 
 
