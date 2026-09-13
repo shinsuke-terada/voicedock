@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from tests.spec_sync import spec_section_text
 from voicedock import paths, pipeline, session
 from voicedock.config import Config
 from voicedock.db import Database, EntityType, Recording, Session
@@ -60,6 +61,32 @@ def add_session(database: Database, *, status: str, regenerated: int = 0) -> Non
 
 def runner(database: Database, cfg: Config, log: Logger) -> pipeline.Pipeline:
     return pipeline.Pipeline(database=database, cfg=cfg, log=log, now=NOW)
+
+
+# --- SPEC の規定そのもの（§10.4 / T-1 / T-2） ---------------------------
+
+
+def test_the_spec_says_the_trigger_is_raw_saved() -> None:
+    """§10.4 が「分組では状態を変えない」「契機は `RAW_SAVED`」と書いていること（T-1）。
+
+    v5.7 までは「`OPEN` でないセッションへ Part を追加する場合は `MERGING` へ戻す」と
+    書いてあった。**分組は `DISCOVERED` の時点で走る**ので、そのとおりに実装すると
+    **まだ文字起こししていない Part を含んだまま統合する。**
+    """
+    text = spec_section_text("10.4")
+    assert "セッションの状態はここでは変えない" in text
+    assert "`RAW_SAVED` に達した時点" in text
+
+
+def test_the_spec_defines_where_the_overflow_goes() -> None:
+    """§10.4 が上限超過の行き先を定めていること（T-2）。
+
+    v5.7 までは「暴走防止の上限」とだけ書かれ、**超えたときに何が起きるかが
+    どこにも無かった。**
+    """
+    text = spec_section_text("10.4")
+    assert "`<device_id>:<YYYYMMDD>#<n>`" in text
+    assert "`n == 1` に接尾辞は付けない" in text
 
 
 # --- 再オープン（§9.3 の `SAVED` / `COMPLETED` 行） ----------------------
