@@ -398,6 +398,15 @@ def _write(target: Path, transcript: Transcript) -> None:
     )
 
 
+def load_transcript(key: PartKey) -> Transcript | None:
+    """保存済みの正規化形式を読む（§10.6 / §9.4）。
+
+    **パスを呼び手に組み立てさせない。**`paths.transcript_path_for()` が唯一の出所で、
+    `key_slug()` を通す規約（v5.0→v5.1 の変更 M-7）をここで閉じる。
+    """
+    return _load(paths.transcript_path_for(key))
+
+
 def _load(path: Path) -> Transcript | None:
     """保存済みの正規化形式を読む。**形が違えば `None`**（冪等判定。§10.6 / §9.4）。"""
     document = _read_json(path)
@@ -451,7 +460,9 @@ def _discard(path: Path) -> None:
         return
 
 
-def metrics(result: TranscribeResult, *, duration_seconds: float | None) -> dict[str, object]:
+def metrics(
+    result: TranscribeResult, *, duration_seconds: float | None
+) -> dict[str, str | int | float | bool | None]:
     """`transcription_completed` のフィールド（§16.2）。
 
     `rtf`（real-time factor）と `speech_ratio` は `duration_seconds` が `None` だと

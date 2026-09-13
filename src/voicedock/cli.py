@@ -8,10 +8,9 @@ SPEC §7 は「設定の出所を二重にしない」と規定しており、�
 from __future__ import annotations
 
 import argparse
-import signal
 import sys
 
-from voicedock import __version__, db, doctor, health, status
+from voicedock import __version__, db, doctor, health, status, worker
 from voicedock.config import ConfigError, load_config, logger_for, startup_notices
 from voicedock.errors import EXIT_CONFIG, EXIT_ERROR, EXIT_OK
 
@@ -80,14 +79,10 @@ def dispatch(args: argparse.Namespace) -> int:
 
 
 def _service() -> int:
-    """常駐サービス。
+    """常駐サービス（§10.0 の `worker_loop`）。
 
-    TODO(#19): SPEC §10.0 の worker_loop() に置き換える。
-    現時点ではパイプラインが存在しないため、設定を検証したあと常駐するだけである。
-
-    即座に終了すると compose の `restart: unless-stopped` によりクラッシュループになり、
-    `docker compose exec` による確認が一切できなくなる。そのため待機する。
-    実装するときは、待機している箇所だけを差し替えること。
+    設定を読み、DB を開き、`worker.Worker` を回す。**SIGTERM で `service_stopping` を
+    出して安全に止まる**（`tini` が転送する。§18.3）。
     """
     try:
         cfg = load_config()
@@ -107,15 +102,8 @@ def _service() -> int:
         log.warning("config_warning", rule=notice.rule, message=notice.message)
 
     # スキーマは起動時に自動適用する（SPEC §8.5）。未適用の版が無ければ何も書かない
-    database = db.connect(
+    with db.connect(
         cfg.database.path, busy_timeout_ms=cfg.database.busy_timeout_ms, tz=cfg.tz
-    )
-    log.info("service_started", version=__version__, schema_version=database.schema_version())
-
-    print(
-        "voicedock: service は未実装です（SPEC §10.0 / #19）。"
-        "パイプラインは何も処理しません。コンテナを常駐させるためだけに待機します。",
-        flush=True,
-    )
-    signal.pause()  # SIGTERM は tini が転送する（§18.3）
+    ) as database:
+        worker.Worker(cfg=cfg, log=log, database=database).run()
     return EXIT_OK

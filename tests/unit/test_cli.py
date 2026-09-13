@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import pathlib
-import signal
 
 import pytest
 import yaml
 
 from tests.helpers import complete_tree, merge
 from tests.spec_sync import spec_removed_subcommands, spec_subcommands
-from voicedock import __version__, db, paths
+from voicedock import __version__, db, paths, worker
 from voicedock.cli import IMPLEMENTED, SUBCOMMANDS
 from voicedock.errors import EXIT_CONFIG, EXIT_ERROR, EXIT_OK
 from voicedock.main import main
@@ -86,22 +85,24 @@ def test_unimplemented_returns_error(name: str, capsys: pytest.CaptureFixture[st
     assert "未実装" in capsys.readouterr().err
 
 
-def test_service_waits_and_announces_stub(
+def test_service_runs_the_worker_loop(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """service は設定を検証したあと、未実装を明示してから待機する。
+    """`service` が `worker.Worker.run()` を呼び、`service_started` を出すこと（§10.0）。
 
-    TODO(#19): worker_loop() が実装されたら、このテストは書き換わる。
-    即座に終了すると compose の restart: unless-stopped でクラッシュループになるため、
-    「待機すること」自体が現時点の仕様である。
+    **ループの中身は `test_worker_loop.py` が見る。**ここで確かめるのは配線だけである
+    （設定を読み、DB を作り、worker を回す）。即座に終了すると compose の
+    `restart: unless-stopped` でクラッシュループになるので、**走ったこと**を見る。
     """
-    paused = False
+    started: list[object] = []
 
-    def _fake_pause() -> None:
-        nonlocal paused
-        paused = True
+    def fake_run(self: worker.Worker) -> None:
+        started.append(self)
+        self.log.info(
+            "service_started", version="test", schema_version=self.database.schema_version()
+        )
 
     document = merge(
         complete_tree(tmp_path),
@@ -110,15 +111,44 @@ def test_service_waits_and_announces_stub(
     config = tmp_path / "config.yaml"
     config.write_text(yaml.safe_dump(document), encoding="utf-8")
     monkeypatch.setenv("VOICEDOCK_CONFIG", str(config))
-    monkeypatch.setattr(signal, "pause", _fake_pause)
+    monkeypatch.setattr(worker.Worker, "run", fake_run)
 
     assert main(["service"]) == EXIT_OK
-    assert paused, "service は待機しなければならない（即座に終了するとクラッシュループになる）"
+    assert started, "worker が回っていない"
     out = capsys.readouterr().out
     assert "service_started" in out, "設定を読めたら service_started を出す（§16.2）"
     assert "schema_version=1" in out, "起動時にスキーマを自動適用する（§8.5）"
-    assert "未実装" in out
     assert (tmp_path / "data" / "voicedock.db").is_file(), "起動時に DB を作ること"
+
+
+def test_service_closes_the_database(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**DB を閉じて終わる。**`with` を外すと `-wal` が残り、次回の起動で
+    「チェックポイントされていない分」を抱えたまま開くことになる。
+    """
+    closed: list[bool] = []
+
+    def fake_run(self: worker.Worker) -> None:
+        original = self.database.close
+
+        def spy() -> None:
+            closed.append(True)
+            original()
+
+        self.database.close = spy  # type: ignore[method-assign]
+
+    document = merge(
+        complete_tree(tmp_path),
+        {"database": {"path": str(tmp_path / "data" / "voicedock.db")}},
+    )
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump(document), encoding="utf-8")
+    monkeypatch.setenv("VOICEDOCK_CONFIG", str(config))
+    monkeypatch.setattr(worker.Worker, "run", fake_run)
+
+    assert main(["service"]) == EXIT_OK
+    assert closed == [True]
 
 
 def test_service_returns_config_exit_code_on_violation(

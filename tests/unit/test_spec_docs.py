@@ -19,11 +19,11 @@ from tests.spec_sync import spec_text, spec_tree_modules
 
 SOURCE_ROOT = REPO_ROOT / "src" / "voicedock"
 
-PLANNED: frozenset[str] = frozenset({"pipeline", "cleaner", "daily"})
+PLANNED: frozenset[str] = frozenset({"cleaner", "daily"})
 """木に載っているが**まだ実装していない**モジュール。
 
-`pipeline.py`（#19）/ `cleaner.py`（#36）/ `daily.py`（#28）。**木から消さない** —
-消すと「どこに何を置く予定か」が本書から失われる。
+`cleaner.py`（#36）/ `daily.py`（#28）。**木から消さない** — 消すと
+「どこに何を置く予定か」が本書から失われる。`pipeline.py` は #19 で実装したので外した。
 """
 
 
