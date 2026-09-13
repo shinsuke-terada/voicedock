@@ -155,7 +155,17 @@ def partkey_for(device_id: str, rel: DevicePath) -> PartKey:
     return PartKey(f"{device_id}/{rel}")
 
 
-def session_key_for(device_id: str, started_at: datetime, *, tz: tzinfo) -> SessionKey:
+OVERFLOW_MARK: Final = "#"
+"""`session_key` の上限超過を表す接尾辞の記号（`<device_id>:<YYYYMMDD>#<n>`）。
+
+**`:` / `/` 以外であること。**`device_id` はボリューム名なので任意の文字を含みうるが、
+鍵は**右から**割るので `device_id` に `#` があっても巻き込まない（`_split_day`）。
+"""
+
+
+def session_key_for(
+    device_id: str, started_at: datetime, *, tz: tzinfo, overflow: int = 1
+) -> SessionKey:
     """Session の恒久識別子を作る。`f"{device_id}:{YYYYMMDD}"`（§8.1 / §10.4）。
 
     **`partkey_for()` と同じ禁則の対象である。**§8.5 の唯一の禁則は
@@ -168,6 +178,10 @@ def session_key_for(device_id: str, started_at: datetime, *, tz: tzinfo) -> Sess
     **深夜の Part が前日のセッションへ入る。**
 
     日をまたぐ 30 分の Part は**開始日に属する**（§10.4）。`ended_at` は見ない。
+
+    `overflow` は `session.max_parts` / `max_duration_seconds` を超えた分の行き先である
+    （v5.7→v5.8 の変更 T-2）。**1 には接尾辞を付けない** — 付けると既に保存した
+    ノートの `voicedock_session_key` と食い違い、§14.1 の削除条件が永久に偽になる。
 
     Raises:
         ValueError: `device_id` が空 / `:` を含む / `/` を含む / `.` で始まる。
@@ -184,7 +198,11 @@ def session_key_for(device_id: str, started_at: datetime, *, tz: tzinfo) -> Sess
             )
     if device_id.startswith("."):
         raise ValueError(f"device_id が '.' で始まっています: {device_id!r}")
-    return SessionKey(f"{device_id}:{started_at.astimezone(tz).strftime('%Y%m%d')}")
+    if overflow < 1:
+        raise ValueError(f"overflow は 1 以上です: {overflow!r}")
+    day = started_at.astimezone(tz).strftime("%Y%m%d")
+    suffix = "" if overflow == 1 else f"{OVERFLOW_MARK}{overflow}"
+    return SessionKey(f"{device_id}:{day}{suffix}")
 
 
 def device_id_of_session(key: SessionKey) -> str:
@@ -200,14 +218,50 @@ def device_id_of_session(key: SessionKey) -> str:
 
 
 def day_of_session(key: SessionKey) -> date:
-    """`session_key` の日付部分（`YYYYMMDD`）。`sessions.day_date` の出所である。"""
-    _device_id, separator, day = key.rpartition(":")
-    if not separator:
-        raise ValueError(f"session_key に ':' がありません: {key!r}")
+    """`session_key` の日付部分（`YYYYMMDD`）。`sessions.day_date` の出所である。
+
+    **上限超過の接尾辞（`#2`）は落とす**（v5.7→v5.8 の変更 T-2）。2 本目のセッションも
+    同じ日のものであり、`day_date` もノートのフォルダも 1 本目と同じになる。
+    """
+    day, _overflow = _split_day(key)
     try:
         return datetime.strptime(day, "%Y%m%d").date()
     except ValueError as exc:
         raise ValueError(f"session_key の日付部分が YYYYMMDD ではありません: {key!r}") from exc
+
+
+def overflow_of(key: SessionKey) -> int:
+    """`session_key` の何本目か（接尾辞が無ければ 1）。§10.4 / T-2。"""
+    _day, overflow = _split_day(key)
+    return overflow
+
+
+def next_overflow(key: SessionKey) -> SessionKey:
+    """同じ日の次のセッションの鍵（`#2` → `#3`）。§10.4 / T-2。"""
+    day, overflow = _split_day(key)
+    return SessionKey(f"{device_id_of_session(key)}:{day}{OVERFLOW_MARK}{overflow + 1}")
+
+
+def _split_day(key: SessionKey) -> tuple[str, int]:
+    """`session_key` を「日付部分」と「何本目か」へ割る。
+
+    **右から切る。**`device_id` に `:` は入れられないので、`rpartition` なら日付側だけを
+    確実に取り出せる（`device_id` に `#` が入っていても巻き込まない）。
+    """
+    _device_id, separator, tail = key.rpartition(":")
+    if not separator:
+        raise ValueError(f"session_key に ':' がありません: {key!r}")
+    day, mark, number = tail.partition(OVERFLOW_MARK)
+    if not mark:
+        return day, 1
+    try:
+        overflow = int(number)
+    except ValueError as exc:
+        raise ValueError(f"session_key の連番が整数ではありません: {key!r}") from exc
+    if overflow < 2:
+        # **`#1` は作らない。**作ると同じセッションを指す鍵が 2 つできる
+        raise ValueError(f"session_key の連番は 2 以上です: {key!r}")
+    return day, overflow
 
 
 def device_id_of(key: PartKey) -> str:
