@@ -837,7 +837,10 @@ voicedock/
 │       ├── wiki.py                 # WikiLink 生成規則・Vault インデックス（§13.8）
 │       ├── session.py              # セッション分組（日単位）・統合・Block 算出（§10.4, §10.8）
 │       ├── states.py               # 状態定義・遷移表（§9）
-│       ├── pipeline.py             # ensure_* の直列実行・backoff / FAILED の再評価（§10, §15.2）
+│       ├── pipeline.py             # ensure_* の直列実行（§11.3, §10.5-§10.7）
+│       │                           #   状態遷移とクラッシュリカバリ（§9.4）
+│       ├── worker.py               # 常駐ループ・停止シグナル・FAILED 再投入の契機
+│       │                           #   （§10.0, §15.2）。cli.py から分けてある
 │       ├── cleaner.py              # §14.1 の評価と削除要求の書き込み（§10.12, §14）
 │       │                           #   削除そのものは行わない。reaper が実行する（N-16）
 │       ├── cli.py                  # service / status / doctor / health / version（§17.1）
