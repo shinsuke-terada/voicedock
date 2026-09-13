@@ -16,6 +16,7 @@ from typing import Any
 
 import yaml
 
+from tests.fixtures.fake_whisper import write_fake_whisper
 from voicedock.config import Config, parse_config
 
 REPO_ROOT = Path(__file__).parents[1]
@@ -55,9 +56,11 @@ def complete_tree(tmp_path: Path) -> dict[str, Any]:
     # CI ではリポジトリのルートなので、どちらでも解決する
     (tmp_path / "whisper.bin").write_bytes(b"\0" * 16)
     (tmp_path / "vad.bin").write_bytes(b"\0" * 16)
+    # **`--help` に VAD フラグを含める。**doctor D-7 は `--help` の出力で VAD 対応を
+    # 判定する（§10.6 の注記）。`exit 0` だけのスクリプトにすると、D-1 を見るだけの
+    # テストが「健全な環境」を表せなくなる（D-7 が notice になる）
+    write_fake_whisper(tmp_path / "whisper-cli")
     executable = tmp_path / "whisper-cli"
-    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    executable.chmod(0o755)
     return merge(
         example_document(),
         {
