@@ -167,7 +167,35 @@ class Worker:
         for partkey in self.pending_partkeys():
             if self.stopper.should_stop():
                 return
-            runner.process_part(partkey)
+            self._with_in_process_retry(
+                lambda key=partkey: runner.process_part(PartKey(key)),  # type: ignore[misc]
+                db.EntityType.RECORDING,
+                partkey,
+            )
+
+    def _with_in_process_retry(
+        self, run: Callable[[], object], entity: db.EntityType, key: str
+    ) -> None:
+        """工程内リトライ（§15.2）。`max_attempts` 回、`backoff_seconds` 間隔。
+
+        **待つのはここである。**`pipeline` は時間を持たない（`sleep` を差し替えて
+        テストできるようにするため）。
+
+        **停止要求は待機の前後で見る。**30 秒の backoff の途中では止まれないが、
+        次の試行へ進む前には止まれる。
+        """
+        while True:
+            run()
+            delay = pipeline.in_process_retry(self.database, entity, key, cfg=self.cfg)
+            if delay is None or self.stopper.should_stop():
+                return
+            self.sleep(delay)
+            if self.stopper.should_stop():
+                return
+            if not pipeline.resume_failed(
+                self.database, entity, key, log=self.log, reset_retry=False, now=self.now()
+            ):
+                return
 
     def pending_partkeys(self) -> list[PartKey]:
         """終端でない Part を `started_at` 昇順で（§10.0）。
@@ -212,12 +240,14 @@ class Worker:
     def requeue_failed(self, inventory: DeviceInventory | None, *, startup: bool = False) -> int:
         """`FAILED` を直前の進行中状態へ戻す（§15.2）。戻り値は再投入した件数。
 
-        中身は #32 が実装する。**ここは契機の判定（`should_requeue`）を確定させる。**
+        契機の判定は `should_requeue()` が持つ。**分けてあるのは、判定そのものを
+        テストできるようにするため**である。
+
+        **戻し方の規則は `pipeline` が持つ。**ここは契機を見て呼ぶだけである。
         """
         if not self.should_requeue(inventory, startup=startup):
             return 0
-        # TODO(#32): FAILED を直前の進行中状態へ戻し retry_count を 0 にする（§15.2）
-        return 0
+        return pipeline.requeue_failed(self.database, log=self.log, now=self.now())
 
     def process_ready_sessions(self) -> None:
         """§10.8〜§10.9 を 1 件ずつ（**Part と同じく直列**。§10.0）。
@@ -231,7 +261,11 @@ class Worker:
         for session_key in self.ready_session_keys():
             if self.stopper.should_stop():
                 return
-            runner.process_session(SessionKey(session_key))
+            self._with_in_process_retry(
+                lambda key=session_key: runner.process_session(SessionKey(key)),  # type: ignore[misc]
+                db.EntityType.SESSION,
+                session_key,
+            )
 
     def ready_session_keys(self) -> list[str]:
         """`READY` で全 Part が終端状態のセッション（§9.3 の `READY → MERGING` のガード）。
