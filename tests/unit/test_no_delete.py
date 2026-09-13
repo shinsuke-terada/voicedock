@@ -832,9 +832,7 @@ def write_result(scene: Scene, *, status: str = "DELETED", detail: str = "", **e
 
 def gone(scene: Scene) -> DeviceInventory:
     """デバイス上からそのファイルが消えた状態の `inventory.json`。"""
-    return DeviceInventory(
-        generated_at=NOW, mount_readonly=False, devices={DEVICE_ID: frozenset()}
-    )
+    return DeviceInventory(generated_at=NOW, mount_readonly=False, devices={DEVICE_ID: frozenset()})
 
 
 def test_a_successful_result_completes_the_part(scene: Scene) -> None:
