@@ -50,8 +50,10 @@ jobs:
   # 規定している。`check` に混ぜると、他の失敗に紛れて**どれが落ちたのか一目で
   # 分からない。**`main` の required check にするのもこの job である。
   #
-  # **正の対照（`test_deletion_actually_happens_when_everything_is_valid`）を
-  # 同じ job で回す。**これが落ちれば「ND が緑なのは何も検証していないから」だと分かる。
+  # **正の対照を同じ job で回す。**コンテナ層は
+  # `test_deletion_actually_happens_when_everything_is_valid`、reaper 層は
+  # `test_a_valid_request_actually_deletes` である。これが落ちれば
+  # 「ND が緑なのは何も検証していないから」だと分かる。
   no-delete:
     runs-on: ubuntu-latest
     steps:
@@ -65,4 +67,8 @@ jobs:
       - run: uv sync --frozen
 
       - name: ND (削除禁止テスト)
-        run: uv run pytest tests/unit/test_no_delete.py tests/unit/test_no_device_delete.py -q
+        run: >
+          uv run pytest -q
+          tests/unit/test_no_delete.py
+          tests/unit/test_reaper.py
+          tests/unit/test_no_device_delete.py
