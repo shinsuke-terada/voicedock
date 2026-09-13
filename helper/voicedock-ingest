@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-HELPER_VERSION="5.2.0"
+HELPER_VERSION="5.4.0"
 LOG_MAX_BYTES=5242880       # 5 MiB。超えたら .1 へ退避する（§10.1 手順 2）
 LOCK_STALE_SECONDS=21600    # 6 時間。PID の再利用とハングへの歯止め（§10.1 手順 1）
 META_SCHEMA=1
@@ -43,6 +43,24 @@ if command -v shasum >/dev/null 2>&1; then
 else
     _sha256_stdin() { sha256sum | awk '{print $1}'; }
 fi
+
+# マウント点の空き容量（バイト）。**取れなければ何も出力しない**（呼び手が「不明」にする）。
+#
+# **列は先頭から数える。**`-P` 無しの BSD は `Available` の後ろに `iused` / `ifree` /
+# `%iused` の 3 列を挟むので、**末尾から数えると `ifree` を拾う**（実測で 10 倍の値に
+# なった）。`$4` は BSD / GNU のどちらでも `Available` である。
+#
+# **`-P` は保険である。**POSIX 出力形式は列を
+# `Filesystem / blocks / Used / Available / Capacity / Mounted on` の 6 つに固定し、
+# **1 行に収めることも保証する** — デバイス名が長いと `-P` 無しの df は行を折り返し、
+# そのとき `$4` は別の値になる。`-k` は 1024 バイト単位を保証する
+# （`-h` は人向けの丸め、`--output` は GNU 専用）。
+# **`printf "%.0f"` にするのは、awk の整数が 2^31 で飽和する実装があるため**
+# （4 GiB 超の空き容量を扱う）。
+_free_bytes() {
+    df -Pk "$1" 2>/dev/null |
+        awk 'NR>1 && $4 ~ /^[0-9]+$/ { printf "%.0f", $4 * 1024; exit }'
+}
 
 _now_iso() { date +%Y-%m-%dT%H:%M:%S%z | sed 's/\(..\)$/:\1/'; }
 _now_epoch() { date +%s; }
@@ -534,6 +552,16 @@ write_heartbeat() {
 # 一時ファイルへ溜めておく（bash 3.2 に連想配列が無いため）。
 INVENTORY_WORK=""
 
+# 空き容量は device_id と並列の 2 本の配列で持つ。**bash 3.2 に連想配列は無い**（§3.2）。
+FREE_DEVICE=()
+FREE_BYTES=()
+
+inventory_free_add() {     # $1=device_id, $2=bytes（空なら載せない）
+    [ -n "${2:-}" ] || return 0
+    FREE_DEVICE+=("$1")
+    FREE_BYTES+=("$2")
+}
+
 inventory_add() {          # $1=device_id, $2...=relpath
     local device_id="$1"; shift
     local rel
@@ -556,6 +584,20 @@ write_inventory() {
         printf '  "schema": %s,\n' "$INVENTORY_SCHEMA"
         printf '  "generated_at": %s,\n' "$(_json_string "$(_now_iso)")"
         printf '  "mount_readonly": %s,\n' "$MOUNT_READONLY"
+        printf '  "device_free_bytes": {'
+        local first_free=1 fi_idx=0
+        while [ "$fi_idx" -lt ${#FREE_DEVICE[@]} ]; do
+            [ "$first_free" -eq 1 ] || printf ','
+            first_free=0
+            printf '\n    %s: %s' \
+                "$(_json_string "${FREE_DEVICE[$fi_idx]}")" "${FREE_BYTES[$fi_idx]}"
+            fi_idx=$((fi_idx + 1))
+        done
+        if [ "$first_free" -eq 1 ]; then
+            printf '},\n'
+        else
+            printf '\n  },\n'
+        fi
         printf '  "devices": {'
         local first_device=1 device prev_device="" line rel
         # device_id, relpath の両方でソートする。**出力が決定的でないとテストが書けない**
@@ -718,6 +760,10 @@ main() {
         else
             all_readonly=0
         fi
+
+        # **空き容量は remount の後に測る。**読み取り専用での再マウントは
+        # 空き容量を変えないが、失敗して別の扱いになった場合に実際の状態を映す
+        inventory_free_add "$device_id" "$(_free_bytes "$path")"
 
         ALL_RELPATH=()
         CAND_RELPATH=(); CAND_SRC=(); CAND_SIZE=(); CAND_MTIME=(); CAND_OK=()
