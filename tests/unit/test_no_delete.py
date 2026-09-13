@@ -20,6 +20,7 @@ reaper（#54）であり、要求が無ければ reaper は何もしない。
 
 from __future__ import annotations
 
+import inspect
 import io
 import json
 from collections.abc import Callable, Iterator
@@ -30,7 +31,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from voicedock import cleaner, device, llm, paths
+from voicedock import cleaner, device, llm, notes, paths
 from voicedock.config import Config
 from voicedock.db import Database, Recording, Session
 from voicedock.device import DeviceInventory
@@ -392,6 +393,21 @@ def test_nd08_a_raw_note_deleted_afterwards_blocks_the_request(scene: Scene) -> 
     assert scene.requests() == []
 
 
+def test_nd08_a_tampered_raw_note_blocks_the_request(scene: Scene) -> None:
+    """ND-08: Raw ノートが改竄された（**鍵は載ったまま**）→ `verify_raw_note` が偽。
+
+    **この形でないと `verify_raw_note()` を単独で確かめられない。**ファイルごと消すと
+    鍵の包含判定も同時に偽になるので、**`verify_raw_note()` を論理式から削っても
+    ND-08 は緑のまま通る**（意図的に削って確かめたら実際に通った）。
+    """
+    scene.rearm()
+    path = scene.raw_path()
+    path.write_text(path.read_text(encoding="utf-8") + "\n追記された行\n", encoding="utf-8")
+    assert PARTKEY in notes.frontmatter_keys(path), "鍵は載ったままであること"
+    scene.evaluate()
+    assert scene.requests() == []
+
+
 def test_nd09_a_raw_note_without_this_key_blocks_the_request(scene: Scene) -> None:
     """ND-09: Raw ノートの `voicedock_recording_keys` に当該 Part が無い。
 
@@ -399,9 +415,33 @@ def test_nd09_a_raw_note_without_this_key_blocks_the_request(scene: Scene) -> No
     X を消す」の 1 段の論理である（v5.0→v5.1 の変更 M-1）。
     """
     scene.rearm()
-    path = scene.raw_path()
-    body = path.read_text(encoding="utf-8").replace(PARTKEY, f"{DEVICE_ID}/other/other.wav")
+    _rewrite_keys(
+        scene, scene.raw_path(), f"{DEVICE_ID}/other/other.wav", column="raw_output_sha256"
+    )
+    scene.evaluate()
+    assert scene.requests() == []
+
+
+def _rewrite_keys(scene: Scene, path: Path, replacement: str, *, column: str) -> None:
+    """ノートの鍵を差し替え、**DB の sha256 も合わせて更新する。**
+
+    合わせないと保存検証が先に偽になり、**鍵の包含判定を論理式から削っても
+    テストが緑のまま通る**（意図的に削って確かめたら実際に通った）。ここで見たいのは
+    「ノートが別のファイルを指しているのに消す」ことが起きないかである。
+    """
+    body = path.read_text(encoding="utf-8").replace(PARTKEY, replacement)
     path.write_text(body, encoding="utf-8")
+    digest = notes.sha256_bytes(path.read_bytes())
+    scene.set_session(**{column: digest})
+
+
+def test_nd09b_a_daily_note_without_this_key_blocks_the_request(scene: Scene) -> None:
+    """ND-09（Daily 側）: Daily ノートの鍵に当該 Part が無い。
+
+    **Raw と Daily で条件が別々に書かれている**ので、両方に個別のテストが要る。
+    """
+    scene.rearm()
+    _rewrite_keys(scene, scene.daily_path(), f"{DEVICE_ID}/other/other.wav", column="output_sha256")
     scene.evaluate()
     assert scene.requests() == []
 
@@ -617,9 +657,61 @@ def test_nd31_a_key_from_another_device_blocks_the_request(scene: Scene) -> None
     assert other_key != PARTKEY
     assert other_key.endswith(RELPATH), "フォルダ名以降は完全に一致する"
 
-    for path in (scene.raw_path(), scene.daily_path()):
-        path.write_text(
-            path.read_text(encoding="utf-8").replace(PARTKEY, other_key), encoding="utf-8"
-        )
+    _rewrite_keys(scene, scene.raw_path(), other_key, column="raw_output_sha256")
+    _rewrite_keys(scene, scene.daily_path(), other_key, column="output_sha256")
     scene.evaluate()
     assert scene.requests() == []
+
+
+# --- `target_is_identical()` を単独で落とす（§14.1.1） ------------------
+
+
+def test_a_file_absent_from_the_inventory_blocks_the_request(scene: Scene) -> None:
+    """`state/inventory.json` にそのファイルが無ければ要求を書かない（§10.12）。
+
+    **デバイスが外れている、あるいは既に消えている。**要求を書いても reaper は
+    検証 3 で拒むだけであり、キューにゴミが溜まる。
+
+    **この形でないと `target_is_identical()` を単独で確かめられない。**
+    `source_path` を壊す経路は `is not None` / `!= ""` が先に受け止めるので、
+    **`target_is_identical()` を論理式から削ってもテストが緑のまま通る**
+    （意図的に削って確かめたら実際に通った）。
+    """
+    empty = DeviceInventory(
+        generated_at=NOW, mount_readonly=False, devices={DEVICE_ID: frozenset()}
+    )
+    assert not cleaner.can_delete_source(
+        scene.part(), scene.session(), [scene.part()], scene.cfg, empty, vault_root=scene.vault
+    )
+
+
+def test_a_key_that_disagrees_with_the_path_blocks_the_request(scene: Scene) -> None:
+    """reaper の検証 12 をコンテナ側でも行う（§14.1.1）。
+
+    `partkey` と `<device_id>/<relpath>` が食い違っていたら、**「ノートで確認した
+    ファイル」と「消すファイル」が別物である。**
+    """
+    scene.rearm()
+    scene.set_part(source_path="TX_MIC001_20260912_090000/TX00_MIC001_20260912_090000.wav")
+    assert not cleaner.target_is_identical(scene.part(), scene.inventory)
+    scene.evaluate()
+    assert scene.requests() == []
+
+
+# --- 空集合・空文字の番犬が論理式に在ること（§14.1） --------------------
+
+
+def test_the_watchdog_terms_are_present_in_the_formula() -> None:
+    """**`len(parts) >= 1` と `source_path != ""` が論理式に在ること。**
+
+    この 2 つは**冗長な番犬として意図的に置かれている**（§14.1）。
+    `_orig` 固定でスカラーに退化し、他の条件が先に受け止めるので、
+    **削ってもどのテストも落ちない。**だから「在ること」そのものを固定する。
+
+    消したくなったら §14.1 の本文を先に直すこと。**空集合の `all()` は真になり、
+    `os.path.join(volume, "")` はボリュームのルートを指す**（v3.0 の欠陥 A-14 と同型）。
+    """
+    source = inspect.getsource(cleaner.can_delete_source)
+    assert "len(parts) >= 1" in source
+    assert 'part.source_path != ""' in source
+    assert "all(" in source, "全 Part 終端条件が消えている"
