@@ -175,20 +175,34 @@ def test_complete_tree_passes_file_checks(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("rule", "key", "filename", "code"),
+    ("rule", "key", "code"),
     [
-        ("V-20", "llm.prompts.analyze", "analyze.txt", ErrorCode.CONFIG_INVALID_VALUE),
-        ("V-20", "llm.prompts.repair", "repair.txt", ErrorCode.CONFIG_INVALID_VALUE),
-        ("V-23", "transcription.model", "whisper.bin", ErrorCode.WHISPER_MODEL_MISSING),
-        ("V-24", "transcription.executable", "whisper-cli", ErrorCode.WHISPER_EXEC_MISSING),
-        ("V-25", "transcription.vad.model", "vad.bin", ErrorCode.WHISPER_MODEL_MISSING),
+        ("V-20", "llm.prompts.analyze", ErrorCode.CONFIG_INVALID_VALUE),
+        ("V-20", "llm.prompts.repair", ErrorCode.CONFIG_INVALID_VALUE),
+        ("V-23", "transcription.model", ErrorCode.WHISPER_MODEL_MISSING),
+        ("V-24", "transcription.executable", ErrorCode.WHISPER_EXEC_MISSING),
+        ("V-25", "transcription.vad.model", ErrorCode.WHISPER_MODEL_MISSING),
     ],
 )
-def test_file_rules(tmp_path: Path, rule: str, key: str, filename: str, code: ErrorCode) -> None:
-    document = complete_tree(tmp_path)
-    (tmp_path / filename).unlink()
+def test_file_rules(tmp_path: Path, rule: str, key: str, code: ErrorCode) -> None:
+    """**対象のキーだけを存在しないパスへ向ける。**
+
+    以前は `complete_tree()` が `tmp_path` へ置いた偽ファイルを `unlink()` していたが、
+    #25 で `llm.prompts.*` が**リポジトリの本物**を指すようになった。消す方式のままだと
+    `prompts/analyze_ja.txt` をテストが削除することになる（§20.2 が禁じている形）。
+    """
+    document = _redirect(complete_tree(tmp_path), key, tmp_path / "absent-on-purpose")
     violations = check_files(parsed(document))
     assert [(v.rule, v.key, v.code) for v in violations] == [(rule, key, code)]
+
+
+def _redirect(document: dict[str, Any], dotted: str, target: Path) -> dict[str, Any]:
+    """`"llm.prompts.analyze"` のようなキーを `target` へ差し替えた写しを返す。"""
+    *head, leaf = dotted.split(".")
+    patch: dict[str, Any] = {leaf: str(target)}
+    for name in reversed(head):
+        patch = {name: patch}
+    return merge(document, patch)
 
 
 def test_v24_requires_the_executable_bit(tmp_path: Path) -> None:
