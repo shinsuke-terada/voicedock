@@ -67,5 +67,12 @@ services:
     # ports: は書かない（§14.4 N-13）。公開ポート 0。
 
 volumes:
+  # **`name:` を明示する。**書かないと Compose がプロジェクト名を前置して
+  # `voicedock_voicedock-models` になり、**`scripts/fetch-models.sh` が書き込む
+  # `voicedock-models` とは別の volume をマウントする**（§18.6 の `docker run -v` も同じ名前）。
+  # 症状は「574 MB を取得したのに D-8 がモデルを見つけない」であり、
+  # 取得の失敗と区別がつかない（2026-09-14 に実機で踏んだ。#95）。
   voicedock-data:
+    name: voicedock-data
   voicedock-models:
+    name: voicedock-models

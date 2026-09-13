@@ -17,7 +17,6 @@ import shutil
 import subprocess
 
 import pytest
-
 import yaml
 
 from tests.helpers import REPO_ROOT
