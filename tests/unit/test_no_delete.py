@@ -23,6 +23,7 @@ from __future__ import annotations
 import inspect
 import io
 import json
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -728,3 +729,73 @@ def test_the_watchdog_terms_are_present_in_the_formula() -> None:
     assert source.count("_note_contains(") == 2, "Raw と Daily の両方で鍵の包含を見ること"
     assert "session.raw_output_path, part.partkey" in source
     assert "session.output_path, part.partkey" in source
+
+
+# --- §20.4 の層の表との突き合わせ ---------------------------------------
+
+
+def spec_layers() -> dict[str, set[str]]:
+    """§20.4 の層の表を `層 → ND 番号の集合` で返す。
+
+    **`ND-01〜ND-17` のような範囲表記を展開する。**件数のずれが最も危ない。
+    """
+    from tests.spec_sync import spec_section_text
+
+    section = spec_section_text("20.4")
+    layers: dict[str, set[str]] = {}
+    for row in re.findall(r"^\| \*\*(コンテナ層|reaper 層|両層)\*\*（(.+?)） \|", section, re.M):
+        name, listed = row
+        numbers: set[str] = set()
+        for piece in re.split(r"[、/]", listed):
+            found = re.findall(r"ND-(\d+)", piece)
+            if len(found) == 2 and "〜" in piece:
+                numbers |= {f"ND-{n:02d}" for n in range(int(found[0]), int(found[1]) + 1)}
+            else:
+                numbers |= {f"ND-{int(n):02d}" for n in found}
+        layers[name] = numbers
+    return layers
+
+
+def implemented_nd() -> set[str]:
+    """このファイルが**実際にテストしている** ND 番号。
+
+    **散文から拾わない。**テスト関数の名前と `parametrize` の ID だけを見る —
+    docstring に「ND-18 は #54 で入る」と書いただけで「実装した」ことにならない。
+    """
+    body = Path(__file__).read_text(encoding="utf-8")
+    found = re.findall(r"^def test_nd(\d+)", body, re.M)
+    found += re.findall(r'"ND-(\d+)"', body)
+    return {f"ND-{int(number):02d}" for number in found}
+
+
+def test_every_nd_number_is_assigned_to_a_layer() -> None:
+    """**ND-01〜ND-31 がすべてどれかの層に属すること**（§20.4 / v5.8→v5.9 の変更 U-2）。
+
+    v5.8 まで表は ND-28 で止まっており、**ND-29 / 30 / 31 がどの層にも
+    属していなかった。**割り当てが無い ND は誰も書かない。
+    """
+    layers = spec_layers()
+    assigned: set[str] = set()
+    for numbers in layers.values():
+        assigned |= numbers
+    expected = {f"ND-{n:02d}" for n in range(1, 32)}
+    assert assigned == expected, sorted(expected - assigned)
+
+
+def test_the_container_layer_is_implemented_here() -> None:
+    """§20.4 のコンテナ層（+ 両層）の ND がこのファイルに在ること。
+
+    **reaper 層は #54 と同時に入る。**ここには無い。
+    """
+    expected = spec_layers()["コンテナ層"] | spec_layers()["両層"]
+    assert expected <= implemented_nd(), sorted(expected - implemented_nd())
+
+
+def test_the_reaper_layer_is_not_claimed_yet() -> None:
+    """**reaper 層をここで書いたつもりにならないこと**（#54 待ち）。
+
+    書いていないものを「書いた」ことにすると、**最重要のテスト群に穴が空いたまま
+    リリース可能に見える。**
+    """
+    claimed = spec_layers()["reaper 層"] & implemented_nd()
+    assert claimed == set(), f"{sorted(claimed)} は #54 で入る"
