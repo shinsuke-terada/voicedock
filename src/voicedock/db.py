@@ -474,6 +474,53 @@ class Database:
             size_bytes=file_size(self.path),
         )
 
+    def update_recording(
+        self, partkey: str, *, now: datetime | None = None, **columns: object
+    ) -> None:
+        """`recordings` の列を更新する。**`status` は受け付けない。**
+
+        状態を変えるのは `record_transition()` だけである（§8.4）。ここで `status` を
+        書けると、**`events` の無い状態変化**が生まれる。
+
+        `updated_at` は常に更新する — 「いつの情報か」が分からない行を残さない。
+        """
+        self._update(EntityType.RECORDING, Recording, partkey, columns, now=now)
+
+    def update_session(
+        self, session_key: str, *, now: datetime | None = None, **columns: object
+    ) -> None:
+        """`sessions` の列を更新する。**`status` は受け付けない**（上と同じ理由）。"""
+        self._update(EntityType.SESSION, Session, session_key, columns, now=now)
+
+    def _update(
+        self,
+        entity: EntityType,
+        row_type: type[Any],
+        key: str,
+        columns: Mapping[str, object],
+        *,
+        now: datetime | None,
+    ) -> None:
+        if "status" in columns:
+            raise ValueError("status は record_transition() でのみ変更できる（§8.4）")
+        known = set(_column_names(row_type))
+        unknown = sorted(set(columns) - known)
+        if unknown:
+            raise ValueError(f"{entity.table} に無い列: {unknown}")
+        if not columns:
+            return
+        values = [
+            truncate(value) if name == "error_message" and isinstance(value, str) else value
+            for name, value in columns.items()
+        ]
+        assignments = ", ".join(f"{name} = ?" for name in columns)
+        with self.conn:
+            self.conn.execute(
+                f"UPDATE {entity.table} SET {assignments}, updated_at = ? "  # noqa: S608
+                f"WHERE {entity.key_column} = ?",
+                [*values, self._now(now), key],
+            )
+
     def recording_by_normalized_path(self, normalized_path: str) -> Recording | None:
         """その `normalized_path` を使っている行（§10.5 の slug 衝突の確認）。
 
