@@ -29,14 +29,39 @@ DOCTOR_SH = REPO_ROOT / "scripts" / "doctor.sh"
 pytestmark = pytest.mark.skipif(not INGEST.is_file(), reason="helper/ がマウントされていない")
 
 
+REQUIRED = (INGEST, INSTALL, DOCTOR_SH)
+"""**必ず在るべきもの。**欠けていたらマウント設定が壊れている。"""
+
+
 def bash_files() -> list[Path]:
-    """静的検査の対象。**`scripts/doctor.sh` も macOS の bash 3.2 で走る**（§19.2）。"""
-    found = [INGEST, INSTALL, DOCTOR_SH]
-    if REAPER.is_file():
-        found.append(REAPER)
-    missing = [p.name for p in found if not p.is_file()]
-    assert missing == [], f"helper/ のスクリプトが足りない: {missing}"
-    return found
+    """静的検査の対象。**`scripts/` の `*.sh` も macOS の bash 3.2 で走る**（§19.2）。
+
+    **列挙ではなく走査で拾う。**v5.10 まではここが `[INGEST, INSTALL, DOCTOR_SH]` の
+    固定配列で、**`scripts/` に新しいスクリプトを置いても bash 3.2 の検査が
+    掛からなかった**（#93 で発覚）。「足しても何も落ちない」のは、
+    §17.1 のサブコマンドを消しても issue の手順が落ちなかったのと同じ穴である。
+    """
+    missing = [p.name for p in REQUIRED if not p.is_file()]
+    assert missing == [], f"静的検査の対象が足りない: {missing}"
+
+    found = sorted((REPO_ROOT / "scripts").glob("*.sh"))
+    found += [p for p in sorted(HELPER_DIR.iterdir()) if p.is_file() and p.suffix != ".conf"]
+    # `.plist` は XML であって bash ではない
+    return [p for p in found if p.suffix not in {".plist"}]
+
+
+def test_the_scan_picks_up_every_script() -> None:
+    """**走査が実際に効くこと。**
+
+    「必ず在るもの」だけを見ても足りない。**`scripts/` に置いたスクリプトが 1 本残らず
+    対象になっている**ことを見る — v5.10 までの固定配列は `REQUIRED` を満たしたまま
+    `fetch-models.sh` を取りこぼしていた（#93）。
+    """
+    found = set(bash_files())
+    for path in REQUIRED:
+        assert path in found, f"{path.name} が静的検査の対象から漏れている"
+    missing = sorted(p.name for p in (REPO_ROOT / "scripts").glob("*.sh") if p not in found)
+    assert missing == [], f"scripts/ のスクリプトが静的検査から漏れている: {missing}"
 
 
 def strip_comments(text: str) -> str:

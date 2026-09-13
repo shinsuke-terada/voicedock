@@ -254,6 +254,42 @@ def spec_unit_test_targets() -> list[str]:
     return targets
 
 
+def spec_e2e_ids() -> list[str]:
+    """§20.3 の表から `E2E-nn` を出現順に返す。
+
+    **`docs/E2E.md` が実機手順の正本である**（§20.3）。SPEC にシナリオを 1 行足して
+    手順書に書き忘れても、**実機当日まで誰も気づかない。**ここで落とす。
+    """
+    found: list[str] = re.findall(r"^\| (E2E-\d+) \|", _section("20.3"), re.M)
+    if not found:
+        pytest.fail("SPEC §20.3 の E2E 表を読み取れませんでした")
+    return found
+
+
+def spec_phase_acceptance() -> dict[str, int]:
+    """Phase 2 / Phase 3 の受け入れ条件の数値（§21.2）と 1 日分の Part 数（§20.3）。
+
+    `scripts/perf-report.sh` が判定に使う 5 つの定数の出所である。**スクリプトに
+    直書きした数値が SPEC と食い違うと、「8 時間以内」と表示しながら別の閾値で
+    判定することになる。**
+    """
+    phases = _section("21.2")
+    asr = re.search(r"1 日分（(\d+) 時間）を \*\*(\d+) 時間以内", phases) or re.search(
+        r"1 日分（(\d+) 時間）を (\d+) 時間以内", phases
+    )
+    llm = re.search(r"約 [\d,]+ 文字 / 約 (\d+) チャンク）を (\d+) 分以内", phases)
+    parts = re.search(r"1 日分（\d+ 時間・(\d+) Part 相当）", _section("20.3"))
+    if asr is None or llm is None or parts is None:
+        pytest.fail("SPEC §21.2 / §20.3 の受け入れ条件の数値を読み取れませんでした")
+    return {
+        "DAY_HOURS": int(asr.group(1)),
+        "LIMIT_HOURS": int(asr.group(2)),
+        "DAY_CHUNKS": int(llm.group(1)),
+        "LIMIT_MINUTES": int(llm.group(2)),
+        "DAY_PARTS": int(parts.group(1)),
+    }
+
+
 def spec_rule_ids(section: str, prefix: str) -> list[str]:
     """`### <section>` の表から `<prefix>-n` の規則 ID を出現順に返す。
 
