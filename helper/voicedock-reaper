@@ -174,6 +174,9 @@ target_is_identical() {     # $1=volume_root $2=relpath $3=size $4=mtime
 
 # --- 結果の書き出し（§10.12） --------------------------------------------
 
+# **`partkey` を必ず載せる**（§14.1.1 の結果の形式。v5.9→v5.10 の変更 X-1）。
+# コンテナは `request_id` を解析せずに対応する Part を引けなければならない —
+# **`request_id` の組み立て規則に依存させると、規則を変えた瞬間に結果が迷子になる。**
 write_result() {            # $1=request_id $2=status $3=detail
     local dir="$VOICEDOCK_HOME/queue/result"
     mkdir -p "$dir"
@@ -184,6 +187,8 @@ write_result() {            # $1=request_id $2=status $3=detail
         printf '  "request_id": "%s",\n' "$1"
         printf '  "completed_at": "%s",\n' "$(_now_iso)"
         printf '  "reaper_version": "%s",\n' "$REAPER_VERSION"
+        printf '  "device_id": "%s",\n' "${RESULT_DEVICE_ID:-}"
+        printf '  "partkey": "%s",\n' "${RESULT_PARTKEY:-}"
         printf '  "status": "%s",\n' "$2"
         printf '  "detail": "%s"\n' "$3"
         printf '}\n'
@@ -206,11 +211,16 @@ already_processed() {       # $1=request_id
 
 process_request() {         # $1=path
     local file="$1" request_id device_id partkey rel size mtime volume
+    RESULT_DEVICE_ID=""
+    RESULT_PARTKEY=""
     request_id="$(json_string "$file" request_id)"
     if [ -z "$request_id" ]; then
         warn "request_invalid file=$file reason=no_request_id"
         return 0
     fi
+
+    RESULT_DEVICE_ID="$(json_string "$file" device_id)"
+    RESULT_PARTKEY="$(json_string "$file" partkey)"
 
     # 検証 11: リプレイ。**既に削除済みの ID で別のファイルを消せない**
     if already_processed "$request_id"; then
@@ -222,6 +232,8 @@ process_request() {         # $1=path
 
     device_id="$(json_string "$file" device_id)"
     partkey="$(json_string "$file" partkey)"
+    RESULT_DEVICE_ID="$device_id"
+    RESULT_PARTKEY="$partkey"
     rel="$(json_string "$file" relpath)"
     size="$(json_number "$file" size)"
     mtime="$(json_number "$file" mtime)"
