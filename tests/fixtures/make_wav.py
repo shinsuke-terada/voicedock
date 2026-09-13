@@ -35,10 +35,18 @@ _BLOCK = 8192
 
 class WavFormat(StrEnum):
     PCM24 = "pcm24"
-    """実機の実測（`docs/POC.md` §6.2）。144,000 B/秒。"""
+    """実機の実測（`docs/POC.md` §6.2）。48 kHz / 24 bit、144,000 B/秒。"""
 
     FLOAT32 = "float32"
-    """DJI 側の設定で選べるもう一方。192,000 B/秒。"""
+    """DJI 側の設定で選べるもう一方。48 kHz / float32、192,000 B/秒。"""
+
+    PCM16 = "pcm16"
+    """**変換後の形式**（16 bit）。`sample_rate` と併せて §10.5 の検証対象を作る。
+
+    #18 の `verify_output()` を**実物の ffmpeg 無しで**テストするために足した。
+    16 kHz で作れば合格、48 kHz で作れば不合格になるので、**検証そのものを
+    検証できる。**
+    """
 
 
 class Content(StrEnum):
@@ -86,14 +94,21 @@ _AMPLITUDE = 0.1
 """おおよそ −20 dBFS。"""
 
 
+_WIDTHS: Final[dict[WavFormat, int]] = {
+    WavFormat.PCM16: 2,
+    WavFormat.PCM24: 3,
+    WavFormat.FLOAT32: 4,
+}
+
+
 def sample_width(fmt: WavFormat) -> int:
     """1 サンプルのバイト数（モノラルなので block align と同じ）。"""
-    return 3 if fmt is WavFormat.PCM24 else 4
+    return _WIDTHS[fmt]
 
 
-def byte_rate(fmt: WavFormat) -> int:
+def byte_rate(fmt: WavFormat, sample_rate: int = SAMPLE_RATE) -> int:
     """1 秒あたりのバイト数。`fmt` チャンクの `byteRate` と同じ値。"""
-    return SAMPLE_RATE * CHANNELS * sample_width(fmt)
+    return sample_rate * CHANNELS * sample_width(fmt)
 
 
 def header_bytes(*, minimal_header: bool = False) -> int:
@@ -103,7 +118,9 @@ def header_bytes(*, minimal_header: bool = False) -> int:
 # --- サンプル生成 --------------------------------------------------------
 
 
-def _samples(frames: int, content: Content, tone_hz: float) -> list[float]:
+def _samples(
+    frames: int, content: Content, tone_hz: float, sample_rate: int = SAMPLE_RATE
+) -> list[float]:
     """−1.0〜1.0 のサンプル列。**乱数を使わない**（同じ引数なら同じバイト列になる）。"""
     if content is Content.SILENCE:
         return [0.0] * frames
@@ -111,7 +128,7 @@ def _samples(frames: int, content: Content, tone_hz: float) -> list[float]:
     period = _SPEECH_ON + _SPEECH_OFF
     values: list[float] = []
     for index in range(frames):
-        seconds = index / SAMPLE_RATE
+        seconds = index / sample_rate
         if seconds % period >= _SPEECH_ON:
             values.append(0.0)
             continue
@@ -136,6 +153,10 @@ def _encode(values: Sequence[float], fmt: WavFormat) -> bytes:
         if fmt is WavFormat.FLOAT32:
             out += struct.pack(f"<{len(block)}f", *block)
             continue
+        if fmt is WavFormat.PCM16:
+            ints = [int(max(-1.0, min(1.0, value)) * 0x7FFF) for value in block]
+            out += struct.pack(f"<{len(ints)}h", *ints)
+            continue
         ints = [int(max(-1.0, min(1.0, value)) * 0x7FFFFF) for value in block]
         raw = bytearray(struct.pack(f"<{len(ints)}i", *ints))
         del raw[3::4]
@@ -154,15 +175,21 @@ def _chunk(chunk_id: bytes, payload: bytes) -> bytes:
     return chunk_id + struct.pack("<I", len(payload)) + payload + pad
 
 
-def _fmt_chunk(fmt: WavFormat) -> bytes:
+def _fmt_chunk(fmt: WavFormat, sample_rate: int = SAMPLE_RATE) -> bytes:
     # tag=1 は PCM、tag=3 は IEEE float。実機は 0x0001 だった（POC §6.2）ので
     # WAVE_FORMAT_EXTENSIBLE は使わない
-    tag = 1 if fmt is WavFormat.PCM24 else 3
+    tag = 3 if fmt is WavFormat.FLOAT32 else 1
     width = sample_width(fmt)
     return _chunk(
         b"fmt ",
         struct.pack(
-            "<HHIIHH", tag, CHANNELS, SAMPLE_RATE, byte_rate(fmt), width * CHANNELS, width * 8
+            "<HHIIHH",
+            tag,
+            CHANNELS,
+            sample_rate,
+            byte_rate(fmt, sample_rate),
+            width * CHANNELS,
+            width * 8,
         ),
     )
 
@@ -174,14 +201,19 @@ def build_wav(
     content: Content = Content.SILENCE,
     minimal_header: bool = False,
     tone_hz: float = 220.0,
+    sample_rate: int = SAMPLE_RATE,
 ) -> bytes:
-    """WAV 1 本をバイト列で返す。"""
+    """WAV 1 本をバイト列で返す。
+
+    `sample_rate` は**変換後の形式を作るためだけ**に可変にしてある（§10.5 の検証）。
+    実機は常に 48 kHz である（`docs/POC.md` §6.2）。
+    """
     if seconds <= 0:
         raise ValueError(f"seconds は正の値: {seconds}")
-    frames = round(SAMPLE_RATE * seconds)
-    data = _encode(_samples(frames, content, tone_hz), fmt)
+    frames = round(sample_rate * seconds)
+    data = _encode(_samples(frames, content, tone_hz, sample_rate), fmt)
 
-    chunks = [_fmt_chunk(fmt)]
+    chunks = [_fmt_chunk(fmt, sample_rate)]
     if not minimal_header:
         chunks += [
             _chunk(b"bext", b"\0" * BEXT_SIZE),
