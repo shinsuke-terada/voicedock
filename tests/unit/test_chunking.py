@@ -142,6 +142,40 @@ def test_zero_overlap_is_allowed(make_config: Callable[..., Config]) -> None:
         assert not set(previous.segments) & set(following.segments)
 
 
+def test_a_time_split_carries_no_overlap(cfg: Config) -> None:
+    """**実時間の上限で割れたときは重なりを持ち越さない**（v5.5→v5.6 の変更 R-2）。
+
+    重なりの目的は文脈の維持だが（§12.4）、**数時間の無録音区間を跨いで維持すべき
+    文脈は無い。**持ち越すと重なりの segment が次チャンクの先頭になり、**その時刻範囲が
+    無録音区間を丸ごと含む** — Timeline に `### 12:09–16:34` のような**実体の無い
+    ブロック**が現れる（実際に Daily ノートを生成して発覚した）。
+    """
+    morning = [segment(0, "朝です。"), segment(5, "続けます。")]
+    evening = [segment(16000, "夕方です。"), segment(16005, "終わります。")]
+    chunks = split_chunks(transcript(*morning, *evening), cfg)
+
+    assert len(chunks) == 2, [(c.start_at, c.end_at) for c in chunks]
+    assert set(chunks[0].segments) == set(morning)
+    assert set(chunks[1].segments) == set(evening)
+    assert not set(chunks[0].segments) & set(chunks[1].segments), "重なりを持ち越している"
+
+
+def test_a_time_split_keeps_block_ranges_tight(cfg: Config) -> None:
+    """時刻範囲が無録音区間を含まないこと（R-2 の目的）。"""
+    chunks = split_chunks(transcript(segment(0, "朝です。"), segment(16000, "夕方です。")), cfg)
+    for chunk in chunks:
+        assert chunk.seconds <= cfg.llm.max_seconds_per_request
+
+
+def test_a_character_split_still_carries_the_overlap(cfg: Config) -> None:
+    """**文字数で割れたときは従来どおり重ねる**（§12.4）。R-2 は時間の場合だけである。"""
+    dense = transcript(*[segment(index, "あ" * 3000, length=0.5) for index in range(20)])
+    chunks = split_chunks(dense, cfg)
+    assert len(chunks) > 1
+    for previous, following in pairwise(chunks):
+        assert set(previous.segments) & set(following.segments), "文脈が切れている"
+
+
 def test_no_chunk_is_only_overlap(cfg: Config) -> None:
     """**重なりだけの末尾チャンクを作らない。**
 
