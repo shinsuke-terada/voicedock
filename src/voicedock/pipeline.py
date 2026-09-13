@@ -23,13 +23,15 @@ from typing import Final
 
 from pydantic import BaseModel, ValidationError
 
-from voicedock import audio, daily, llm, paths, raw, session, transcribe, wiki
+from voicedock import audio, cleaner, daily, device, llm, paths, raw, session, transcribe, wiki
 from voicedock.config import Config
 from voicedock.db import Database, EntityType, Recording, Session, TransitionConflict
 from voicedock.errors import ErrorCode, counts_against_max_attempts
+from voicedock.heartbeat import DEFAULT_STATE_ROOT
 from voicedock.log import Logger
 from voicedock.paths import InboxPath, PartKey, SessionKey, StagingPath
 from voicedock.states import (
+    PART_DELETABLE,
     PART_RECOVERY,
     PART_RETRYABLE_FROM_FAILED,
     SESSION_RECOVERY,
@@ -82,6 +84,20 @@ RAW_SAVED_OR_BEYOND: Final[frozenset[str]] = frozenset(
         PartStatus.COMPLETED,
     }
 )
+
+DELETE_EVALUATED: Final[frozenset[str]] = frozenset(
+    {
+        SessionStatus.SAVED,
+        SessionStatus.SOURCE_DELETING,
+        SessionStatus.SOURCE_DELETE_PENDING,
+        SessionStatus.CLEANUP,
+    }
+)
+"""§14.1 を評価するセッションの状態（§9.3 の `SAVED` 行以降）。
+
+**`COMPLETED` を含めない。**後始末まで終わった行をもう一度評価すると、`delete_attempts`
+が毎周回増え続ける。
+"""
 
 MERGEABLE: Final[frozenset[str]] = frozenset({SessionStatus.READY, SessionStatus.MERGING})
 """`ensure_merged()` が進められるセッションの状態。
@@ -160,6 +176,9 @@ class Pipeline:
     log: Logger
     now: datetime | None = None
     """時刻の注入口。**テストが固定する。**"""
+
+    state_root: Path = DEFAULT_STATE_ROOT
+    """`/state`（Helper の報告）。**§14.1 のロック 2-B を読むのに要る**（§7.5）。"""
 
     # --- §11.3 の本体 ----------------------------------------------------
 
@@ -491,6 +510,9 @@ class Pipeline:
         if row is None:
             return SessionOutcome.STOPPED
         if row.status in SAVED_OR_BEYOND:
+            # **保存済みでも削除の評価だけは進める**（§14.3）。`SAVED` で止まったままだと
+            # 削除が無効な運用でも Part が `RAW_SAVED` に残り続ける（§9.3 の `SAVED` 行）
+            self.delete_sources_if_safe(session_key)
             return SessionOutcome.SAVED
 
         transcript = self.build_transcript(session_key)
@@ -507,7 +529,81 @@ class Pipeline:
             return SessionOutcome.STOPPED
         if not self.ensure_daily_note(session_key, transcript):
             return SessionOutcome.ANALYZED
+        self.delete_sources_if_safe(session_key)
         return SessionOutcome.SAVED
+
+    # --- §14.3 削除 ---------------------------------------------------------
+
+    def delete_sources_if_safe(self, session_key: SessionKey) -> bool:
+        """§14.1 を評価し、真なら削除要求を書く（§10.12 / §14.3）。
+
+        戻り値は「このセッションの後始末まで進めたか」である。**保留を返したときは
+        `cleanup_staging()` も `COMPLETED` も行わない**（§11.3 / §14.3）。
+
+        **削除が無効なときもここを通る。**§9.3 の `SAVED → CLEANUP`（`delete_source_audio
+        == false`）と `RAW_SAVED → COMPLETED`（同）がこの経路であり、**Phase 7 前の
+        通常運用はすべてこちら**である。
+
+        **このメソッドはデバイスに触れない。**触れられない（§14.4 N-16）。
+        """
+        row = self.database.get_session(session_key)
+        if row is None or row.status not in DELETE_EVALUATED:
+            return False
+        parts = self.database.recordings_for_session(session_key)
+
+        if not self.cfg.cleanup.delete_source_audio:
+            # **安全ロック 1 が掛かっている。**元音声を残したまま完了する（§9.3）
+            return self._complete_without_deleting(row, parts)
+
+        inventory = device.read_inventory(self.state_root)
+        requested = 0
+        for part in parts:
+            if part.status not in {status.value for status in PART_DELETABLE}:
+                continue
+            request = cleaner.request_part_deletion(
+                part,
+                row,
+                parts,
+                self.cfg,
+                inventory,
+                vault_root=Path(self.cfg.obsidian.root),
+                log=self.log,
+                now=self.now or datetime.now(self.cfg.tz),
+            )
+            if request is None:
+                continue
+            self._transition(
+                PartKey(part.partkey), PartStatus.RAW_SAVED, PartStatus.SOURCE_DELETING
+            )
+            requested += 1
+
+        if requested == 0:
+            # §9.3 の「`SAVED` のまま」。**`delete_attempts += 1` で backoff を進める**
+            # （ビジーループ防止。§15.2）。**遷移ではないので `events` を書かない**
+            self.database.update_session(
+                session_key, delete_attempts=row.delete_attempts + 1, now=self.now
+            )
+            return False
+
+        self._session_transition(session_key, row.status, SessionStatus.SOURCE_DELETING)
+        return False
+
+    def _complete_without_deleting(self, row: Session, parts: list[Recording]) -> bool:
+        """`delete_source_audio == false` の経路（§9.3）。**元音声を残したまま完了する。**"""
+        for part in parts:
+            if part.status == PartStatus.RAW_SAVED:
+                self._transition(PartKey(part.partkey), PartStatus.RAW_SAVED, PartStatus.COMPLETED)
+        if row.status == SessionStatus.SAVED:
+            self._session_transition(row.session_key, SessionStatus.SAVED, SessionStatus.CLEANUP)
+        fresh = self.database.get_session(SessionKey(row.session_key))
+        if fresh is None or fresh.status != SessionStatus.CLEANUP:
+            return False
+        for part in parts:
+            cleaner.cleanup_staging(part)
+        self._session_transition(row.session_key, SessionStatus.CLEANUP, SessionStatus.COMPLETED)
+        # **ログを出さない。**§16.4 は `session_completed` を v5.0 で削除し、行き先を
+        # 「`events` テーブル（状態遷移そのもの）」と定めている
+        return True
 
     def build_transcript(self, session_key: SessionKey) -> session.SessionTranscript | None:
         """§10.8: `started_at` 昇順に Part transcript を連結する。**永続化しない。**"""
