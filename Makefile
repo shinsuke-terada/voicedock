@@ -53,6 +53,10 @@ test:
 	  -v "$(CURDIR)/compose.yaml:/app/compose.yaml:ro" \
 	  -v "$(CURDIR)/Dockerfile:/app/Dockerfile:ro" \
 	  -v "$(CURDIR)/Makefile:/app/Makefile:ro" \
+	  -v "$(CURDIR)/.github:/app/.github:ro" \
+	  -v "$(CURDIR)/uv.lock:/app/uv.lock:ro" \
+	  -v "$(CURDIR)/requirements.lock:/app/requirements.lock:ro" \
+	  -v "$(CURDIR)/requirements-dev.lock:/app/requirements-dev.lock:ro" \
 	  voicedock:dev pytest -q
 
 # モデルの取得（§18.6）。**image へ埋め込まない**（18.6 GB ある）。
