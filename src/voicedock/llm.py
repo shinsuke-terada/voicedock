@@ -19,8 +19,10 @@ import json
 import os
 import re
 import time
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final
@@ -28,8 +30,9 @@ from typing import Any, Final
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 
-from voicedock.config import AnalysisConfig, Config, SectionConfig
+from voicedock.config import AnalysisConfig, Config, LlmConfig, SectionConfig
 from voicedock.errors import ErrorCode
+from voicedock.session import AbsoluteSegment, SessionTranscript
 
 CHAT_PATH: Final = "chat/completions"
 THINK_RE: Final = re.compile(r"<think>.*?</think>", re.S)
@@ -583,3 +586,374 @@ def probe(
         elapsed_seconds=completion.elapsed_seconds,
         total_tokens=completion.total_tokens,
     )
+
+
+# ============================================================
+# 長文対策（Map-Reduce。§12.4）
+# ============================================================
+
+REDUCE_MAX_DEPTH: Final = 3
+"""多段 Reduce の段数の上限（§12.4）。
+
+20,000 文字の束を 3 段重ねれば 1 束あたり約 1,000 件の `PartialAnalysis` を畳める。
+**1 日 18 チャンクに対して十分な余裕がある**（実際には 1 段で終わる）。
+"""
+
+DEDUPE_FIELDS: Final[tuple[str, ...]] = ("key_points", "decisions", "ideas", "tags")
+"""重複除去の対象（§12.4）。`tasks` は `Task` なので `text` で比べる。"""
+
+
+@dataclass(frozen=True)
+class Chunk:
+    """Map 段階の 1 チャンク（§12.4）。
+
+    **時刻範囲を保持する。**Timeline はこの情報から生成し、**LLM には時刻を出力させない**
+    （幻覚を避ける。§13.4）。
+    """
+
+    text: str
+    start_at: datetime
+    end_at: datetime
+    segments: tuple[AbsoluteSegment, ...]
+
+    @property
+    def seconds(self) -> float:
+        return (self.end_at - self.start_at).total_seconds()
+
+
+def split_chunks(transcript: SessionTranscript, cfg: Config) -> list[Chunk]:
+    """セッション transcript をチャンクへ分ける（§12.4）。
+
+    **分割は segment 境界でのみ行う。文の途中で切らない。**1 チャンクの上限は
+    `max_chars_per_request`（文字数）**かつ** `max_seconds_per_request`（実時間）である。
+    後者が要るのは **Timeline の粒度を時間的に揃えるため**で、文字数だけで割ると
+    時間帯が不均等な Timeline になる。
+
+    直近 `chunk_overlap_chars` を次チャンクの先頭に重ねて文脈を維持する。**重なりも
+    segment 単位である** — 文字数で切ると文の途中から始まる。
+    """
+    settings = cfg.llm
+    chunks: list[Chunk] = []
+    current: list[AbsoluteSegment] = []
+
+    for segment in transcript.segments:
+        if current and _exceeds(current, segment, settings):
+            chunks.append(_chunk(current))
+            current = _overlap(current, settings.chunk_overlap_chars)
+        current.append(segment)
+
+    if current and not _is_only_overlap(chunks, current):
+        chunks.append(_chunk(current))
+    return chunks
+
+
+def _is_only_overlap(chunks: list[Chunk], current: list[AbsoluteSegment]) -> bool:
+    """末尾が直前チャンクの重なりだけで構成されているか。
+
+    **重なりだけの末尾チャンクを作らない。**作ると同じ内容を 2 回 LLM へ投げ、
+    Timeline にも同じ時間帯が 2 度現れる。
+    """
+    if not chunks:
+        return False
+    return set(current) <= set(chunks[-1].segments)
+
+
+def _exceeds(current: list[AbsoluteSegment], nxt: AbsoluteSegment, settings: LlmConfig) -> bool:
+    """`nxt` を足すと上限を超えるか（文字数**または**実時間）。"""
+    chars = sum(len(segment.text) for segment in current) + len(nxt.text)
+    seconds = (nxt.end_at - current[0].at).total_seconds()
+    return chars > settings.max_chars_per_request or seconds > settings.max_seconds_per_request
+
+
+def _overlap(current: list[AbsoluteSegment], limit: int) -> list[AbsoluteSegment]:
+    """末尾から `limit` 文字ぶんの segment を返す（§12.4 の `chunk_overlap_chars`）。
+
+    **segment 単位で切る。**文字数で切ると次チャンクが文の途中から始まる。
+    """
+    if limit <= 0:
+        return []
+    taken: list[AbsoluteSegment] = []
+    total = 0
+    for segment in reversed(current):
+        if total + len(segment.text) > limit and taken:
+            break
+        taken.insert(0, segment)
+        total += len(segment.text)
+    # **全部を重ねない。**次チャンクが直前チャンクと同じになり、無限に進まなくなる
+    return taken if len(taken) < len(current) else taken[1:]
+
+
+def _chunk(segments: list[AbsoluteSegment]) -> Chunk:
+    return Chunk(
+        text="\n".join(segment.text for segment in segments),
+        start_at=segments[0].at,
+        end_at=max(segment.end_at for segment in segments),
+        segments=tuple(segments),
+    )
+
+
+# --- Map / Reduce -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SessionAnalysis:
+    """`analyze_session()` の結果。**状態遷移は呼び手が決める**（#27）。"""
+
+    result: BaseModel | None
+    chunks: tuple[Chunk, ...]
+    partials: tuple[BaseModel, ...]
+    """Map 中間結果。**Timeline の素材**（§13.4）。単一パスなら空である。"""
+
+    error_code: ErrorCode | None = None
+    error_message: str | None = None
+    elapsed_seconds: float = 0.0
+    reduce_depth: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return self.result is not None and self.error_code is None
+
+    @property
+    def single_pass(self) -> bool:
+        """チャンクが 1 個で Map-Reduce を使わなかったか（§12.4）。
+
+        **真なら Timeline は Part / Block の時刻範囲から組み立てる**（§13.4）。
+        """
+        return not self.partials
+
+
+def analyze_session(
+    transcript: SessionTranscript,
+    *,
+    cfg: Config,
+    endpoint: Endpoint | None = None,
+    client: httpx.Client | None = None,
+    env: Mapping[str, str] | None = None,
+) -> SessionAnalysis:
+    """セッション transcript を解析する（§12.4）。**例外を投げない。**
+
+    チャンクが 1 個なら Map-Reduce を使わず `analyze_ja.txt` で単一パス処理する。
+    **その場合 Map 中間結果が存在しないため、Timeline は Part / Block の時刻範囲から
+    組み立てる**（§13.4。E2E-01 の 1 分録音は必ずこの経路を通る）。
+    """
+    chunks = tuple(split_chunks(transcript, cfg))
+    if not chunks:
+        return SessionAnalysis(
+            result=None,
+            chunks=(),
+            partials=(),
+            error_code=ErrorCode.SESSION_MERGE_FAILED,
+            error_message="チャンクが 0 個です（統合結果が空）",
+        )
+
+    if len(chunks) == 1:
+        single = analyze(
+            chunks[0].text,
+            cfg=cfg,
+            kind=PromptKind.ANALYZE,
+            endpoint=endpoint,
+            client=client,
+            env=env,
+        )
+        return SessionAnalysis(
+            result=single.analysis,
+            chunks=chunks,
+            partials=(),
+            error_code=single.error_code,
+            error_message=single.error_message,
+            elapsed_seconds=single.elapsed_seconds,
+        )
+
+    elapsed = 0.0
+    partials: list[BaseModel] = []
+    for chunk in chunks:
+        mapped = analyze(
+            chunk.text, cfg=cfg, kind=PromptKind.MAP, endpoint=endpoint, client=client, env=env
+        )
+        elapsed += mapped.elapsed_seconds
+        if mapped.analysis is None:
+            return SessionAnalysis(
+                result=None,
+                chunks=chunks,
+                partials=tuple(partials),
+                error_code=mapped.error_code,
+                error_message=mapped.error_message,
+                elapsed_seconds=elapsed,
+            )
+        partials.append(mapped.analysis)
+
+    reduced = reduce_phase(partials, cfg=cfg, endpoint=endpoint, client=client, env=env)
+    return SessionAnalysis(
+        result=reduced.result,
+        chunks=chunks,
+        partials=tuple(partials),
+        error_code=reduced.error_code,
+        error_message=reduced.error_message,
+        elapsed_seconds=elapsed + reduced.elapsed_seconds,
+        reduce_depth=reduced.reduce_depth,
+    )
+
+
+@dataclass(frozen=True)
+class ReduceResult:
+    result: BaseModel | None
+    error_code: ErrorCode | None = None
+    error_message: str | None = None
+    elapsed_seconds: float = 0.0
+    reduce_depth: int = 0
+
+
+def reduce_phase(
+    partials: Sequence[BaseModel],
+    *,
+    cfg: Config,
+    endpoint: Endpoint | None = None,
+    client: httpx.Client | None = None,
+    env: Mapping[str, str] | None = None,
+    depth: int = 1,
+) -> ReduceResult:
+    """`PartialAnalysis` の列を 1 つの `AnalysisResult` へ畳む（§12.4）。
+
+    **入力は JSON 配列であり、原文 transcript を再送しない**（§12.4）。
+
+    入力が `max_chars_per_request` を超える場合は**多段 Reduce** へ入る。
+    **中間段の出力は `PartialAnalysis` である** — `title` は「その日を表す簡潔な日本語」
+    であり（§12.5）、**束の一部に対して付けた題は最終段では邪魔になる。**
+    """
+    body = _as_json(partials)
+    if len(body) <= cfg.llm.max_chars_per_request or len(partials) <= 1:
+        final = analyze(
+            body, cfg=cfg, kind=PromptKind.REDUCE, endpoint=endpoint, client=client, env=env
+        )
+        return ReduceResult(
+            result=_deduped(final.analysis),
+            error_code=final.error_code,
+            error_message=final.error_message,
+            elapsed_seconds=final.elapsed_seconds,
+            reduce_depth=depth,
+        )
+
+    if depth >= REDUCE_MAX_DEPTH:
+        # **例外にしない**（§1.3）。Raw ノートは既に保存されている
+        return ReduceResult(
+            result=None,
+            error_code=ErrorCode.LLM_INVALID_JSON,
+            error_message=f"多段 Reduce が上限 {REDUCE_MAX_DEPTH} 段に達しました",
+            reduce_depth=depth,
+        )
+
+    elapsed = 0.0
+    folded: list[BaseModel] = []
+    for bundle in _bundles(partials, cfg.llm.max_chars_per_request):
+        mapped = analyze(
+            _as_json(bundle),
+            cfg=cfg,
+            kind=PromptKind.MAP,
+            endpoint=endpoint,
+            client=client,
+            env=env,
+        )
+        elapsed += mapped.elapsed_seconds
+        if mapped.analysis is None:
+            return ReduceResult(
+                result=None,
+                error_code=mapped.error_code,
+                error_message=mapped.error_message,
+                elapsed_seconds=elapsed,
+                reduce_depth=depth,
+            )
+        folded.append(mapped.analysis)
+
+    deeper = reduce_phase(
+        folded, cfg=cfg, endpoint=endpoint, client=client, env=env, depth=depth + 1
+    )
+    return ReduceResult(
+        result=deeper.result,
+        error_code=deeper.error_code,
+        error_message=deeper.error_message,
+        elapsed_seconds=elapsed + deeper.elapsed_seconds,
+        reduce_depth=deeper.reduce_depth,
+    )
+
+
+def _bundles(partials: Sequence[BaseModel], limit: int) -> list[list[BaseModel]]:
+    """**時刻順のまま**、JSON 化した長さが `limit` を超えない範囲で貪欲に詰める（§12.4）。
+
+    **並べ替えない。**Timeline の素材でもあるので順序が意味を持つ。
+    """
+    bundles: list[list[BaseModel]] = []
+    current: list[BaseModel] = []
+    for item in partials:
+        candidate = [*current, item]
+        if current and len(_as_json(candidate)) > limit:
+            bundles.append(current)
+            current = [item]
+            continue
+        current = candidate
+    if current:
+        bundles.append(current)
+    return bundles
+
+
+def _as_json(partials: Sequence[BaseModel]) -> str:
+    """`PartialAnalysis` の JSON 配列（§12.4 の Reduce 入力）。"""
+    return json.dumps(
+        [item.model_dump() for item in partials], ensure_ascii=False, separators=(",", ":")
+    )
+
+
+# --- 重複除去（§12.4） --------------------------------------------------
+
+
+def normalize_for_dedupe(text: str) -> str:
+    """重複除去の正規形（§12.4）。
+
+    **前後空白除去・全角半角統一（NFKC）・小文字化の完全一致のみ。曖昧一致はしない**
+    （取りこぼしより重複のほうが安全）。
+    """
+    return unicodedata.normalize("NFKC", text).strip().casefold()
+
+
+def dedupe(values: Sequence[str]) -> list[str]:
+    """**順序を保ったまま**重複を落とす。最初に現れたものを残す。"""
+    seen: set[str] = set()
+    kept: list[str] = []
+    for value in values:
+        key = normalize_for_dedupe(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(value)
+    return kept
+
+
+def _deduped(analysis: BaseModel | None) -> BaseModel | None:
+    """Reduce の結果から重複を落とす（§12.4 の「最後に重複除去する」）。
+
+    **LLM に任せない。**プロンプトで「重複する項目はまとめてください」と指示しているが
+    （§12.5）、守られたかどうかは確かめられる。
+    """
+    if analysis is None:
+        return None
+    changes: dict[str, object] = {}
+    for name in DEDUPE_FIELDS:
+        values = getattr(analysis, name, None)
+        if isinstance(values, list) and values and all(isinstance(v, str) for v in values):
+            changes[name] = dedupe(values)
+    tasks = getattr(analysis, "tasks", None)
+    if isinstance(tasks, list):
+        changes["tasks"] = _dedupe_tasks(tasks)
+    return analysis.model_copy(update=changes) if changes else analysis
+
+
+def _dedupe_tasks(tasks: Sequence[Task]) -> list[Task]:
+    """`tasks` は `text` で比べる（`due` が違っても同じやることは 1 件にする）。"""
+    seen: set[str] = set()
+    kept: list[Task] = []
+    for task in tasks:
+        key = normalize_for_dedupe(task.text)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(task)
+    return kept
