@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Whisper モデルと Silero VAD モデルを named volume へ取得する（SPEC §18.6）。
 #
 # **モデルを Docker image へ埋め込まない。**18.6 GB あり、image の再構築ごとに
@@ -13,6 +13,10 @@
 #   ./scripts/fetch-models.sh large-v3-turbo-q8_0  # Whisper モデルを指定
 #   VAD_MODEL=silero-v6.2.0 ./scripts/fetch-models.sh
 #   FORCE=1 ./scripts/fetch-models.sh              # 既に在っても取り直す
+# **shebang は `#!/bin/bash` に固定する**（`/usr/bin/env bash` にしない）。
+# macOS 同梱の bash は 3.2 であり、`env` だと Homebrew の bash 5 を拾う環境と
+# 拾わない環境で**別のインタプリタになる。**#93 まで、このファイルだけが
+# 静的検査の対象から漏れていた。
 set -euo pipefail
 
 MODEL="${1:-large-v3-turbo-q5_0}"
