@@ -187,11 +187,14 @@ def test_the_makefile_has_a_models_target() -> None:
 
 
 def run_script(name: str, *, vad: str | None = None) -> subprocess.CompletedProcess[str]:
-    """`docker` を見つけられない PATH で走らせ、**検証だけを通す。**
+    """到達できない `DOCKER_HOST` で走らせ、**検証だけを通す。**
 
-    検証を抜けると `docker run` へ進んで 1 GB を落としはじめる。`docker` を
-    見つけられなければ**その手前で止まる**ので、テストがネットワークを使わない
-    （§20.2）。
+    検証を抜けると `docker run` へ進む。**到達できない daemon を指しておけば、
+    1 GB のダウンロードは始まらない**（テストがネットワークを使わない。§20.2）。
+
+    **「docker が無い」ことに依存してはならない。**`make test` のコンテナには docker が
+    無いが **CI には在る**ので、エラー文面で判定すると CI だけが落ちる（実際に落ちた）。
+    検証を通ったかどうかは**標準出力のバナー**で見る。
     """
     env = {"PATH": "/usr/bin:/bin", "DOCKER_HOST": "unix:///nonexistent"}
     if vad is not None:
@@ -248,18 +251,19 @@ def test_an_empty_model_name_falls_back_to_the_default(empty: str) -> None:
     """
     result = run_script(WHISPER_DEFAULT, vad="") if empty == "vad" else run_script("")
     assert "モデル名に使えない文字があります" not in result.stderr
-    assert "docker が見つかりません" in result.stderr
+    assert f"whisper={WHISPER_DEFAULT} vad={VAD_DEFAULT}" in result.stdout
 
 
 @pytest.mark.parametrize("name", [WHISPER_DEFAULT, "large-v3-turbo-q8_0", "base.en", "tiny"])
 def test_a_normal_model_name_passes_validation(name: str) -> None:
-    """**正常な名前は検証を通る。**通ったあと `docker` が無くて失敗するところまで見る。
+    """**正常な名前は検証を通る。**
 
-    「検証で落ちたのか docker で落ちたのか」を区別するために、標準エラーの文面で判定する。
+    「検証を抜けたか」は**標準出力のバナー**で見る。`docker` の有無やエラー文面で
+    判定すると、**`make test`（docker 無し）と CI（docker 在り）で結果が変わる。**
     """
     result = run_script(name)
     assert "モデル名に使えない文字があります" not in result.stderr
-    assert "docker が見つかりません" in result.stderr
+    assert f"whisper={name}" in result.stdout, "検証を抜けていない"
 
 
 # --- 堅牢化（SPEC より厳しくしている点） --------------------------------

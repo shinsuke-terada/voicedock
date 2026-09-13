@@ -45,10 +45,10 @@ for name in "$MODEL" "$VAD_MODEL"; do
     esac
 done
 
-command -v docker >/dev/null 2>&1 || die "docker が見つかりません（§3.2）"
-
 printf 'fetch-models: volume=%s whisper=%s vad=%s\n' "$VOLUME" "$MODEL" "$VAD_MODEL"
 printf 'fetch-models: 約 1 GB を取得します。既に在るものは飛ばします（FORCE=1 で取り直し）\n'
+
+command -v docker >/dev/null 2>&1 || die "docker が見つかりません（§3.2）"
 
 # **`--user 0:0` で root として入る。**新規 volume の所有権が root なので、
 # 非 root では書き込めない（§18.6）
