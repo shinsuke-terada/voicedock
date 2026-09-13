@@ -357,6 +357,18 @@ def test_nd01_to_nd06_a_part_that_did_not_finish_is_never_requested(
     scene.evaluate()
     assert scene.requests() == [], nd
 
+    # **§14.1 の論理式そのものも偽であること。**`delete_sources_if_safe()` 側にも
+    # 同じ絞り込みがあるので、要求が無いことだけを見ると
+    # **`can_delete_source()` から条件を削っても通ってしまう**（実際に通った）
+    assert not cleaner.can_delete_source(
+        scene.part(),
+        scene.session(),
+        [scene.part()],
+        scene.cfg,
+        scene.inventory,
+        vault_root=scene.vault,
+    ), nd
+
 
 # --- ND-07〜ND-09: Raw ノート ------------------------------------------
 
