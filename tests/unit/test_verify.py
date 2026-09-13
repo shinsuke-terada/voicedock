@@ -478,3 +478,16 @@ def test_resolve_treats_an_unreadable_note_as_different(tmp_path: Path) -> None:
     assert resolve_output_path(VaultPath(tmp_path), "2026-08-29 Voice", SESSION_KEY) == (
         tmp_path / "2026-08-29 Voice (2).md"
     )
+
+
+def test_an_empty_list_is_rendered_as_brackets() -> None:
+    """**空リストは `[]` と書く。**
+
+    `key:` だけだと YAML が `null` と読み、**「鍵が 0 件」と「鍵の欄が無い」が
+    区別できなくなる。**Part を 0 件持つ Session は実在する（`session_empty`。§16.4）。
+    """
+    text = render_frontmatter({RECORDING_KEYS_FIELD: []})
+    assert f"{RECORDING_KEYS_FIELD}: []" in text
+    document = parse_frontmatter(text + "body\n")
+    assert document is not None
+    assert document[RECORDING_KEYS_FIELD] == []

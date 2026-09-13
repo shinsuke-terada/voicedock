@@ -147,8 +147,14 @@ def render_frontmatter(fields: Mapping[str, object]) -> str:
         elif value is None:
             lines.append(f"{key}: null")
         elif isinstance(value, Sequence):
-            lines.append(f"{key}:")
-            lines.extend(f"  - {yaml_quote(str(item))}" for item in value)
+            if not value:
+                # **空リストは `[]` と書く。**`key:` だけだと YAML が `null` と読み、
+                # 「鍵が 0 件」と「鍵の欄が無い」が区別できなくなる。
+                # Part を 0 件持つ Session は実在する（`session_empty`。§16.4）
+                lines.append(f"{key}: []")
+            else:
+                lines.append(f"{key}:")
+                lines.extend(f"  - {yaml_quote(str(item))}" for item in value)
         else:  # pragma: no cover - 呼び手が渡さない型
             lines.append(f"{key}: {yaml_quote(str(value))}")
     lines.append(FRONTMATTER_DELIMITER)
