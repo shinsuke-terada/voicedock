@@ -425,6 +425,32 @@ class Database:
         ).fetchone()
         return None if row is None else _from_row(Session, row)
 
+    def ungrouped_recordings(self) -> list[Recording]:
+        """`session_key` が未設定の Part を `started_at` 昇順で返す（§10.4）。
+
+        **分組の対象はこれだけである。**再接続のたびに全件を引き直すと、処理済みの
+        Part が別のセッションへ移りうる。
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM recordings WHERE session_key IS NULL ORDER BY started_at, partkey"
+        ).fetchall()
+        return [_from_row(Recording, row) for row in rows]
+
+    def recordings_for_session(self, session_key: str) -> list[Recording]:
+        """そのセッションに属する Part を `started_at` 昇順で返す（§10.8）。"""
+        rows = self.conn.execute(
+            "SELECT * FROM recordings WHERE session_key = ? ORDER BY started_at, partkey",
+            (session_key,),
+        ).fetchall()
+        return [_from_row(Recording, row) for row in rows]
+
+    def sessions_with_status(self, status: str) -> list[Session]:
+        """`status` のセッションを `session_key` 昇順で返す。"""
+        rows = self.conn.execute(
+            "SELECT * FROM sessions WHERE status = ? ORDER BY session_key", (status,)
+        ).fetchall()
+        return [_from_row(Session, row) for row in rows]
+
     def events_for(self, entity: EntityType, entity_key: str) -> list[Event]:
         rows = self.conn.execute(
             "SELECT * FROM events WHERE entity_type = ? AND entity_key = ? ORDER BY id",

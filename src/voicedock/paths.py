@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+from datetime import date, datetime, tzinfo
 from pathlib import Path, PurePosixPath
 from typing import Final, NewType
 
@@ -148,6 +149,61 @@ def partkey_for(device_id: str, rel: DevicePath) -> PartKey:
     if not is_safe_relpath(rel):
         raise ValueError(f"relpath が健全ではありません（§14.4 N-17）: {rel!r}")
     return PartKey(f"{device_id}/{rel}")
+
+
+def session_key_for(device_id: str, started_at: datetime, *, tz: tzinfo) -> SessionKey:
+    """Session の恒久識別子を作る。`f"{device_id}:{YYYYMMDD}"`（§8.1 / §10.4）。
+
+    **`partkey_for()` と同じ禁則の対象である。**§8.5 の唯一の禁則は
+    「`partkey` / `session_key` の**算出規則**を変えるな」であり、2 つの鍵は同格である。
+    だから `session.py` ではなくここに置き、**同じ形の固定テスト**で守る
+    （`tests/unit/test_paths.py::test_session_key_is_pinned`）。
+
+    **日付は `tz` に変換してから取る。**`started_at` は `config.timezone` 付きで作られる
+    が（§5.2）、DB から読み直した値や UTC の値が渡ることがある。変換を省くと
+    **深夜の Part が前日のセッションへ入る。**
+
+    日をまたぐ 30 分の Part は**開始日に属する**（§10.4）。`ended_at` は見ない。
+
+    Raises:
+        ValueError: `device_id` が空 / `:` を含む / `/` を含む / `.` で始まる。
+            `:` は鍵の区切りなので含められない（macOS のボリューム名には現れないが、
+            **鍵を組み立てる前に弾く** — 壊れた鍵がノートへ載ると直す手段が無い）。
+    """
+    if not device_id:
+        raise ValueError("device_id が空です")
+    for forbidden in (":", "/"):
+        if forbidden in device_id:
+            raise ValueError(
+                f"device_id に {forbidden!r} を含められません（鍵の区切りと衝突する）: "
+                f"{device_id!r}"
+            )
+    if device_id.startswith("."):
+        raise ValueError(f"device_id が '.' で始まっています: {device_id!r}")
+    return SessionKey(f"{device_id}:{started_at.astimezone(tz).strftime('%Y%m%d')}")
+
+
+def device_id_of_session(key: SessionKey) -> str:
+    """`session_key` の `device_id` 部分（**最後の** `:` より前）。
+
+    **`partition` ではなく `rpartition` を使う。**`device_id` に `:` は入れられないが、
+    右から切れば日付部分だけを確実に落とせる。
+    """
+    device_id, separator, _day = key.rpartition(":")
+    if not separator:
+        raise ValueError(f"session_key に ':' がありません: {key!r}")
+    return device_id
+
+
+def day_of_session(key: SessionKey) -> date:
+    """`session_key` の日付部分（`YYYYMMDD`）。`sessions.day_date` の出所である。"""
+    _device_id, separator, day = key.rpartition(":")
+    if not separator:
+        raise ValueError(f"session_key に ':' がありません: {key!r}")
+    try:
+        return datetime.strptime(day, "%Y%m%d").date()
+    except ValueError as exc:
+        raise ValueError(f"session_key の日付部分が YYYYMMDD ではありません: {key!r}") from exc
 
 
 def device_id_of(key: PartKey) -> str:
