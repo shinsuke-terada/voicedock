@@ -172,6 +172,21 @@ def spec_config_example() -> dict[str, object]:
     return document
 
 
+def spec_section_code(section: str, language: str, index: int = 0) -> str:
+    """`### <section>` の `index` 番目の ```<language> ブロックを返す。
+
+    実装が SPEC のコードブロックの**写し**であることを固定するために使う
+    （§5.2 の正規表現など）。写しであることをテストで縛らないと、
+    **SPEC と実装が静かに食い違う。**
+    """
+    found: list[str] = re.findall(rf"```{language}\n(.*?)\n```", _section(section), re.S)
+    if len(found) <= index:
+        pytest.fail(
+            f"SPEC §{section} に {language} ブロックが {index + 1} 個ありません（{len(found)} 個）"
+        )
+    return found[index]
+
+
 def spec_helper_conf() -> str:
     """§7.4 の 1 つめの ```sh ブロック（`helper/helper.example.conf` の正）。
 
