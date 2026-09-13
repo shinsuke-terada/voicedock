@@ -283,7 +283,13 @@ def test_inventory_matches_spec_shape(tmp_path: Path, volumes: Path) -> None:
     """`inventory.json` が §7.5 の形で、`devices` がソート済みであること。"""
     run_ingest(write_conf(tmp_path))
     inventory = read_json(tmp_path / "home" / "state" / "inventory.json")
-    assert set(inventory) == {"schema", "generated_at", "mount_readonly", "devices"}
+    assert set(inventory) == {
+        "schema",
+        "generated_at",
+        "mount_readonly",
+        "device_free_bytes",
+        "devices",
+    }
     devices = inventory["devices"]
     assert isinstance(devices, dict)
     assert list(devices) == [DEVICE_ID]
@@ -291,6 +297,86 @@ def test_inventory_matches_spec_shape(tmp_path: Path, volumes: Path) -> None:
     assert isinstance(files, list)
     assert files == sorted(files), "relpath がソートされていない（差分が読めない）"
     assert files
+
+
+def test_free_bytes_matches_df() -> None:
+    """`_free_bytes` が `df -Pk` の `Available × 1024` と一致すること（§7.5）。
+
+    **列は先頭から数える。**`-P` 無しの BSD は `Available` の後ろに `iused` / `ifree` /
+    `%iused` の 3 列を挟むので、**末尾から数えると `ifree` を拾う**（実装中に踏み、
+    実測で 10 倍の値になった）。
+    """
+    body = INGEST.read_text(encoding="utf-8")
+    assert "df -Pk" in body, "-P が無いと長いデバイス名で df が行を折り返す"
+    assert "$4" in body and "NF-2" not in body, "列を末尾から数えている"
+
+    script = "\n".join(
+        line for line in body.splitlines()[_free_bytes_span(body)[0] : _free_bytes_span(body)[1]]
+    )
+    result = subprocess.run(  # noqa: S603
+        [BASH, "-c", f"{script}\n_free_bytes /tmp"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    reported = int(result.stdout.strip())
+    expected = subprocess.run(  # noqa: S603
+        [BASH, "-c", "df -Pk /tmp | awk 'NR==2 {printf \"%.0f\", $4*1024}'"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    # df は 2 回の呼び出しの間に値が動くので、桁が合っていることだけを見る
+    assert abs(reported - int(expected.stdout.strip())) < reported * 0.01
+
+
+def test_free_bytes_is_empty_for_a_missing_path() -> None:
+    """**取れなければ何も出力しない**（呼び手が「不明」にする）。"""
+    body = INGEST.read_text(encoding="utf-8")
+    start, end = _free_bytes_span(body)
+    script = "\n".join(body.splitlines()[start:end])
+    result = subprocess.run(  # noqa: S603
+        [BASH, "-c", f"{script}\n_free_bytes /nonexistent-path-for-test"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.stdout.strip() == ""
+
+
+def _free_bytes_span(body: str) -> tuple[int, int]:
+    lines = body.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("_free_bytes()"))
+    end = next(i for i in range(start, len(lines)) if lines[i] == "}") + 1
+    return start, end
+
+
+def test_inventory_reports_device_free_bytes(tmp_path: Path, volumes: Path) -> None:
+    """`device_free_bytes` がデバイスごとに入ること（§7.5 / §17.2）。
+
+    **コンテナはデバイスに到達できない**（§14.4 N-3）ので、Helper が測るしかない。
+    `df -Pk` の `$4` を 1024 倍した値である。
+    """
+    run_ingest(write_conf(tmp_path))
+    free = read_json(tmp_path / "home" / "state" / "inventory.json")["device_free_bytes"]
+    assert isinstance(free, dict)
+    assert list(free) == [DEVICE_ID]
+    assert isinstance(free[DEVICE_ID], int)
+    assert free[DEVICE_ID] > 0
+
+
+def test_inventory_free_bytes_is_empty_without_devices(tmp_path: Path) -> None:
+    """デバイスが無ければ空の辞書（**キーごと消さない** — 形を保って「0 台」を表す）。"""
+    empty = tmp_path / "volumes"
+    empty.mkdir()
+    run_ingest(write_conf(tmp_path, volumes_root=str(empty)))
+    inventory = read_json(tmp_path / "home" / "state" / "inventory.json")
+    assert inventory["device_free_bytes"] == {}
+    assert inventory["devices"] == {}
 
 
 def test_state_files_match_the_spec_examples(tmp_path: Path, volumes: Path) -> None:
