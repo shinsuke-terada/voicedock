@@ -5,7 +5,7 @@ UV_IMAGE ?= ghcr.io/astral-sh/uv:0.12.13-python3.12-trixie-slim
 UV_RUN = docker run --rm -v "$(CURDIR)":/w -w /w \
            -e UV_PROJECT_ENVIRONMENT=/tmp/.venv $(UV_IMAGE) sh -c
 
-.PHONY: up down logs status test lint fmt lock helper-install helper-status
+.PHONY: models up down logs status test lint fmt lock helper-install helper-status
 
 # bind mount 先を用意する。本来は helper/install.sh の仕事だが、それまでは make up が面倒を見る
 VOICEDOCK_HOME_DIRS = inbox queue state
@@ -44,8 +44,16 @@ test:
 	  -v "$(CURDIR)/config:/app/config:ro" \
 	  -v "$(CURDIR)/helper:/app/helper:ro" \
 	  -v "$(CURDIR)/prompts:/app/prompts:ro" \
+	  -v "$(CURDIR)/scripts:/app/scripts:ro" \
 	  -v "$(CURDIR)/compose.yaml:/app/compose.yaml:ro" \
+	  -v "$(CURDIR)/Dockerfile:/app/Dockerfile:ro" \
+	  -v "$(CURDIR)/Makefile:/app/Makefile:ro" \
 	  voicedock:dev pytest -q
+
+# モデルの取得（§18.6）。**image へ埋め込まない**（18.6 GB ある）。
+# named volume は root 所有で作られるので、スクリプトが root で取得して uid 1000 へ移す
+models:
+	./scripts/fetch-models.sh
 
 # Lint と型検査も使い捨てコンテナで行う。ホストに ruff / mypy を入れない（§3.3）
 lint:
