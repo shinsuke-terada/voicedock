@@ -36,18 +36,36 @@ def spec_text() -> str:
 # 見出しと見なしてしまい、節が途中で切れる。
 _NEXT_HEADING = r"(?=^#{1,6} (?:\d|付録)|\Z)"
 
+_HEADING_RE = re.compile(r"^#{1,6} (?:\d|付録)")
+_FENCE_RE = re.compile(r"^\s*```")
+
 
 def _section(heading: str) -> str:
-    """`### <heading>` から次の見出しまでの本文を返す。"""
+    r"""`### <heading>` から次の見出しまでの本文を返す。
+
+    **コードフェンスの中は見出しとして扱わない。**正規表現だけで切っていた頃は、
+    ブロック内の `# 2026-09-12 に …` のような**数字で始まるコメント**が
+    `^#{1,6} \d` に一致し、**節が途中で切れていた**（§18.6 の bash ブロックが
+    読めなくなっていた。#13 で発覚）。`_NEXT_HEADING` は他のヘルパが使うので残す。
+    """
     text = spec_text()
-    m = re.search(
-        rf"^#+ {re.escape(heading)}[^\n]*\n(.*?)" + _NEXT_HEADING,
-        text,
-        re.S | re.M,
-    )
-    if m is None:
+    lines = text.splitlines()
+    start: int | None = None
+    for index, line in enumerate(lines):
+        if line.startswith("#") and line.lstrip("#").startswith(f" {heading}"):
+            start = index + 1
+            break
+    if start is None:
         pytest.fail(f"SPEC に見出し {heading!r} が見つかりません")
-    return m.group(1)
+    in_fence = False
+    for index in range(start, len(lines)):
+        line = lines[index]
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if not in_fence and _HEADING_RE.match(line):
+            return "\n".join(lines[start:index])
+    return "\n".join(lines[start:])
 
 
 def spec_error_codes() -> dict[str, str]:
