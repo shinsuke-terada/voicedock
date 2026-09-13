@@ -229,6 +229,31 @@ def spec_config_example() -> dict[str, object]:
     return document
 
 
+def spec_skip_reasons() -> set[str]:
+    """本文が `reason=<name>` として名指しする理由（§5.3 / §10.2 / §16.4 / §20.1）。
+
+    **`reason=` の値は実装の定数ではなく SPEC の語である。**定数を持っているだけだと、
+    値を書き換えてもテストが一緒に動いて通ってしまう（実際に通った）。
+    """
+    found = set(re.findall(r"reason=([a-z_]+)", spec_text()))
+    if not found:
+        pytest.fail("SPEC の reason= を読み取れませんでした")
+    return found
+
+
+def spec_unit_test_targets() -> list[str]:
+    """§20.1 の表の「対象」列を出現順に返す。
+
+    **件数のずれが最も危ない**（#55 の振り返り）。SPEC に 1 行足して実装を忘れると、
+    **検査が足りないまま「完了」になる。**`docs/TEST_COVERAGE.md` と突き合わせる。
+    """
+    rows = re.findall(r"^\| (.+?) \| .+? \|$", _section("20.1"), re.M)
+    targets = [row.strip() for row in rows if row.strip() not in {"対象", "---"}]
+    if not targets:
+        pytest.fail("SPEC §20.1 の表を読み取れませんでした")
+    return targets
+
+
 def spec_rule_ids(section: str, prefix: str) -> list[str]:
     """`### <section>` の表から `<prefix>-n` の規則 ID を出現順に返す。
 
@@ -328,6 +353,59 @@ def spec_retry_reset_statuses() -> set[str]:
 # --- §9 の状態機械 -------------------------------------------------------
 
 _TRANSITION_SKIP_SOURCES: Final = frozenset({"現状態", "---", "—", "各工程通過"})
+
+
+def spec_retry_settings() -> dict[str, object]:
+    """§15.2 冒頭の `retry:` ブロック（`max_attempts` / `backoff_seconds`）。
+
+    **`config.example.yaml` との一致は V-* が見ているが、規定そのものは §15.2 にある。**
+    ここを読むことで「SPEC の数字を変えたのにテストが通る」を防ぐ。
+    """
+    document = yaml.safe_load(spec_section_code("15.2", "yaml"))
+    if not isinstance(document, dict) or "retry" not in document:
+        pytest.fail("SPEC §15.2 の retry ブロックを読み取れませんでした")
+    retry = document["retry"]
+    if not isinstance(retry, dict):
+        pytest.fail("SPEC §15.2 の retry ブロックが辞書ではありません")
+    return retry
+
+
+def spec_delete_evaluation_backoff() -> list[int]:
+    """§15.2 の `delete_evaluation_backoff_seconds`（`SAVED` の再評価間隔）。"""
+    matched = re.search(
+        r"`cleanup\.delete_evaluation_backoff_seconds`（`\[([\d, ]+)\]`）", _section("15.2")
+    )
+    if matched is None:
+        pytest.fail("SPEC §15.2 の delete_evaluation_backoff_seconds を読み取れませんでした")
+    return [int(value) for value in matched.group(1).split(",")]
+
+
+def spec_max_attempts_exempt_codes() -> set[str]:
+    """§15.2 が「`max_attempts` の対象外」と名指しするエラーコードと状態。
+
+    **工程内リトライで回してはならないもの**であり、契機（Helper の復帰 / デバイスの
+    再接続）を待って無期限に再評価する。
+    """
+    codes: set[str] = set()
+    for line in _section("15.2").splitlines():
+        head, marker, _ = line.partition("は `max_attempts` の対象外")
+        if marker:
+            codes.update(re.findall(r"`([A-Z_]+)`", head))
+    if not codes:
+        pytest.fail("SPEC §15.2 の max_attempts 対象外を読み取れませんでした")
+    return codes
+
+
+def spec_retry_count_is_unchanged_on_retry() -> list[str]:
+    """§9.3 の「工程内リトライ」行が `retry_count` をどう書いているか（S-1）。
+
+    **増やす場所は `FAILED` への遷移だけである。**両方で増やすと二重に数え、
+    `max_attempts: 3` で実際には 4 回試すことになる。
+    """
+    found = re.findall(r"^\| `FAILED` \| 工程内リトライ \|.*\| (.*?) \|$", spec_text(), re.M)
+    if len(found) != 2:
+        pytest.fail(f"§9.3 の工程内リトライ行が 2 行ありません（{len(found)} 行）")
+    return found
 
 
 def spec_states(section: str) -> list[str]:

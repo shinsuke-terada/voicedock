@@ -24,6 +24,7 @@ from tests.fixtures.fake_tree import (
     build_fake_inbox,
 )
 from tests.fixtures.make_wav import Content
+from tests.spec_sync import spec_skip_reasons
 from voicedock import audio, discover
 from voicedock.config import Config
 from voicedock.db import Database, EntityType
@@ -243,6 +244,15 @@ def test_already_known_is_logged_as_part_skipped(
         assert f"reason={ALREADY_KNOWN}" in line
         assert " DEBUG " in line, "既知は DEBUG である（§10.2）"
     assert ALREADY_KNOWN not in EVENTS, "イベント名にしてはならない"
+
+
+def test_the_skip_reason_is_the_word_the_spec_uses() -> None:
+    """**`reason=` の値は SPEC の語そのものである**（§10.2 / §20.1）。
+
+    定数 `ALREADY_KNOWN` を使って検査するだけだと、**値を書き換えてもテストが一緒に
+    動いて通る**（意図的に壊して確かめたら実際に通った）。SPEC 本文と突き合わせる。
+    """
+    assert ALREADY_KNOWN in spec_skip_reasons()
 
 
 def test_a_concurrent_insert_falls_back_to_already_known(
