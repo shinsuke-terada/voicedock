@@ -582,10 +582,15 @@ def test_a_verified_output_is_reused(cfg: Config, source: InboxPath) -> None:
     assert again.sha256 is None, "再利用時はハッシュを算出しない（入力を読まない）"
 
 
+@pytest.mark.needs_ffmpeg
 def test_a_broken_output_is_regenerated(
     make_config: Callable[..., Config], tmp_path: Path, source: InboxPath, good_output: Path
 ) -> None:
-    """**壊れた出力は「無い」と同じ扱い。**残すと次回「変換済み」と誤認する（§10.5）。"""
+    """**壊れた出力は「無い」と同じ扱い。**残すと次回「変換済み」と誤認する（§10.5）。
+
+    偽 ffmpeg で動かすが、**壊れた出力の判定には実物の `ffprobe` が要る**
+    （`verify_output()` が呼ぶ）。CI には無いので `needs_ffmpeg` を付ける。
+    """
     target = Path(normalized_path_for(PARTKEY))
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(b"not a wav")
