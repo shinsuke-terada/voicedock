@@ -22,6 +22,7 @@ from tests.spec_sync import spec_helper_conf
 HELPER_DIR = REPO_ROOT / "helper"
 INGEST = HELPER_DIR / "voicedock-ingest"
 INSTALL = HELPER_DIR / "install.sh"
+REAPER = HELPER_DIR / "voicedock-reaper"
 EXAMPLE_CONF = HELPER_DIR / "helper.example.conf"
 DOCTOR_SH = REPO_ROOT / "scripts" / "doctor.sh"
 
@@ -31,6 +32,8 @@ pytestmark = pytest.mark.skipif(not INGEST.is_file(), reason="helper/ がマウ�
 def bash_files() -> list[Path]:
     """静的検査の対象。**`scripts/doctor.sh` も macOS の bash 3.2 で走る**（§19.2）。"""
     found = [INGEST, INSTALL, DOCTOR_SH]
+    if REAPER.is_file():
+        found.append(REAPER)
     missing = [p.name for p in found if not p.is_file()]
     assert missing == [], f"helper/ のスクリプトが足りない: {missing}"
     return found

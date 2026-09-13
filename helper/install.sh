@@ -108,7 +108,7 @@ install_ingest() {
 install_reaper() {
     # **黙って何もしてはならない。**「ロック 2-A を解除したつもり」の誤解を生む
     [ -f "$HELPER_DIR/voicedock-reaper" ] \
-        || die "voicedock-reaper がまだ実装されていません（#54 / T-50）。--with-reaper は使えません。
+        || die "voicedock-reaper が $HELPER_DIR にありません。--with-reaper は使えません。
        安全ロック 2-A は解除されていません（§14.2）。"
     cp "$HELPER_DIR/voicedock-reaper" "$VD_HOME/bin/voicedock-reaper"
     chmod 755 "$VD_HOME/bin/voicedock-reaper"
