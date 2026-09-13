@@ -4205,8 +4205,11 @@ VoiceDock doctor
 [✓] LLM endpoint         http://model-runner.docker.internal/engines/v1
 [✓] LLM response         qwen3-30b-a3b  (4.1s, 12 tokens)
 [✓] Obsidian vault       /obsidian (readable, writable, folders exist)
-[✓] Helper               running (last seen 42s ago, v4.1.0, mount=readOnly)
-[!] Source deletion      DISABLED (config=false, mount=ro)
+[✓] Helper               running (last seen 42s ago, v5.4.0, mount=readOnly)
+[!] Source deletion      DISABLED
+      lock 1  : config.yaml=false, helper.conf=false
+      lock 2-A: voicedock-reaper is NOT installed  <- deletion is impossible
+      lock 2-B: MOUNT_MODE=ro (device mounted read-only)
 ────────────────────────────────────────────────────────
 12 checks passed, 0 failed, 1 notice
 ```
@@ -4626,6 +4629,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 | P-1 | **§17.2 の `Failed parts` を自然キー形式へ** | v5.0 までは `42` / `57` の整数 ID で 1 行に収まっていたが、v5.1 で自然キーへ移った（v5.0→v5.1 の変更 M-1）。**`partkey` は 70 文字前後あり、表の 1 列目に入れると他の列が読めない。**鍵を 1 行目・詳細を次行へ字下げする形にした。§16.2 が「短い別名を作ると識別子が 2 系統になる」と決めているので**別名は作らない** |
 | P-2 | **`device_free_bytes` を §7.5 の `inventory.json` へ追加**（§7.5, §17.2, §19.2） | **§17.2 は `Device free space` を表示すると書き、§19.2 の D-6 削除理由も「Helper が `heartbeat.json` に書く値の転記」と書いていたが、§7.5 の表にその項目が無く `voicedock-ingest` も書いていなかった** — 3 箇所が食い違ったまま、**`status` の行が恒久的に `unknown` になる**状態だった。置き場を `inventory.json` にしたのは、**値がデバイスごとに決まる**のに対し `heartbeat.json` は Helper 1 つの状態を表すからである。複数デバイスの同時接続は §5.4 の同名衝突の注記が前提にしている |
 | P-3 | **§6 の木を実態へ**（§6） | **6 モジュールが載っていなかった**（`heartbeat` / `discover` / `raw` / `wiki` / `status` / `health`）。`notes.py` の説明は「Raw / Daily レンダリング・WikiLink」を含んだままで、#24 で `raw.py`・#29 で `wiki.py` が分かれた事実を反映していなかった。`cli.py` の説明は **v5.0 で削除した 9 本のサブコマンド**（`history` / `show` / `retry` / `pending` / `cleanup` / `scan`）を並べていた。**木は「どこに何があるか」の唯一の索引**なので、古いと読み手が存在しないファイルを探す |
+| P-5 | **§19.2 の出力例の `Source deletion` を複数行形式へ**（§19.2） | 先頭の例が `DISABLED (config=false, mount=ro)` の 1 行形式で、**続く 2 つの例（`ENABLED` / `DISABLED` の詳細）と形が違っていた。**1 行形式には **lock 2-A（reaper の有無）が無い** — v5.0 で DH-14 を D-17 へ統合したときの取り残しである。**三重ロックのどれが効いているかが見えないと Phase 7 の移行判断ができない**のが D-17 の存在理由なので、形を揃えた。あわせて例の `helper_version` を現行の `5.4.0` にした |
 | P-4 | **§20.1 に 4 行追加**（§20.1） | `status` / Vault インデックス / モデル取得 / **文書の整合**。最後の 1 行が P-3 の再発防止である — **§6 の木が `src/voicedock/*.py` を全件列挙していることをテストで固定した。**モジュールを足して木を直さずに通ると、索引が静かに古くなる |
 
 > **v5.3 の O-5 と同じ処方である。**あちらは「本文が指示するイベント名が §16.4 に在ること」を
