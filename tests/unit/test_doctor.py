@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import io
+import re
 from pathlib import Path
 from typing import Any
 
@@ -63,8 +64,12 @@ def test_all_ok_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert lines[3] == f"[✓] {'Config validation':<21}107 keys, 0 errors"
     assert lines[4].startswith(f"[✓] {'Database':<21}")
     assert lines[5].startswith(f"[✓] {'Data volume':<21}")
-    assert lines[6] == SEPARATOR
-    assert lines[7] == "4 checks passed, 0 failed, 0 notices"
+    assert lines[6].startswith(f"[✓] {'Whisper executable':<21}")
+    assert "(VAD: supported)" in lines[6], "D-7 は VAD 対応の有無を表示する（§19.2）"
+    assert lines[7].startswith(f"[✓] {'Whisper model':<21}")
+    assert lines[8].startswith(f"[✓] {'VAD model':<21}")
+    assert lines[9] == SEPARATOR
+    assert lines[10] == "7 checks passed, 0 failed, 0 notices"
     assert run(path, tmp_path / "state")[1] == EXIT_OK
 
 
@@ -146,9 +151,30 @@ def test_row_render_indents_extra_lines() -> None:
     ]
 
 
-def test_registry_has_d1_to_d3() -> None:
-    """D-4 以降は各担当チケットが足す（#34 で総仕上げ）。"""
-    assert [c.id for c in doctor.CHECKS] == ["D-1", "D-2", "D-3"]
+def test_registry_matches_the_implemented_checks() -> None:
+    """**番号は詰めない**（§19.2）。D-4〜D-6 は v5.0 の削減で欠番である。
+
+    残りは各担当チケットが足す（#34 で総仕上げ）。
+    """
+    assert [c.id for c in doctor.CHECKS] == ["D-1", "D-2", "D-3", "D-7", "D-8", "D-9"]
+
+
+def test_every_check_id_exists_in_the_spec() -> None:
+    """実装した検査の番号が §19.2 の表に在ること。
+
+    **番号を勝手に作らない。**doctor の行は「PR をマージしたら 1 本増える」確認手段なので
+    （§19.2）、SPEC に無い番号が出ると何を見ているのか分からなくなる。
+    """
+    listed = set(re.findall(r"^\| (D-\d+) ", _section_19_2(), re.M))
+    assert {c.id for c in doctor.CHECKS} <= listed
+
+
+def _section_19_2() -> str:
+    from tests.spec_sync import spec_text
+
+    text = spec_text()
+    start = text.index("### 19.2")
+    return text[start : text.index("## 20. ", start)]
 
 
 # --- D-2 / D-3 -----------------------------------------------------------
