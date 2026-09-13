@@ -888,6 +888,23 @@ def test_a_result_for_another_part_is_left_alone(scene: Scene) -> None:
     assert scene.part().status == PartStatus.SOURCE_DELETING
 
 
+def test_a_result_for_a_part_that_moved_on_is_left_alone(scene: Scene) -> None:
+    """**`SOURCE_DELETING` でない Part の結果には触れない。**
+
+    **`partkey` が一致するかどうかだけでは足りない**（意図的に状態の条件を外したら
+    テストが緑のまま通った）。再投入で新しい要求を出したあとに古い結果が届くと、
+    **1 回の削除で 2 回 `COMPLETED` へ進めてしまう。**
+    """
+    scene.set_part(status=PartStatus.COMPLETED)
+    result = write_result(scene)
+    moved = scene.runner.collect_delete_results([scene.part()], gone(scene))
+
+    assert moved == 0
+    assert result.exists(), "別の周回で回収されるべき結果を捨てている"
+    assert scene.part().status == PartStatus.COMPLETED
+    assert scene.part().source_deleted_at is None
+
+
 def test_a_missing_result_expires_and_withdraws_the_request(scene: Scene) -> None:
     """結果が来ないまま `delete_result_timeout_seconds` を過ぎたら取り下げる（§9.3）。
 
