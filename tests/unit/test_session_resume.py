@@ -26,9 +26,10 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from voicedock import paths, pipeline, session
+from voicedock import llm, paths, pipeline, session
 from voicedock.config import Config
 from voicedock.db import Database, EntityType, Recording, Session
+from voicedock.errors import ErrorCode
 from voicedock.log import Logger
 from voicedock.paths import DevicePath, SessionKey
 from voicedock.states import (
@@ -253,6 +254,9 @@ def test_resuming_does_not_record_a_phantom_transition(
 
     `ANALYZING` から再開した行に `MERGED → ANALYZING` を書くと、障害を追う人が
     「もう一度 `MERGED` を通った」と読む。§8.4 の `events` は状態遷移の唯一の履歴である。
+
+    このテストは `_analysis_is_valid` の短絡で戻る経路を見る。**遷移を書く行まで
+    到達する経路**は `test_resuming_past_the_guard_does_not_conflict` が見る。
     """
     add_session(database, status=SessionStatus.ANALYZING)
     monkeypatch.setattr(pipeline.Pipeline, "_analysis_is_valid", lambda *_args: True)
@@ -261,6 +265,45 @@ def test_resuming_does_not_record_a_phantom_transition(
     recorded = transitions(database)
     assert (SessionStatus.MERGED, SessionStatus.ANALYZING) not in recorded, recorded
     assert (SessionStatus.ANALYZING, SessionStatus.ANALYZED) in recorded, recorded
+
+
+def test_resuming_past_the_guard_does_not_conflict(
+    database: Database,
+    cfg: Config,
+    logger: tuple[Logger, io.StringIO],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """**遷移を書く行まで到達する経路。**`ANALYZING` から再開して LLM がまた落ちる形。
+
+    `db.record_transition()` は `WHERE <key> = ? AND status = ?` で現在の状態を確かめ、
+    合わなければ `TransitionConflict` を投げる。だから `ANALYZING` の行に
+    `MERGED → ANALYZING` を書こうとすると**例外で落ちる。**
+
+    **`_analysis_is_valid` の短絡で戻るテストだけではこの行に届かない**
+    （意図的な破壊で確認した）。
+    """
+    add_session(database, status=SessionStatus.ANALYZING)
+    monkeypatch.setattr(pipeline.Pipeline, "_analysis_is_valid", lambda *_args: False)
+    monkeypatch.setattr(
+        llm,
+        "analyze_session",
+        lambda *_args, **_kwargs: llm.SessionAnalysis(
+            result=None,
+            chunks=(),
+            partials=(),
+            error_code=ErrorCode.LLM_UNAVAILABLE,
+            error_message="stub",
+        ),
+    )
+
+    assert not runner(database, cfg, logger[0]).ensure_analysis(KEY, empty_transcript())
+
+    row = database.get_session(KEY)
+    assert row is not None
+    assert row.status == SessionStatus.FAILED
+    recorded = transitions(database)
+    assert (SessionStatus.MERGED, SessionStatus.ANALYZING) not in recorded, recorded
+    assert (SessionStatus.ANALYZING, SessionStatus.FAILED) in recorded, recorded
 
 
 def test_analysis_still_starts_from_merged(
