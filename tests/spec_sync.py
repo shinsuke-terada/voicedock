@@ -229,6 +229,19 @@ def spec_config_example() -> dict[str, object]:
     return document
 
 
+def spec_unit_test_targets() -> list[str]:
+    """§20.1 の表の「対象」列を出現順に返す。
+
+    **件数のずれが最も危ない**（#55 の振り返り）。SPEC に 1 行足して実装を忘れると、
+    **検査が足りないまま「完了」になる。**`docs/TEST_COVERAGE.md` と突き合わせる。
+    """
+    rows = re.findall(r"^\| (.+?) \| .+? \|$", _section("20.1"), re.M)
+    targets = [row.strip() for row in rows if row.strip() not in {"対象", "---"}]
+    if not targets:
+        pytest.fail("SPEC §20.1 の表を読み取れませんでした")
+    return targets
+
+
 def spec_rule_ids(section: str, prefix: str) -> list[str]:
     """`### <section>` の表から `<prefix>-n` の規則 ID を出現順に返す。
 
