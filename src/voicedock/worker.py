@@ -30,7 +30,7 @@ from voicedock.config import Config
 from voicedock.device import DeviceInventory
 from voicedock.heartbeat import DEFAULT_STATE_ROOT, read_heartbeat
 from voicedock.log import Logger
-from voicedock.paths import PartKey
+from voicedock.paths import PartKey, SessionKey
 from voicedock.states import PART_TERMINAL, SessionStatus
 
 STOP_SIGNALS: Final[tuple[signal.Signals, ...]] = (signal.SIGTERM, signal.SIGINT)
@@ -115,6 +115,7 @@ class Worker:
         self.discover_parts()
         self.close_idle_sessions()
         self.process_pending_parts()
+        self.process_ready_sessions()
         self.requeue_failed(inventory)
         return True
 
@@ -217,6 +218,20 @@ class Worker:
             return 0
         # TODO(#32): FAILED を直前の進行中状態へ戻し retry_count を 0 にする（§15.2）
         return 0
+
+    def process_ready_sessions(self) -> None:
+        """§10.8〜§10.9 を 1 件ずつ（**Part と同じく直列**。§10.0）。
+
+        **停止要求は 1 件ごとに見る。**LLM の 1 回が最大 1800 秒（§7.2）なので途中では
+        止まれないが、次のセッションへ進む前には止まれる。
+        """
+        runner = pipeline.Pipeline(
+            database=self.database, cfg=self.cfg, log=self.log, now=self.now()
+        )
+        for session_key in self.ready_session_keys():
+            if self.stopper.should_stop():
+                return
+            runner.process_session(SessionKey(session_key))
 
     def ready_session_keys(self) -> list[str]:
         """`READY` で全 Part が終端状態のセッション（§9.3 の `READY → MERGING` のガード）。

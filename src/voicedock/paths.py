@@ -59,6 +59,8 @@ DATA_ROOT: Final = Path("/data")
 VAULT_ROOT: Final = Path("/obsidian")
 QUEUE_ROOT: Final = Path("/queue")
 TRANSCRIPTS_ROOT: Final = DATA_ROOT / "transcripts" / "parts"
+ANALYSIS_ROOT: Final = DATA_ROOT / "analysis"
+"""LLM 解析結果の置き場（§10.9 / §8.3）。**設定キーではない** — SPEC が固定している。"""
 """Part transcript の置き場（§10.6 / §4.1）。**設定キーではない** — SPEC が固定している。"""
 
 # 一時ファイルの命名（§13.6）。`.` 始まりは検証途中のファイルを Obsidian に拾わせないため
@@ -226,6 +228,14 @@ def relpath_of(key: PartKey) -> DevicePath:
     if not separator:
         raise ValueError(f"partkey に '/' がありません: {key!r}")
     return DevicePath(PurePosixPath(rest))
+
+
+def analysis_path_for(key: SessionKey) -> Path:
+    """`/data/analysis/<slug>.json`（§8.3 / §10.9）。`slug = key_slug(session_key)`。
+
+    **`session_key` をそのままファイル名にしない。**`:` を含む（§8.1）。
+    """
+    return ANALYSIS_ROOT / f"{key_slug(key)}.json"
 
 
 def transcript_path_for(key: PartKey) -> Path:
