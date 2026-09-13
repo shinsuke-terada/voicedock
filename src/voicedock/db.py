@@ -308,6 +308,7 @@ class Database:
         error_code: str | None = None,
         error_message: str | None = None,
         detail: str | None = None,
+        reset_retry: bool = False,
         now: datetime | None = None,
     ) -> None:
         """状態を進め、`events` へ 1 行残す（§8.4）。
@@ -324,9 +325,13 @@ class Database:
         **どの遷移が許されるかはここで検査しない**（#11 の `states.py` と #19 が担う）。
         """
         moment = self._now(now)
-        if to_status in RETRY_RESET_STATUSES:
+        if reset_retry or to_status in RETRY_RESET_STATUSES:
+            # `reset_retry` は §15.2 の**再評価**（デバイス再接続 / サービス起動）である。
+            # **工程内リトライでは 0 に戻さない** — 戻すと `max_attempts` が効かなくなる
             retry_expr = "0"
         elif to_status == FAILED_STATUS:
+            # **増やす場所はここだけである**（v5.6→v5.7 の変更 S-1）。リトライ側でも
+            # 増やすと二重に数え、`max_attempts: 3` で実際には 4 回試すことになる
             retry_expr = "retry_count + 1"
         else:
             retry_expr = "retry_count"
@@ -450,6 +455,36 @@ class Database:
             "SELECT * FROM sessions WHERE status = ? ORDER BY session_key", (status,)
         ).fetchall()
         return [_from_row(Session, row) for row in rows]
+
+    def failed_from(self, entity: EntityType, entity_key: str) -> str | None:
+        """**直前にどの進行中状態から `FAILED` へ落ちたか**（§9.3 / §15.2）。
+
+        §15.2 は「累積の失敗回数は `events` テーブルから復元する」と規定している。
+        **戻り先も同じ出所から取る** — 行に「どこで落ちたか」の列は無く、生成物の有無から
+        推測すると §9.4 の再開規則と二重の判定になる。
+        """
+        row = self.conn.execute(
+            "SELECT from_status FROM events "
+            "WHERE entity_type = ? AND entity_key = ? AND to_status = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (entity, entity_key, FAILED_STATUS),
+        ).fetchone()
+        return None if row is None else row["from_status"]
+
+    def rows_with_status(
+        self, entity: EntityType, status: str
+    ) -> list[tuple[str, int, str | None]]:
+        """`(key, retry_count, error_code)` を返す（§15.2 の再評価が使う）。
+
+        **dataclass を組み立てない。**Part と Session の両方を同じ形で扱いたいだけで、
+        全列は要らない。
+        """
+        rows = self.conn.execute(
+            f"SELECT {entity.key_column} AS key, retry_count, error_code "  # noqa: S608
+            f"FROM {entity.table} WHERE status = ? ORDER BY updated_at, {entity.key_column}",
+            (status,),
+        ).fetchall()
+        return [(row["key"], row["retry_count"], row["error_code"]) for row in rows]
 
     def events_for(self, entity: EntityType, entity_key: str) -> list[Event]:
         rows = self.conn.execute(
