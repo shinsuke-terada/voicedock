@@ -5,7 +5,7 @@ UV_IMAGE ?= ghcr.io/astral-sh/uv:0.12.13-python3.12-trixie-slim
 UV_RUN = docker run --rm -v "$(CURDIR)":/w -w /w \
            -e UV_PROJECT_ENVIRONMENT=/tmp/.venv $(UV_IMAGE) sh -c
 
-.PHONY: up down logs status test lint fmt lock
+.PHONY: up down logs status test lint fmt lock helper-install helper-status
 
 # bind mount 先を用意する。本来は helper/install.sh の仕事だが、それまでは make up が面倒を見る
 VOICEDOCK_HOME_DIRS = inbox queue state
@@ -19,6 +19,11 @@ up:
 	docker compose up -d --build
 
 down:   ; docker compose down
+
+# ホスト側 Helper（SPEC §3.4(6), §4.1, §17.4）。**Docker には依存しない**
+# （Docker Desktop の起動前にデバイスが挿されうるため。§7.4）
+helper-install: ; ./helper/install.sh
+helper-status:  ; ./helper/install.sh --status
 logs:   ; docker compose logs -f voicedock
 
 # voicedock status は #33 まで未実装。終了コード 1 を返すが、ターゲットは隠さない
@@ -27,12 +32,17 @@ status: ; docker compose exec voicedock voicedock status
 # テストはコンテナ内で実行する。ホストに Python / pytest を入れない（SPEC §3.3, §17.4）
 # docs/ と config/ と compose.yaml も渡す。仕様・設定・マウント点と実装の整合を
 # テストで固定するため（§17.4, tests/spec_sync.py, tests/unit/test_paths.py）
+#
+# helper/ も渡す。ホスト側 Helper（bash）の挙動をコンテナ内の pytest から
+# subprocess で検証するため（§20.1 / §20.4 の Helper 層）。**ro で渡す**ので
+# テストが helper/ を書き換えることはない
 test:
 	docker build --target dev -t voicedock:dev .
 	docker run --rm \
 	  -v "$(CURDIR)/tests:/app/tests:ro" \
 	  -v "$(CURDIR)/docs:/app/docs:ro" \
 	  -v "$(CURDIR)/config:/app/config:ro" \
+	  -v "$(CURDIR)/helper:/app/helper:ro" \
 	  -v "$(CURDIR)/compose.yaml:/app/compose.yaml:ro" \
 	  voicedock:dev pytest -q
 

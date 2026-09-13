@@ -10,6 +10,7 @@ enum を忘れた、という事故を即座に落とす。
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Final
@@ -168,6 +169,32 @@ def spec_config_example() -> dict[str, object]:
     document = yaml.safe_load(m.group(1))
     if not isinstance(document, dict):
         pytest.fail("SPEC §7.2 の yaml ブロックがマッピングになっていません")
+    return document
+
+
+def spec_helper_conf() -> str:
+    """§7.4 の 1 つめの ```sh ブロック（`helper/helper.example.conf` の正）。
+
+    §7.2 と `config/config.example.yaml` の関係と同じである。**Helper の設定は
+    `helper.conf` にしか無い**ので（§7.4）、SPEC と example が食い違うと
+    「ユーザーが手で書く唯一の設定」が壊れる。
+    """
+    found: list[str] = re.findall(r"```sh\n(.*?)\n```", _section("7.4"), re.S)
+    if not found:
+        pytest.fail("SPEC §7.4 の sh ブロックを読み取れませんでした")
+    return found[0]
+
+
+def spec_json_block(section: str, index: int = 0) -> dict[str, object]:
+    """`### <section>` の `index` 番目の ```json ブロックを parse して返す。"""
+    found = re.findall(r"```json\n(.*?)\n```", _section(section), re.S)
+    if len(found) <= index:
+        pytest.fail(
+            f"SPEC §{section} に json ブロックが {index + 1} 個ありません（{len(found)} 個）"
+        )
+    document = json.loads(found[index])
+    if not isinstance(document, dict):
+        pytest.fail(f"SPEC §{section} の json ブロック {index} がマッピングではありません")
     return document
 
 
