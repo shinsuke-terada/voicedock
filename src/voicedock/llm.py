@@ -637,9 +637,18 @@ def split_chunks(transcript: SessionTranscript, cfg: Config) -> list[Chunk]:
     current: list[AbsoluteSegment] = []
 
     for segment in transcript.segments:
-        if current and _exceeds(current, segment, settings):
+        if not current:
+            current.append(segment)
+            continue
+        over_chars, over_time = _limits(current, segment, settings)
+        if over_chars or over_time:
             chunks.append(_chunk(current))
-            current = _overlap(current, settings.chunk_overlap_chars)
+            # **時間で割れたときは重なりを持ち越さない。**重なりの目的は文脈の維持だが
+            # （§12.4）、**数時間の無録音区間を跨いで維持すべき文脈は無い。**持ち越すと
+            # 重なりの segment が次チャンクの先頭になり、**その時刻範囲が無録音区間を
+            # 丸ごと含む。**Timeline に「12:09–16:34」のような実体の無いブロックが出る
+            # （実際に出た。v5.5→v5.6 の変更 R-2）
+            current = [] if over_time else _overlap(current, settings.chunk_overlap_chars)
         current.append(segment)
 
     if current and not _is_only_overlap(chunks, current):
@@ -658,11 +667,20 @@ def _is_only_overlap(chunks: list[Chunk], current: list[AbsoluteSegment]) -> boo
     return set(current) <= set(chunks[-1].segments)
 
 
-def _exceeds(current: list[AbsoluteSegment], nxt: AbsoluteSegment, settings: LlmConfig) -> bool:
-    """`nxt` を足すと上限を超えるか（文字数**または**実時間）。"""
+def _limits(
+    current: list[AbsoluteSegment], nxt: AbsoluteSegment, settings: LlmConfig
+) -> tuple[bool, bool]:
+    """`nxt` を足すと超える上限を `(文字数, 実時間)` で返す（§12.4）。
+
+    **どちらで割れたかを呼び手へ伝える。**重なりの持ち越し方が変わるためである
+    （v5.5→v5.6 の変更 R-2）。
+    """
     chars = sum(len(segment.text) for segment in current) + len(nxt.text)
     seconds = (nxt.end_at - current[0].at).total_seconds()
-    return chars > settings.max_chars_per_request or seconds > settings.max_seconds_per_request
+    return (
+        chars > settings.max_chars_per_request,
+        seconds > settings.max_seconds_per_request,
+    )
 
 
 def _overlap(current: list[AbsoluteSegment], limit: int) -> list[AbsoluteSegment]:
