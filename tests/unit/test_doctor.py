@@ -88,8 +88,16 @@ def test_violations_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_file_rules_are_reported_by_d1(tmp_path: Path) -> None:
-    """V-20 / V-23 / V-25 は D-1 が報告する（#13 / #25 が未了の実環境で出る形）。"""
-    document = example_document()
+    """V-20 / V-23 / V-25 は D-1 が報告する。
+
+    **プロンプトの行き先を意図的に存在しないパスへ向ける。**`config.example.yaml` の
+    `/app/prompts/*.txt` は #25 で実在するようになり、**コンテナでは在る / CI では
+    `/app` が無い**という環境依存のテストになっていた。V-23 / V-25（モデル）は
+    どちらの環境にも無いのでそのまま使える。
+    """
+    document = merge(
+        example_document(), {"llm": {"prompts": {"analyze": str(tmp_path / "absent.txt")}}}
+    )
     path = write_config(tmp_path, document)
     out, code = run(path, tmp_path / "state")
     assert "V-20  CONFIG_INVALID_VALUE  llm.prompts.analyze" in out
