@@ -108,6 +108,29 @@ MERGEABLE: Final[frozenset[str]] = frozenset({SessionStatus.READY, SessionStatus
 同じ経路で進む（§9.4 の巻き戻しは起動時の 1 回だけである）。
 """
 
+ANALYZABLE: Final[frozenset[str]] = frozenset({SessionStatus.MERGED, SessionStatus.ANALYZING})
+"""`ensure_analysis()` が進められるセッションの状態。
+
+**`ANALYZING` を含める。**`resume_failed()` は `FAILED` を**落ちた工程へ**戻すので
+（§9.3 / §15.2）、LLM で落ちた行は `ANALYZING` に戻ってくる。`MERGED` だけを受け付けると
+**戻した先に受け手がいない。**`MERGEABLE` が `MERGING` を含むのと同じ理由である。
+"""
+
+WRITABLE: Final[frozenset[str]] = frozenset({SessionStatus.ANALYZED, SessionStatus.WRITING})
+"""`ensure_daily_note()` が進められるセッションの状態。`ANALYZABLE` と同じ理由で
+`WRITING` を含める（Obsidian の書き込みで落ちた行はここへ戻る）。
+"""
+
+PROCESSABLE: Final[frozenset[str]] = MERGEABLE | ANALYZABLE | WRITABLE
+"""`process_session()` に渡す価値があるセッションの状態。
+
+**`worker.ready_session_keys()` の走査対象そのものである。**ここから漏れた状態は
+**誰にも拾われない。**v5.13 まで走査は `{READY, MERGING}` だけで、`MERGED` /
+`ANALYZING` / `ANALYZED` / `WRITING` に座った行は**再起動しても動かなかった**
+（§9.4 の巻き戻しは `ANALYZING → MERGED` などへ移すだけで、`MERGED` もまた
+走査対象外だったため）。2026-09-14 に実機で踏んだ（#97）。
+"""
+
 REOPENABLE: Final[frozenset[str]] = frozenset({SessionStatus.SAVED, SessionStatus.COMPLETED})
 """再オープンできるセッションの状態（§9.3 の `SAVED / COMPLETED → MERGING` 行）。
 
@@ -755,14 +778,17 @@ class Pipeline:
             return False
         if row.status in ANALYZED_OR_BEYOND:
             return True
-        if row.status != SessionStatus.MERGED:
+        if row.status not in ANALYZABLE:
             return False
         if self._analysis_is_valid(session_key):
             # §9.4: 生成物が実在して検証を通るなら工程を飛ばす
-            self._session_transition(session_key, SessionStatus.MERGED, SessionStatus.ANALYZED)
+            self._session_transition(session_key, row.status, SessionStatus.ANALYZED)
             return True
 
-        self._session_transition(session_key, SessionStatus.MERGED, SessionStatus.ANALYZING)
+        # **既に `ANALYZING` なら遷移を記録しない**（`MERGEABLE` の扱いと同じ）。
+        # 戻ってきた行に `MERGED → ANALYZING` を書くと、events に在りもしない遷移が残る
+        if row.status == SessionStatus.MERGED:
+            self._session_transition(session_key, SessionStatus.MERGED, SessionStatus.ANALYZING)
         result = llm.analyze_session(transcript, cfg=self.cfg)
         if not result.ok or result.result is None:
             self._fail_session(
@@ -829,14 +855,14 @@ class Pipeline:
             return False
         if row.status in SAVED_OR_BEYOND:
             return True
-        if row.status != SessionStatus.ANALYZED or row.analysis_path is None:
+        if row.status not in WRITABLE or row.analysis_path is None:
             return False
 
         analysis = self._load_analysis(session_key)
         if analysis is None:
             self._fail_session(
                 session_key,
-                SessionStatus.ANALYZED,
+                row.status,
                 ErrorCode.OBSIDIAN_WRITE_FAILED,
                 f"解析結果を読めません: {row.analysis_path}",
                 event="obsidian_failed",
@@ -849,7 +875,9 @@ class Pipeline:
         excluded = [p for p in parts if p.status in session.EXCLUDED_FROM_MERGE]
         day = paths.day_of_session(session_key)
 
-        self._session_transition(session_key, SessionStatus.ANALYZED, SessionStatus.WRITING)
+        # **既に `WRITING` なら遷移を記録しない**（`ensure_analysis()` と同じ扱い）
+        if row.status == SessionStatus.ANALYZED:
+            self._session_transition(session_key, SessionStatus.ANALYZED, SessionStatus.WRITING)
         content = self._render_daily(
             analysis,
             session_key=session_key,
