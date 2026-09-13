@@ -5,7 +5,7 @@ UV_IMAGE ?= ghcr.io/astral-sh/uv:0.12.13-python3.12-trixie-slim
 UV_RUN = docker run --rm -v "$(CURDIR)":/w -w /w \
            -e UV_PROJECT_ENVIRONMENT=/tmp/.venv $(UV_IMAGE) sh -c
 
-.PHONY: models up down logs status test lint fmt lock helper-install helper-status
+.PHONY: models up down logs status doctor test lint fmt lock helper-install helper-status
 
 # bind mount 先を用意する。本来は helper/install.sh の仕事だが、それまでは make up が面倒を見る
 VOICEDOCK_HOME_DIRS = inbox queue state
@@ -28,6 +28,11 @@ logs:   ; docker compose logs -f voicedock
 
 # voicedock status は #33 まで未実装。終了コード 1 を返すが、ターゲットは隠さない
 status: ; docker compose exec voicedock voicedock status
+
+# 診断（§19.2）。**ホスト側 5 件 → コンテナ内 12 件の順で 17 件**。
+# `scripts/doctor.sh` がコンテナ内の doctor まで続けて呼ぶので、ここでは 1 本だけ叩く。
+# **`make up` の前でも動く**（コンテナが無ければ最後の 12 件を skip する）
+doctor: ; ./scripts/doctor.sh
 
 # テストはコンテナ内で実行する。ホストに Python / pytest を入れない（SPEC §3.3, §17.4）
 # docs/ と config/ と compose.yaml も渡す。仕様・設定・マウント点と実装の整合を
