@@ -51,11 +51,17 @@ def bash_files() -> list[Path]:
 
 
 def test_the_scan_picks_up_every_script() -> None:
-    """**走査が実際に効くこと。**必ず在るものが 1 つでも落ちていたら検査は空振りである。"""
+    """**走査が実際に効くこと。**
+
+    「必ず在るもの」だけを見ても足りない。**`scripts/` に置いたスクリプトが 1 本残らず
+    対象になっている**ことを見る — v5.10 までの固定配列は `REQUIRED` を満たしたまま
+    `fetch-models.sh` を取りこぼしていた（#93）。
+    """
     found = set(bash_files())
     for path in REQUIRED:
         assert path in found, f"{path.name} が静的検査の対象から漏れている"
-    assert len(found) > len(REQUIRED), "scripts/ と helper/ の走査が効いていない"
+    missing = sorted(p.name for p in (REPO_ROOT / "scripts").glob("*.sh") if p not in found)
+    assert missing == [], f"scripts/ のスクリプトが静的検査から漏れている: {missing}"
 
 
 def strip_comments(text: str) -> str:
