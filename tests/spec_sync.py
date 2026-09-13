@@ -172,6 +172,21 @@ def spec_config_example() -> dict[str, object]:
     return document
 
 
+def spec_rule_ids(section: str, prefix: str) -> list[str]:
+    """`### <section>` の表から `<prefix>-n` の規則 ID を出現順に返す。
+
+    **件数のずれが最も危ない。**#55 の振り返りのとおり、名前の変更は grep で見つかるが
+    **件数の変更は本文を読まないと分からない**。SPEC に規則を 1 行足して実装を
+    忘れると、**検査が足りないまま「完了」になる。**
+    """
+    found: list[str] = re.findall(
+        rf"^\| \*{{0,2}}({re.escape(prefix)}-\d+)\*{{0,2}} \|", _section(section), re.M
+    )
+    if not found:
+        pytest.fail(f"SPEC §{section} の {prefix}-* を読み取れませんでした")
+    return found
+
+
 def spec_section_code(section: str, language: str, index: int = 0) -> str:
     """`### <section>` の `index` 番目の ```<language> ブロックを返す。
 
