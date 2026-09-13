@@ -318,7 +318,7 @@ def test_the_depth_limit_matches_the_spec() -> None:
     block = text[start : text.index("### 12.5", start)]
     matched = re.search(r"\| 段数の上限 \| \*\*(\d+) 段\*\*（`REDUCE_MAX_DEPTH`）", block)
     assert matched is not None, "§12.4 の「段数の上限」の行を読み取れません"
-    assert REDUCE_MAX_DEPTH == int(matched.group(1))
+    assert int(matched.group(1)) == REDUCE_MAX_DEPTH
 
 
 # --- 重複除去（§12.4） --------------------------------------------------
