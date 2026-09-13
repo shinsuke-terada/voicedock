@@ -34,6 +34,10 @@ make up                      # = docker compose up -d --build
 **`helper/install.sh` を飛ばすと録音は 1 本も取り込まれない。**コンテナは正常に見え続けるため
 気づきにくい。`doctor` の DH-12 と healthcheck の H-8 がこれを検出する。
 
+`./scripts/doctor.sh`（= `make doctor`）は **初回セットアップ検査と環境診断を兼ねる。検査のみを
+行い、ホスト設定は変更しない。**`make up` の前はホスト側の 5 件だけを実行し、起動後に実行すると
+続けてコンテナ内の 12 件も走る（合計 17）。
+
 日常操作は `make` にまとめてある（`up` / `down` / `logs` / `status` / `test` / `doctor` / `models`
 / `helper-install` / `helper-status`）。
 `make test` はコンテナ内で pytest を実行するため、**ホストに Python を入れる必要はない**。
