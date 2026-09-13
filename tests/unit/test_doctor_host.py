@@ -53,6 +53,24 @@ def write_stub(directory: Path, name: str, body: str) -> Path:
     return path
 
 
+def helper_conf_text(*, volumes: Path, home: Path) -> str:
+    """**実物と同じ字面の `helper.conf`。**パスだけ差し替える。
+
+    `helper/helper.example.conf` は §7.4 の規範ブロックの写しであり
+    （`test_helper_conf_matches_spec` が固定している）、`install.sh` はこれを配る。
+    **配列は複数行で書かれている。**
+
+    1 行形式（`EXCLUDE_VOLUMES=("a" "b")`）で書いた偽 conf を使っていた頃は、
+    **`doctor.sh` の `conf_array()` が複数行配列を読めず、実機で常に `(none)` と
+    表示していたことに気づけなかった**（#95）。`test_probe.py` が
+    `inventory.json` を ingest と同じ字面で組み立てるのと同じ理由である。
+    """
+    text = (REPO_ROOT / "helper" / "helper.example.conf").read_text(encoding="utf-8")
+    text = re.sub(r"^VOLUMES_ROOT=.*$", f"VOLUMES_ROOT={volumes}", text, flags=re.M)
+    text = re.sub(r"^VOICEDOCK_HOME=.*$", f'VOICEDOCK_HOME="{home}"', text, flags=re.M)
+    return text
+
+
 @pytest.fixture
 def host(tmp_path: Path) -> dict[str, Path]:
     """DH-1〜DH-15 が全部通る状態のホストを組み立てる。"""
@@ -74,17 +92,7 @@ def host(tmp_path: Path) -> dict[str, Path]:
     volumes = tmp_path / "volumes"
     volumes.mkdir()
     (home / "helper.conf").write_text(
-        f"VOLUMES_ROOT={volumes}\n"
-        "INCLUDE_VOLUMES=()\n"
-        'EXCLUDE_VOLUMES=("Macintosh HD" ".*")\n'
-        "MOUNT_MODE=ro\n"
-        "DELETE_SOURCE_AUDIO=false\n"
-        f'VOICEDOCK_HOME="{home}"\n'
-        "STABILITY_FAST_PATH_SECONDS=60\n"
-        "STABILITY_INTERVAL_SECONDS=3\n"
-        "STABILITY_CHECKS=2\n"
-        "MAX_SCAN_DEPTH=3\n",
-        encoding="utf-8",
+        helper_conf_text(volumes=volumes, home=home), encoding="utf-8"
     )
     for name in ("state", "log", "queue"):
         (home / name).mkdir(exist_ok=True)
@@ -281,10 +289,34 @@ def test_dh10_handles_a_vault_path_with_spaces(host: dict[str, Path]) -> None:
 
 
 def test_dh13_shows_the_effective_helper_settings(host: dict[str, Path]) -> None:
+    """**実効値そのものを見る。**ラベルが出ているだけでは検査になっていない。
+
+    §5.4 は「`.*` を正規表現と解釈すると DJI が 1 台も検出されないまま無言で停止し、
+    その症状はホットプラグ伝播の失敗と区別がつかない」と書いており、**だから DH-13 が
+    実効値を必ず表示する。**表示が嘘なら、その防壁ごと無い。
+    """
     result = run(host)
     assert "MOUNT_MODE=ro, DELETE_SOURCE_AUDIO=false" in result.stdout
-    assert "INCLUDE_VOLUMES=" in result.stdout
-    assert "EXCLUDE_VOLUMES=" in result.stdout
+    # 既定の `INCLUDE_VOLUMES=()` は空なので `(none)`
+    assert "INCLUDE_VOLUMES=(none)" in result.stdout, result.stdout
+    # **複数行配列の中身が出ること**（`helper.example.conf` はこの形で書かれている）
+    assert '"Macintosh HD"' in result.stdout, result.stdout
+    assert '"com.apple.TimeMachine.*"' in result.stdout, result.stdout
+    assert "EXCLUDE_VOLUMES=(none)" not in result.stdout, result.stdout
+
+
+def test_dh13_reads_a_single_line_array_too(host: dict[str, Path]) -> None:
+    """陰性対照。**1 行形式も読めること** — 人が手で書き直す形である。"""
+    conf = host["home"] / "helper.conf"
+    text = re.sub(
+        r"^EXCLUDE_VOLUMES=\(\n(?:.*\n)*?\)$",
+        'EXCLUDE_VOLUMES=("Backup SSD" ".*")',
+        conf.read_text(encoding="utf-8"),
+        flags=re.M,
+    )
+    conf.write_text(text, encoding="utf-8")
+    result = run(host)
+    assert '"Backup SSD"' in result.stdout, result.stdout
 
 
 def test_dh13_warns_when_the_device_is_mounted_read_write(host: dict[str, Path]) -> None:
