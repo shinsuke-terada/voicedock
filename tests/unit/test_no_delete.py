@@ -791,11 +791,17 @@ def test_the_container_layer_is_implemented_here() -> None:
     assert expected <= implemented_nd(), sorted(expected - implemented_nd())
 
 
-def test_the_reaper_layer_is_not_claimed_yet() -> None:
-    """**reaper 層をここで書いたつもりにならないこと**（#54 待ち）。
+def test_the_reaper_layer_lives_in_its_own_file() -> None:
+    """**reaper 層をここで書いたつもりにならないこと。**
 
-    書いていないものを「書いた」ことにすると、**最重要のテスト群に穴が空いたまま
-    リリース可能に見える。**
+    reaper 層は `tests/unit/test_reaper.py` が `bash helper/voicedock-reaper` を
+    実行して確かめる（§20.4）。書いていないものを「書いた」ことにすると、
+    **最重要のテスト群に穴が空いたままリリース可能に見える。**
     """
-    claimed = spec_layers()["reaper 層"] & implemented_nd()
-    assert claimed == set(), f"{sorted(claimed)} は #54 で入る"
+    reaper_layer = spec_layers()["reaper 層"]
+    assert reaper_layer & implemented_nd() == set(), "reaper 層をこのファイルに書かない"
+
+    other = Path(__file__).with_name("test_reaper.py")
+    found = re.findall(r"^def test_nd(\d+)", other.read_text(encoding="utf-8"), re.M)
+    covered = {f"ND-{int(number):02d}" for number in found}
+    assert reaper_layer <= covered, sorted(reaper_layer - covered)
