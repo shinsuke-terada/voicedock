@@ -602,27 +602,121 @@ TX_MIC001_20260912_163444/
 
 ## 11. Model Runner と LLM スループット（#13 で記入）
 
-⬜ 未実施。
+⚠ **一部のみ。**疎通と初回のレイテンシは採れたが、**スループット判定は保留**
+（測ったチャンクが小さすぎる）。**`models` 長構文での注入は未検証。**
 
-```bash
-docker desktop enable model-runner && docker model status
-docker model pull <§18.2 のタグ>
-./scripts/fetch-models.sh
-make up
-docker compose exec voicedock env | grep VOICEDOCK_LLM   # 注入の確認
+### 11.0 モデルの取得
+
+```text
+$ docker desktop enable model-runner
+$ docker model status
+Docker Model Runner is running
+BACKEND    STATUS         DETAILS
+llama.cpp  Running        llama.cpp b9879-metal (sha256:b70706f4...)
+diffusers  Not Installed
+mlx        Not Installed
+vllm       Not Installed
+
+$ docker model pull ai/qwen3:30b-a3b-instruct-2507-q4_K_M
+Downloaded 18.56GB of 18.56GB
+Model pulled successfully
 ```
 
-| # | 項目 | 実測 |
-|---|---|---|
-| `docker model status` | running か | ⬜ |
-| モデルタグ | 実際に pull できたタグ。**thinking 系でないこと**（§12.3） | ⬜ |
-| `VOICEDOCK_LLM_URL` | **実際の形**（`/engines/v1` の有無）。Compose 5.5.1 での注入 | ⬜ |
-| `response_format` | `{"type":"json_object"}` が受理されるか | ⬜ |
-| 20,000 字 1 チャンク | latency（秒） | ⬜ |
-| 18 チャンク換算 | **30 分以内か**（§21.2 Phase 3） | ⬜ |
-| ホスト RAM | `docker stats` の実測（§4.3 の試算 18 GB の検証） | ⬜ |
+**バックエンドは `llama.cpp`（Metal）である。**`mlx` は未導入。§23 の Mac ネイティブ化を
+検討するときの出発点になる。
 
-**判定は `./scripts/perf-report.sh --llm` でも出せる**（`llm_completed` ログから）。
+`./scripts/fetch-models.sh`:
+
+```text
+fetched: /models/whisper/ggml-large-v3-turbo-q5_0.bin
+fetched: /models/whisper/ggml-silero-v5.1.2.bin
+-rw-r--r-- 1 1000 1000 574041195 ggml-large-v3-turbo-q5_0.bin
+-rw-r--r-- 1 1000 1000    885098 ggml-silero-v5.1.2.bin
+394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2  ggml-large-v3-turbo-q5_0.bin
+29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf  ggml-silero-v5.1.2.bin
+```
+
+**uid 1000 所有で 2 ファイル。**受け入れ条件を満たす。
+
+> **ただし named volume の名前が食い違っていた**（§12.0(1)）。`fetch-models.sh` は
+> `voicedock-models` へ書き、Compose は `voicedock_voicedock-models` をマウントしていた。
+> v5.13（AA-1）で `name:` を明示して解決。
+
+### 11.1 エンドポイントの実際の形
+
+**コンテナ内から 2 通りとも到達できた。**
+
+```text
+$ docker compose exec voicedock python -c "import httpx; print(httpx.get(URL + '/models').text)"
+
+http://model-runner.docker.internal/engines/v1/models   → 200
+http://host.docker.internal:12434/engines/v1/models     → 200
+
+{"object":"list","data":[{"id":"docker.io/ai/qwen3:30b-a3b-instruct-2507-q4_K_M",
+ "object":"model","created":0,"owned_by":"docker","dmr":{}}]}
+```
+
+| 記録事項 | 実測 |
+|---|---|
+| URL の形 | **`/engines/v1` を含む。**`§12.1` の `{URL}/chat/completions` がそのまま使える |
+| ホスト名 | `model-runner.docker.internal`（ポート指定なし）と `host.docker.internal:12434` の両方 |
+| **モデル id** | **`docker.io/` 接頭辞が付く** — `ai/qwen3:...` ではなく `docker.io/ai/qwen3:...` が返る |
+
+> **`models` 長構文での注入は未検証である。**`compose.yaml` の `models:` は
+> `TODO(#13)` のままで、本節の実測は**環境変数を手で与えた**もの
+> （`VOICEDOCK_LLM_URL` / `VOICEDOCK_LLM_MODEL`）。
+> **Compose 5.5.1 が実際に何を注入するか（とくにモデル id に接頭辞が付くか）は
+> 長構文を入れてから確かめること。**§22 R-21 はここに掛かっている。
+
+### 11.2 実音声での LLM 実行（**Daily ノートが出た**）
+
+```text
+2026-09-14T01:52:20+09:00 INFO  service_started version=0.1.0 schema_version=1
+2026-09-14T01:52:42+09:00 INFO  llm_completed session_key=DJIMIC3:20260912 chunks=1 elapsed_s=21.8
+2026-09-14T01:52:42+09:00 INFO  obsidian_saved session_key=DJIMIC3:20260912 path="Daily/Voice/Wiki/20260912/2026-09-12 Voice.md" bytes=1504
+2026-09-14T01:52:50+09:00 INFO  llm_completed session_key=DJIMIC3:20260913 chunks=1 elapsed_s=8.0
+2026-09-14T01:52:50+09:00 INFO  obsidian_saved session_key=DJIMIC3:20260913 path="Daily/Voice/Wiki/20260913/2026-09-13 Voice.md" bytes=2700
+```
+
+**Phase 1〜6 が実音声で端から端まで通った。**取り込み → 変換 → Whisper → Raw ノート →
+統合 → LLM → Daily ノート → 保存検証 → `COMPLETED`。
+
+| # | 実測 |
+|---|---|
+| 1 チャンク（初回。モデル読み込み込み） | **21.8 秒** |
+| 1 チャンク（2 回目。暖機後） | **8.0 秒** |
+| 18 チャンク換算（暖機後） | 約 2.4 分 |
+| 判定 | ⬜ **保留** |
+
+> **判定を出さない理由。**測ったチャンクは **11 文字と 79 文字**であり、
+> §21.2 Phase 3 が想定する **20,000 文字**とは桁が 3 つ違う。
+> **入力長にほぼ比例する工程なので、この数字から 30 分以内かは言えない。**
+> 20,000 文字 1 チャンクの実測が要る（#13 の受け入れ条件）。
+
+`response_format: {"type":"json_object"}` の受理可否は未確認（本番経路は
+§12.3 の独自抽出を使うため、非対応でも動く）。
+
+### 11.3 品質の問題（**#98 で起票**）
+
+**20 秒・79 文字の文字起こしから `Key Points` が 19 項目生成された。**
+「参加者の表情は明るかった」など、**文字起こしに存在しない内容**である。
+
+| 項目 | `config.yaml` | 実際 |
+|---|---|---|
+| `key_points` | `max_items: 20` | **19** |
+| `tags` | `max_items: 15` | **15**（`default_tags` の 2 件を除く） |
+
+**`tags` は上限にぴったり一致している。**JSON スキーマの `maxItems` がモデルへ渡り、
+**埋めるべき数**として解釈されている。`prompts/analyze_ja.txt` は
+「発言に存在しない事実を追加しないでください」「推測や補完を行わないでください」と
+明示しているが、**散文の制約よりスキーマの数字のほうが強く効いた。**
+
+§1.3 の優先順位 1 は記録の保護である。**要約に言っていないことが混ざるのは記録の破壊と同じ**
+であり、しかも Daily は Raw より読まれる。#98 で直す。
+
+### 11.4 ホスト側の RAM
+
+⬜ 未測定（18.5 GB のモデルを常駐させた状態での `docker stats` を採ること）。
 
 ---
 
