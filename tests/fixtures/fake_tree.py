@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -23,7 +24,21 @@ from voicedock.paths import DevicePath, PartKey, partkey_for
 DEVICE_ID: Final = "DJIMIC3"
 """実機のボリューム名（`docs/POC.md` §6.1。出荷時の `NO NAME` から改名したもの）。"""
 
-HELPER_VERSION: Final = "4.4.0"
+
+def _helper_version() -> str:
+    """`helper/voicedock-ingest` の `HELPER_VERSION` を読む。
+
+    **直書きしない。**v5.2 まではここに `"4.4.0"` と書いてあり、**実装が無かったため
+    誰も気づかないまま古くなっていた。**実ファイルから読めば食い違えない。
+    """
+    script = Path(__file__).parents[2] / "helper" / "voicedock-ingest"
+    matched = re.search(r'^HELPER_VERSION="([^"]+)"', script.read_text(encoding="utf-8"), re.M)
+    if matched is None:  # pragma: no cover - 実装が壊れたときだけ通る
+        raise RuntimeError(f"HELPER_VERSION を読み取れません: {script}")
+    return matched.group(1)
+
+
+HELPER_VERSION: Final = _helper_version()
 META_SCHEMA: Final = 1
 DEFAULT_COPIED_AT: Final = datetime(2026, 9, 13, 9, 0, 0, tzinfo=UTC)
 
