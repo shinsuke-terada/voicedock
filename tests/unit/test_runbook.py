@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import re
-import shutil
 from pathlib import Path
 
 import pytest
@@ -155,36 +154,105 @@ def test_the_extraction_finds_the_program() -> None:
     assert EXEC_PROGRAM.findall("docker compose exec voicedock voicedock status") == ["voicedock"]
 
 
+def runtime_programs() -> set[str]:
+    """runtime イメージで呼べるプログラム。**`Dockerfile` から静的に求める。**
+
+    **`shutil.which()` を使ってはならない。**あれは「いま pytest が走っている場所」を
+    見るだけで、runtime イメージの中身ではない。CI の `check` job は
+    **GitHub ランナー上で直に pytest を回す**ので `/usr/bin/sqlite3` が在り、
+    `which` に頼った検査は**そこで嘘をつく**（#95 で踏んだ）。
+    """
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    runtime = dockerfile.split("AS runtime", 1)[1].split("AS dev", 1)[0]
+
+    found = {"python", "python3", "pip", "voicedock"} | _BASE_IMAGE_TOOLS
+    lines = runtime.splitlines()
+    index = 0
+    while index < len(lines):
+        if "apt-get install" in lines[index]:
+            # 行末が `\` の間は同じコマンドである
+            while True:
+                body = lines[index].rstrip()
+                continued = body.endswith("\\")
+                for token in body.rstrip("\\").split():
+                    if token.startswith("-") or "/" in token or token in _APT_NOISE:
+                        continue
+                    found.add(token)
+                index += 1
+                if not continued or index >= len(lines):
+                    break
+            continue
+        index += 1
+
+    # `COPY --from=... /usr/local/bin/<name>` で入るもの（whisper-cli など）
+    found |= set(re.findall(r"/usr/local/bin/([\w.-]+)", runtime))
+    return found
+
+
+_APT_NOISE = frozenset({"RUN", "apt-get", "update", "install", "&&", "rm", "apt"})
+
+_BASE_IMAGE_TOOLS = frozenset(
+    {
+        "cat",
+        "cp",
+        "date",
+        "df",
+        "du",
+        "env",
+        "find",
+        "grep",
+        "head",
+        "id",
+        "ln",
+        "ls",
+        "mkdir",
+        "mv",
+        "sh",
+        "sleep",
+        "sort",
+        "stat",
+        "tail",
+        "touch",
+        "wc",
+    }
+)
+"""`python:3.12-slim-bookworm` の Debian ユーザランドに最初から在るもの。
+
+**この検査が捕まえたいのは「入れていないパッケージ」である**（`sqlite3` のような）。
+coreutils まで Dockerfile に列挙させると、検査が本題から外れる。
+"""
+
+
 @pytest.mark.parametrize(
     "path",
     [E2E_PATH, POC_PATH, REPO_ROOT / "README.md", REPO_ROOT / "docs" / "SPEC.md"],
     ids=lambda p: p.name,
 )
-def test_every_documented_program_exists_in_the_image(path: Path) -> None:
-    """**手順が呼ぶプログラムがイメージに在ること。**
+def test_every_documented_program_is_in_the_runtime_image(path: Path) -> None:
+    """**手順が呼ぶプログラムが runtime イメージに在ること。**
 
     §17.1 は `history` / `show` を削った代替として `events` を SQL で読む手順を載せている。
     **v5.13 まで `sqlite3 -box` と書いてあり、そのとおり打つと
     `executable file not found` になった**（2026-09-14 に実機で踏んだ）。
-    runtime イメージに `sqlite3` CLI は入っていない。
-
-    **`dev` は `FROM runtime` なので、ここで見つからないものは本番にも無い。**
     """
     if not path.is_file():
         pytest.skip(f"{path.name} がマウントされていない")
-    programs = sorted(set(EXEC_PROGRAM.findall(path.read_text(encoding="utf-8"))))
-    missing = [name for name in programs if shutil.which(name) is None]
+    programs = set(EXEC_PROGRAM.findall(path.read_text(encoding="utf-8")))
+    missing = sorted(programs - runtime_programs())
     assert missing == [], (
-        f"{path.relative_to(REPO_ROOT)}: イメージに無いプログラムを手順が呼んでいる {missing}"
+        f"{path.relative_to(REPO_ROOT)}: runtime イメージに無いプログラムを手順が呼んでいる "
+        f"{missing}（Dockerfile が入れているのは {sorted(runtime_programs())}）"
     )
 
 
 def test_the_check_would_catch_a_missing_program() -> None:
-    """陽性対照。**`sqlite3` CLI が無いことを確かめる** — 在るなら検査が意味を失う。"""
-    assert shutil.which("sqlite3") is None, (
-        "sqlite3 CLI がイメージに入った。手順を戻してよいか §18.3 と照らして判断すること"
+    """陽性対照。**`sqlite3` が runtime イメージに無いこと** — 在るなら検査が意味を失う。"""
+    programs = runtime_programs()
+    assert "sqlite3" not in programs, (
+        "sqlite3 を Dockerfile が入れた。手順を戻してよいか §18.3 と照らして判断すること"
     )
-    assert shutil.which("python") is not None
+    assert "python" in programs
+    assert "ffmpeg" in programs, "Dockerfile の apt-get を読めていない（検査が空振りする）"
 
 
 # --- 手順が参照するスクリプトが実在すること ------------------------------
