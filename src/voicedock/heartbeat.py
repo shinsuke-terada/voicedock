@@ -42,6 +42,13 @@ class Heartbeat(BaseModel):
     mount_readonly: bool | None = None
     delete_source_audio: bool | None = None
     reaper_installed: bool | None = None
+    device_free_bytes: int | None = None
+    """接続中デバイスの空き容量（§17.2 の `Device free space`）。
+
+    **コンテナはデバイスに到達できない**（§14.4 N-3）ので、自分で測る経路は無い。
+    Helper が報告しなければ `None`（`status` は `unknown` と出す）。
+    """
+
     include_volumes: tuple[str, ...] = ()
     exclude_volumes: tuple[str, ...] = ()
     config_error: str | None = None
