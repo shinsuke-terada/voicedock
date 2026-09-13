@@ -20,6 +20,8 @@ from voicedock.config import Config, parse_config
 
 REPO_ROOT = Path(__file__).parents[1]
 EXAMPLE_PATH = REPO_ROOT / "config" / "config.example.yaml"
+PROMPTS_ROOT = REPO_ROOT / "prompts"
+"""§12.5 のプロンプト（コンテナでは `/app/prompts`、CI ではリポジトリ直下）。"""
 
 
 def example_document() -> dict[str, Any]:
@@ -47,8 +49,10 @@ def complete_tree(tmp_path: Path) -> dict[str, Any]:
     プロンプトは #25、モデルは #13 の成果物であり実環境にはまだ無い。
     **検査そのものは今のうちに固定しておく。**
     """
-    for name in ("analyze", "map", "reduce", "repair"):
-        (tmp_path / f"{name}.txt").write_text("x", encoding="utf-8")
+    # **プロンプトは本物を使う**（#25 で `prompts/` がリポジトリに入った）。
+    # 偽ファイル（`"x"` 1 文字）にすると `llm.system_prompt()` を通るテストが
+    # 「差し込みが働いたか」を確かめられない。`REPO_ROOT` はコンテナ内では `/app` で、
+    # CI ではリポジトリのルートなので、どちらでも解決する
     (tmp_path / "whisper.bin").write_bytes(b"\0" * 16)
     (tmp_path / "vad.bin").write_bytes(b"\0" * 16)
     executable = tmp_path / "whisper-cli"
@@ -59,10 +63,10 @@ def complete_tree(tmp_path: Path) -> dict[str, Any]:
         {
             "llm": {
                 "prompts": {
-                    "analyze": str(tmp_path / "analyze.txt"),
-                    "map": str(tmp_path / "map.txt"),
-                    "reduce": str(tmp_path / "reduce.txt"),
-                    "repair": str(tmp_path / "repair.txt"),
+                    "analyze": str(PROMPTS_ROOT / "analyze_ja.txt"),
+                    "map": str(PROMPTS_ROOT / "map_ja.txt"),
+                    "reduce": str(PROMPTS_ROOT / "reduce_ja.txt"),
+                    "repair": str(PROMPTS_ROOT / "repair_json.txt"),
                 }
             },
             "transcription": {
