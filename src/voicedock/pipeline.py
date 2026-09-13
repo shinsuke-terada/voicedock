@@ -16,14 +16,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Final
 
 from pydantic import BaseModel, ValidationError
 
-from voicedock import audio, llm, paths, raw, session, transcribe
+from voicedock import audio, daily, llm, paths, raw, session, transcribe, wiki
 from voicedock.config import Config
 from voicedock.db import Database, EntityType, Recording, Session
 from voicedock.errors import ErrorCode
@@ -96,8 +96,21 @@ class SessionOutcome(StrEnum):
     """有効な Part が 0 件。ノートを作らず `COMPLETED`（`session_empty`。§10.8）。"""
 
     ANALYZED = "analyzed"
-    """LLM 解析まで到達した。Daily ノートは #28 が書く。"""
+    """LLM 解析まで到達したが Daily ノートで止まった。"""
 
+    SAVED = "saved"
+    """Daily ノートを保存し検証も通った（§13.7）。削除の評価は #36 が行う。"""
+
+
+SAVED_OR_BEYOND: Final[frozenset[str]] = frozenset(
+    {
+        SessionStatus.SAVED,
+        SessionStatus.SOURCE_DELETING,
+        SessionStatus.SOURCE_DELETE_PENDING,
+        SessionStatus.CLEANUP,
+        SessionStatus.COMPLETED,
+    }
+)
 
 ANALYZED_OR_BEYOND: Final[frozenset[str]] = frozenset(
     {
@@ -411,8 +424,8 @@ class Pipeline:
         row = self.database.get_session(session_key)
         if row is None:
             return SessionOutcome.STOPPED
-        if row.status in ANALYZED_OR_BEYOND:
-            return SessionOutcome.ANALYZED
+        if row.status in SAVED_OR_BEYOND:
+            return SessionOutcome.SAVED
 
         transcript = self.build_transcript(session_key)
         if not self.ensure_merged(row, transcript):
@@ -426,7 +439,9 @@ class Pipeline:
             return SessionOutcome.STOPPED
         if not self.ensure_analysis(session_key, transcript):
             return SessionOutcome.STOPPED
-        return SessionOutcome.ANALYZED
+        if not self.ensure_daily_note(session_key, transcript):
+            return SessionOutcome.ANALYZED
+        return SessionOutcome.SAVED
 
     def build_transcript(self, session_key: SessionKey) -> session.SessionTranscript | None:
         """§10.8: `started_at` 昇順に Part transcript を連結する。**永続化しない。**"""
@@ -506,6 +521,17 @@ class Pipeline:
         target = paths.analysis_path_for(session_key)
         try:
             self._write_analysis(target, result.result)
+            # **Map 中間結果を残す**（§10.9 / R-1）。§13.4 の Timeline はこれを並べたもので、
+            # 再生成には 18 回の LLM 呼び出しが要る
+            daily.save_timeline(
+                target,
+                daily.build_timeline(
+                    partials=result.partials,
+                    chunks=result.chunks,
+                    transcript=transcript,
+                    summary=str(getattr(result.result, "summary", "")),
+                ),
+            )
         except OSError as exc:
             self._fail_session(
                 session_key,
@@ -531,6 +557,169 @@ class Pipeline:
             elapsed_s=round(result.elapsed_seconds, 1),
         )
         return True
+
+    def ensure_daily_note(
+        self, session_key: SessionKey, transcript: session.SessionTranscript
+    ) -> bool:
+        """`ANALYZED → WRITING → SAVED`（§10.10 / §10.11 / §13.4）。**冪等。**
+
+        §9.4 の「`output_path` が存在し `output_sha256` と一致すれば飛ばす」を
+        保存検証（W-1〜W-9）の再実行で担う。**別の判定を書かない** — #36 の
+        `cleaner.py` も同じ `verify_note()` を呼ぶ。
+
+        **リンクの生成失敗は保存検証の合否に影響させない**（§13.8）。
+        """
+        row = self.database.get_session(session_key)
+        if row is None:
+            return False
+        if row.status in SAVED_OR_BEYOND:
+            return True
+        if row.status != SessionStatus.ANALYZED or row.analysis_path is None:
+            return False
+
+        analysis = self._load_analysis(session_key)
+        if analysis is None:
+            self._fail_session(
+                session_key,
+                SessionStatus.ANALYZED,
+                ErrorCode.OBSIDIAN_WRITE_FAILED,
+                f"解析結果を読めません: {row.analysis_path}",
+                event="obsidian_failed",
+                reason="write",
+            )
+            return False
+
+        parts = self.database.recordings_for_session(session_key)
+        included = [p for p in parts if p.status not in session.EXCLUDED_FROM_MERGE]
+        excluded = [p for p in parts if p.status in session.EXCLUDED_FROM_MERGE]
+        day = paths.day_of_session(session_key)
+
+        self._session_transition(session_key, SessionStatus.ANALYZED, SessionStatus.WRITING)
+        content = self._render_daily(
+            analysis,
+            session_key=session_key,
+            day=day,
+            transcript=transcript,
+            included=included,
+            excluded=excluded,
+            recorded_seconds=row.recorded_seconds,
+        )
+        try:
+            result = daily.write_daily_note(
+                content,
+                day=day,
+                session_key=session_key,
+                recording_keys=[PartKey(p.partkey) for p in included],
+                cfg=self.cfg,
+                vault_root=Path(self.cfg.obsidian.root),
+            )
+        except (OSError, ValueError) as exc:
+            self._fail_session(
+                session_key,
+                SessionStatus.WRITING,
+                ErrorCode.OBSIDIAN_WRITE_FAILED,
+                f"{type(exc).__name__}: {exc}",
+                event="obsidian_failed",
+                reason="write",
+            )
+            return False
+
+        if not result.ok:
+            self._fail_session(
+                session_key,
+                SessionStatus.WRITING,
+                ErrorCode.OBSIDIAN_VERIFY_FAILED,
+                f"落ちた規則: {', '.join(result.failed_rules)}",
+                event="obsidian_failed",
+                reason="verify",
+            )
+            return False
+
+        # **DB 更新が成功するまで `SAVED` とみなさない**（§13.7）
+        self.database.update_session(
+            session_key,
+            output_path=self._vault_relative(Path(result.path)),
+            output_sha256=result.sha256,
+            error_code=None,
+            error_message=None,
+            now=self.now,
+        )
+        self._session_transition(session_key, SessionStatus.WRITING, SessionStatus.SAVED)
+        self.log.info(
+            "obsidian_saved",
+            session_key=session_key,
+            path=self._vault_relative(Path(result.path)),
+            bytes=Path(result.path).stat().st_size,
+        )
+        return True
+
+    def _render_daily(
+        self,
+        analysis: BaseModel,
+        *,
+        session_key: SessionKey,
+        day: date,
+        transcript: session.SessionTranscript,
+        included: list[Recording],
+        excluded: list[Recording],
+        recorded_seconds: float | None,
+    ) -> str:
+        """§13.4 のレンダリング。**リンクの生成が失敗しても保存は続ける**（§13.8）。"""
+        links = self._plan_links(analysis, session_key=session_key, day=day)
+        # **保存済みの Map 中間結果を優先する**（§10.9 / R-1）。読めなければ §13.4 の
+        # 代替経路（Block ごとに `summary` の各文）へ落ちる。**失敗させない** —
+        # Timeline は要約の付随物である
+        timeline = daily.load_timeline(paths.analysis_path_for(session_key))
+        if not timeline:
+            timeline = daily.build_timeline(
+                partials=(),
+                chunks=(),
+                transcript=transcript,
+                summary=str(getattr(analysis, "summary", "")),
+            )
+        return daily.render_daily_note(
+            analysis,
+            day=day,
+            session_key=session_key,
+            recording_keys=[PartKey(p.partkey) for p in included],
+            failed_keys=[PartKey(p.partkey) for p in excluded],
+            recorded_seconds=recorded_seconds,
+            block_count=len(transcript.blocks),
+            timeline=timeline,
+            links=links,
+            cfg=self.cfg,
+        )
+
+    def _plan_links(
+        self, analysis: BaseModel, *, session_key: SessionKey, day: date
+    ) -> wiki.LinkPlan:
+        """§13.8。**失敗しても空の計画を返す**（保存検証の合否に影響させない）。"""
+        try:
+            index = wiki.index_for(self.cfg, Path(self.cfg.obsidian.root))
+            tags = getattr(analysis, "tags", None)
+            return wiki.plan_links(
+                cfg=self.cfg,
+                day=day,
+                tags=[str(tag) for tag in tags] if isinstance(tags, list) else [],
+                index=index,
+                self_name=daily.daily_filename(self.cfg, day),
+                name_for_day=lambda other: daily.daily_filename(self.cfg, other),
+                raw_names=daily.raw_note_names(session_key, self.cfg, day),
+            )
+        except (OSError, ValueError) as exc:
+            self.log.debug("obsidian_saved", session_key=session_key, reason=f"link: {exc}")
+            return wiki.LinkPlan()
+
+    def _load_analysis(self, session_key: SessionKey) -> BaseModel | None:
+        target = paths.analysis_path_for(session_key)
+        try:
+            document = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        try:
+            return llm.build_schema(self.cfg).model_validate(document)
+        except ValidationError:
+            return None
 
     def _analysis_is_valid(self, session_key: SessionKey) -> bool:
         """`analysis_path` が実在しスキーマ検証を通るか（§9.4 / §10.9）。"""
@@ -566,7 +755,14 @@ class Pipeline:
         )
 
     def _fail_session(
-        self, session_key: str, from_status: str, code: ErrorCode, detail: str | None
+        self,
+        session_key: str,
+        from_status: str,
+        code: ErrorCode,
+        detail: str | None,
+        *,
+        event: str = "llm_failed",
+        reason: str | None = None,
     ) -> None:
         """**元音声は削除しない**（§9.3 の `ANALYZING → FAILED` の副作用）。
 
@@ -582,7 +778,10 @@ class Pipeline:
             error_message=detail,
             now=self.now,
         )
-        self.log.error("llm_failed", session_key=session_key, error_code=code)
+        fields: dict[str, str | None] = {"session_key": session_key, "error_code": code}
+        if reason is not None:
+            fields["reason"] = reason
+        self.log.error(event, **fields)
 
     # --- 共通の遷移ヘルパ -----------------------------------------------
 

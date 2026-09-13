@@ -13,8 +13,9 @@ from __future__ import annotations
 import io
 import json
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -57,8 +58,15 @@ def _data_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture
-def cfg(make_config: Callable[..., Config]) -> Config:
-    return make_config()
+def cfg(make_config: Callable[..., Config], tmp_path: Path) -> Config:
+    """Vault を `tmp_path` へ向ける。
+
+    **#28 で `ensure_daily_note()` が繋がったので、Vault が無いと `FAILED` になる。**
+    ここで見たいのは統合と解析なので、書ける Vault を与えて最後まで通す。
+    """
+    vault = tmp_path / "obsidian"
+    vault.mkdir(exist_ok=True)
+    return make_config({"obsidian": {"root": str(vault)}})
 
 
 @pytest.fixture
@@ -145,10 +153,29 @@ def stub_analysis(
                 result=None, chunks=(), partials=(), error_code=error, error_message="stub"
             )
         model = llm.build_schema(cfg)
+        partial_model = llm.build_schema(cfg, partial=True)
+        # **Map 中間結果を `summary` と違う文面にする。**同じにすると、保存済みを
+        # 使っているのか §13.4 の代替経路へ落ちているのかがテストで区別できない
+        partials = tuple(
+            partial_model.model_validate(
+                {"summary": f"チャンク {index}", "key_points": [f"Map 由来の点 {index}"]}
+            )
+            for index in range(chunks)
+        )
+        start = datetime(2026, 9, 12, 9, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+        made_chunks = tuple(
+            llm.Chunk(
+                text="x",
+                start_at=start + timedelta(hours=index),
+                end_at=start + timedelta(hours=index, minutes=30),
+                segments=(),
+            )
+            for index in range(chunks)
+        )
         return llm.SessionAnalysis(
             result=model.model_validate(document or ANALYSIS),
-            chunks=tuple(range(chunks)),  # type: ignore[arg-type]
-            partials=(),
+            chunks=made_chunks,
+            partials=partials,
             elapsed_seconds=12.5,
         )
 
@@ -171,8 +198,8 @@ def test_a_ready_session_reaches_analyzed(
     add_session(database)
     add_part(database)
     stub_analysis(monkeypatch, cfg)
-    assert runner.process_session(SESSION_KEY) is SessionOutcome.ANALYZED
-    assert status_of(database) == SessionStatus.ANALYZED
+    assert runner.process_session(SESSION_KEY) is SessionOutcome.SAVED
+    assert status_of(database) == SessionStatus.SAVED
 
 
 def test_failed_and_skipped_parts_are_excluded(
@@ -207,14 +234,19 @@ def test_the_transcript_is_not_persisted(
     monkeypatch: pytest.MonkeyPatch,
     _data_root: Path,
 ) -> None:
-    """**統合結果は永続化しない**（§10.8）。`/data` に増えるのは解析結果だけである。"""
+    """**統合結果は永続化しない**（§10.8）。
+
+    `/data` に増えるのは**解析結果と Map 中間結果だけ**である（後者は §10.9 / R-1）。
+    **transcript そのものは書かない。**
+    """
     add_session(database)
     add_part(database)
     stub_analysis(monkeypatch, cfg)
     before = {p for p in _data_root.rglob("*") if p.is_file()}
     runner.process_session(SESSION_KEY)
-    added = {p for p in _data_root.rglob("*") if p.is_file()} - before
-    assert [p.parent.name for p in added] == ["analysis"]
+    added = sorted(p.name for p in {p for p in _data_root.rglob("*") if p.is_file()} - before)
+    slug = paths.key_slug(SESSION_KEY)
+    assert added == [f"{slug}.json", f"{slug}.timeline.json"]
 
 
 # --- session_empty（§10.8 / §16.4） -------------------------------------
@@ -359,9 +391,9 @@ def test_an_analyzed_session_is_skipped(
     add_session(database, state=state)
     add_part(database)
     calls = stub_analysis(monkeypatch, cfg)
-    assert runner.process_session(SESSION_KEY) is SessionOutcome.ANALYZED
-    assert calls == []
-    assert status_of(database) == state
+    outcome = runner.process_session(SESSION_KEY)
+    assert outcome in {SessionOutcome.ANALYZED, SessionOutcome.SAVED}
+    assert calls == [], "LLM を再実行している"
 
 
 # --- 失敗（§10.9 / §15.1）。**最重要** ----------------------------------
@@ -483,7 +515,59 @@ def test_every_transition_is_recorded(
         (SessionStatus.MERGING, SessionStatus.MERGED),
         (SessionStatus.MERGED, SessionStatus.ANALYZING),
         (SessionStatus.ANALYZING, SessionStatus.ANALYZED),
+        (SessionStatus.ANALYZED, SessionStatus.WRITING),
+        (SessionStatus.WRITING, SessionStatus.SAVED),
     ]
+
+
+# --- Timeline の素材（§13.4 / §10.9 の R-1） ----------------------------
+
+
+def test_the_saved_timeline_is_preferred(
+    runner: Pipeline, database: Database, cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**保存済みの Map 中間結果を使う**（§10.9 / §13.4）。
+
+    使わないと Timeline が代替経路（`summary` の各文）へ落ち、**どのブロックにも
+    同じ要約が並ぶ**（実際に Daily ノートを生成して発覚した）。
+    """
+    from voicedock import daily
+
+    add_session(database)
+    add_part(database)
+    stub_analysis(monkeypatch, cfg)
+    runner.process_session(SESSION_KEY)
+
+    note = next(Path(cfg.obsidian.root).rglob("*Voice.md")).read_text(encoding="utf-8")
+    saved = daily.load_timeline(paths.analysis_path_for(SESSION_KEY))
+    assert saved, "Map 中間結果が保存されていない"
+    assert saved[0].lines == ("Map 由来の点 0",)
+    for block in saved:
+        for line in block.lines:
+            assert line in note, "保存済みの Map 中間結果を使っていない"
+
+
+def test_a_missing_timeline_falls_back(
+    runner: Pipeline, database: Database, cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**読めなければ §13.4 の代替経路へ落ちる。失敗させない。**
+
+    Timeline は要約の付随物であり、§1.3 の優先順位を上げる理由が無い。
+    """
+    from voicedock import daily
+
+    add_session(database)
+    add_part(database)
+    stub_analysis(monkeypatch, cfg)
+
+    original = daily.load_timeline
+    monkeypatch.setattr(daily, "load_timeline", lambda _path: [])
+    assert runner.process_session(SESSION_KEY) is SessionOutcome.SAVED
+    assert original is not daily.load_timeline
+
+    note = next(Path(cfg.obsidian.root).rglob("*Voice.md")).read_text(encoding="utf-8")
+    assert "## Timeline" in note
+    assert "Map 由来の点" not in note, "代替経路へ落ちていない"
 
 
 # --- §10.8 絶対時刻で統合されていること ---------------------------------
