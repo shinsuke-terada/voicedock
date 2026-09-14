@@ -25,6 +25,7 @@ from voicedock.llm import Chunk, build_schema
 from voicedock.paths import PartKey, SessionKey
 from voicedock.session import AbsoluteSegment, SessionTranscript
 
+FINGERPRINT = "FP"
 JST = ZoneInfo("Asia/Tokyo")
 DAY = date(2026, 8, 29)
 SESSION_KEY = SessionKey("DJIMIC3:20260829")
@@ -402,22 +403,56 @@ def test_the_timeline_is_saved_next_to_the_analysis(tmp_path: Path) -> None:
     analysis_path = tmp_path / "abc123.json"
     start = datetime(2026, 8, 29, 7, 12, tzinfo=JST)
     blocks = [TimelineBlock(start, start + timedelta(hours=1), ("点",))]
-    daily.save_timeline(analysis_path, blocks)
+    daily.save_timeline(analysis_path, blocks, fingerprint=FINGERPRINT)
     assert daily.timeline_path(analysis_path).name == "abc123.timeline.json"
-    assert daily.load_timeline(analysis_path) == blocks
+    assert daily.load_timeline(analysis_path, fingerprint=FINGERPRINT) == blocks
+
+
+def test_a_timeline_of_another_transcript_is_ignored(tmp_path: Path) -> None:
+    """**指紋が違えば「無い」と同じ扱い**（§9.4 / #108）。
+
+    `save_timeline()` は書き込みの失敗を握りつぶすので、**解析だけが新しく
+    Timeline が古い**状態が起こりうる。そのまま使うと**本文が古いノート**ができる。
+    """
+    analysis_path = tmp_path / "abc123.json"
+    start = datetime(2026, 8, 29, 7, 12, tzinfo=JST)
+    blocks = [TimelineBlock(start, start + timedelta(hours=1), ("点",))]
+    daily.save_timeline(analysis_path, blocks, fingerprint=FINGERPRINT)
+    assert daily.load_timeline(analysis_path, fingerprint="別の指紋") == []
+
+
+def test_a_timeline_without_a_fingerprint_is_ignored(tmp_path: Path) -> None:
+    """v5.18 以前の形式（指紋を持たない配列）も使わない。"""
+    analysis_path = tmp_path / "abc123.json"
+    daily.timeline_path(analysis_path).write_text(
+        '[{"start_at": "2026-08-29T07:12:00+09:00", "end_at": "2026-08-29T08:12:00+09:00",'
+        ' "lines": ["点"]}]',
+        encoding="utf-8",
+    )
+    assert daily.load_timeline(analysis_path, fingerprint=FINGERPRINT) == []
 
 
 @pytest.mark.parametrize(
-    "content", ["", "not json", "{}", '[{"start_at": "x"}]', '[{"lines": []}]', "[1,2]"]
+    "content",
+    [
+        "",
+        "not json",
+        "{}",
+        "[1,2]",
+        '{"schema": 2}',
+        '{"schema": 2, "transcript_sha256": "FP", "blocks": "x"}',
+        '{"schema": 2, "transcript_sha256": "FP", "blocks": [{"start_at": "x"}]}',
+        '{"schema": 2, "transcript_sha256": "FP", "blocks": [{"lines": []}]}',
+    ],
 )
 def test_a_broken_timeline_falls_back(tmp_path: Path, content: str) -> None:
     """**読めなければ空**（§10.9 の代替経路へ落ちる）。**失敗させない。**"""
     analysis_path = tmp_path / "abc123.json"
     daily.timeline_path(analysis_path).write_text(content, encoding="utf-8")
-    assert daily.load_timeline(analysis_path) == []
+    assert daily.load_timeline(analysis_path, fingerprint=FINGERPRINT) == []
 
 
 def test_saving_a_timeline_never_raises(tmp_path: Path) -> None:
     blocked = tmp_path / "sub" / "abc.json"
     (tmp_path / "sub").write_text("not a directory", encoding="utf-8")
-    daily.save_timeline(blocked, [])  # 例外を投げない
+    daily.save_timeline(blocked, [], fingerprint=FINGERPRINT)  # 例外を投げない

@@ -295,6 +295,16 @@ def analysis_path_for(key: SessionKey) -> Path:
     return ANALYSIS_ROOT / f"{key_slug(key)}.json"
 
 
+def analysis_source_path(analysis_path: Path) -> Path:
+    """`<analysis_path>` の隣の `<slug>.source.json`（§9.4）。
+
+    解析の**入力の指紋**を持つ。`daily.timeline_path()` と同じ流儀で隣に置く —
+    解析本体は `llm.build_schema()` のスキーマ検証を通す必要があり、**指紋を混ぜると
+    検証が落ちる。**
+    """
+    return analysis_path.with_suffix(".source.json")
+
+
 def transcript_path_for(key: PartKey) -> Path:
     """`/data/transcripts/parts/<slug>.json`（§10.6）。
 
