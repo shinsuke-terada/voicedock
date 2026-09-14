@@ -780,8 +780,8 @@ class Pipeline:
             return True
         if row.status not in ANALYZABLE:
             return False
-        if self._analysis_is_valid(session_key):
-            # §9.4: 生成物が実在して検証を通るなら工程を飛ばす
+        if self._analysis_matches(session_key, transcript):
+            # §9.4: 生成物が実在し、**今の統合結果を解析したもの**なら工程を飛ばす
             self._session_transition(session_key, row.status, SessionStatus.ANALYZED)
             return True
 
@@ -812,7 +812,12 @@ class Pipeline:
                     transcript=transcript,
                     summary=str(getattr(result.result, "summary", "")),
                 ),
+                fingerprint=session.transcript_fingerprint(transcript),
             )
+            # **指紋は解析本体を書いた後に置く**（§9.4）。順序を逆にすると、
+            # 解析の書き込みに失敗したのに指紋だけが残り、**古い解析が「最新」と
+            # 判定される。**`_write_analysis` が投げれば指紋は書かれない
+            self._write_fingerprint(target, transcript)
         except OSError as exc:
             self._fail_session(
                 session_key,
@@ -952,7 +957,10 @@ class Pipeline:
         # **保存済みの Map 中間結果を優先する**（§10.9 / R-1）。読めなければ §13.4 の
         # 代替経路（Block ごとに `summary` の各文）へ落ちる。**失敗させない** —
         # Timeline は要約の付随物である
-        timeline = daily.load_timeline(paths.analysis_path_for(session_key))
+        timeline = daily.load_timeline(
+            paths.analysis_path_for(session_key),
+            fingerprint=session.transcript_fingerprint(transcript),
+        )
         if not timeline:
             timeline = daily.build_timeline(
                 partials=(),
@@ -1004,8 +1012,22 @@ class Pipeline:
         except ValidationError:
             return None
 
-    def _analysis_is_valid(self, session_key: SessionKey) -> bool:
-        """`analysis_path` が実在しスキーマ検証を通るか（§9.4 / §10.9）。"""
+    def _analysis_matches(
+        self, session_key: SessionKey, transcript: session.SessionTranscript
+    ) -> bool:
+        """`analysis_path` が実在し、スキーマ検証を通り、**今の transcript を解析したもの**か。
+
+        §9.4 の「完了した工程は飛ばす」は、**入力が同じである限り**成り立つ。
+        §9.2 の再オープンでは入力が増えるので指紋が変わり、解析はやり直される。
+
+        **名前に「何に対して妥当か」を入れてある。**`_analysis_is_valid` のままだと、
+        呼び手が入力を渡さずに済んでしまい、**古い解析をそのままノートへ書く**
+        （2026-09-14 に実機で 2 時間 51 分ぶんが Daily ノートから欠けた。#108）。
+
+        **指紋が読めなければ偽を返す。**旧版からの移行と、指紋の書き込みに失敗した場合。
+        **正しさを費用より優先する**（§1.3） — 余計に 1 回解析するほうが、
+        嘘のノートを残すより良い。
+        """
         target = paths.analysis_path_for(session_key)
         try:
             document = json.loads(target.read_text(encoding="utf-8"))
@@ -1015,7 +1037,37 @@ class Pipeline:
             llm.build_schema(self.cfg).model_validate(document)
         except ValidationError:
             return False
-        return True
+        return self._fingerprint_of(target) == session.transcript_fingerprint(transcript)
+
+    def _fingerprint_of(self, analysis_path: Path) -> str | None:
+        """`<slug>.source.json` に記録した指紋。読めなければ `None`。"""
+        try:
+            document = json.loads(
+                paths.analysis_source_path(analysis_path).read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return None
+        value = document.get("transcript_sha256") if isinstance(document, dict) else None
+        return value if isinstance(value, str) else None
+
+    def _write_fingerprint(
+        self, analysis_path: Path, transcript: session.SessionTranscript
+    ) -> None:
+        """解析の入力の指紋を残す（§9.4）。**解析本体を書いた後に呼ぶ。**"""
+        paths.analysis_source_path(analysis_path).write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "transcript_sha256": session.transcript_fingerprint(transcript),
+                    "segments": len(transcript.segments),
+                    "blocks": len(transcript.blocks),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
     def _write_analysis(self, target: Path, analysis: BaseModel) -> None:
         """**`/data` へ書く。Vault ではない**（§4.1 / §8.3）。

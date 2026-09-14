@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from voicedock import llm, paths, pipeline
+from voicedock import llm, paths, pipeline, session
 from voicedock.config import Config
 from voicedock.db import Database, EntityType, Recording, Session
 from voicedock.errors import ErrorCode
@@ -183,6 +183,17 @@ def stub_analysis(
     return calls
 
 
+def write_fingerprint(transcript: session.SessionTranscript) -> Path:
+    """`<slug>.source.json` を書く（§9.4）。**pipeline が書くものと同じ形にする。**"""
+    target = paths.analysis_source_path(paths.analysis_path_for(SESSION_KEY))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps({"schema": 1, "transcript_sha256": session.transcript_fingerprint(transcript)}),
+        encoding="utf-8",
+    )
+    return target
+
+
 def status_of(database: Database) -> str:
     row = database.get_session(SESSION_KEY)
     assert row is not None
@@ -238,8 +249,10 @@ def test_the_transcript_is_not_persisted(
 ) -> None:
     """**統合結果は永続化しない**（§10.8）。
 
-    `/data` に増えるのは**解析結果と Map 中間結果だけ**である（後者は §10.9 / R-1）。
-    **transcript そのものは書かない。**
+    `/data` に増えるのは**解析結果・Map 中間結果・入力の指紋だけ**である
+    （それぞれ §10.9 / R-1、§9.4）。**transcript そのものは書かない。**
+
+    指紋は SHA-256 と件数であり、**本文を持たない。**復元できないので「永続化」ではない。
     """
     add_session(database)
     add_part(database)
@@ -248,7 +261,7 @@ def test_the_transcript_is_not_persisted(
     runner.process_session(SESSION_KEY)
     added = sorted(p.name for p in {p for p in _data_root.rglob("*") if p.is_file()} - before)
     slug = paths.key_slug(SESSION_KEY)
-    assert added == [f"{slug}.json", f"{slug}.timeline.json"]
+    assert added == [f"{slug}.json", f"{slug}.source.json", f"{slug}.timeline.json"]
 
 
 # --- session_empty（§10.8 / §16.4） -------------------------------------
@@ -357,7 +370,7 @@ def test_the_title_is_stored_but_not_used_for_the_filename(
 def test_a_valid_analysis_is_not_regenerated(
     runner: Pipeline, database: Database, cfg: Config, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """§9.4: `analysis_path` が存在しスキーマ検証を通れば再実行しない。"""
+    """§9.4: 実在しスキーマ検証を通り、**かつ指紋が一致すれば**再実行しない。"""
     add_session(database, state=SessionStatus.MERGED)
     add_part(database)
     target = paths.analysis_path_for(SESSION_KEY)
@@ -366,9 +379,66 @@ def test_a_valid_analysis_is_not_regenerated(
 
     transcript = runner.build_transcript(SESSION_KEY)
     assert transcript is not None
+    write_fingerprint(transcript)
     assert runner.ensure_analysis(SESSION_KEY, transcript) is True
     assert calls == [], "LLM を再実行している"
     assert status_of(database) == SessionStatus.ANALYZED
+
+
+def test_an_analysis_without_a_fingerprint_is_regenerated(
+    runner: Pipeline, database: Database, cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**指紋が無ければやり直す**（§9.4）。旧版からの移行と、書き込みに失敗した場合。
+
+    **正しさを費用より優先する** — 余計に 1 回解析するほうが、嘘のノートを残すより良い。
+    """
+    add_session(database, state=SessionStatus.MERGED)
+    add_part(database)
+    paths.analysis_path_for(SESSION_KEY).write_text(
+        json.dumps(ANALYSIS, ensure_ascii=False), encoding="utf-8"
+    )
+    calls = stub_analysis(monkeypatch, cfg)
+
+    transcript = runner.build_transcript(SESSION_KEY)
+    assert transcript is not None
+    assert runner.ensure_analysis(SESSION_KEY, transcript) is True
+    assert calls != [], "指紋が無いのに解析を飛ばしている"
+
+
+def test_an_analysis_of_a_different_transcript_is_regenerated(
+    runner: Pipeline, database: Database, cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**入力が変われば「完了した工程」ではない**（§9.4 / #108）。
+
+    2026-09-14 の実機では、6 回の再オープンすべてで解析が飛ばされ、
+    **`parts: 8` と書かれたノートの本文が 2 Part 分のまま**だった。
+    """
+    add_session(database, state=SessionStatus.MERGED)
+    add_part(database)
+    paths.analysis_path_for(SESSION_KEY).write_text(
+        json.dumps(ANALYSIS, ensure_ascii=False), encoding="utf-8"
+    )
+    calls = stub_analysis(monkeypatch, cfg)
+
+    transcript = runner.build_transcript(SESSION_KEY)
+    assert transcript is not None
+    # 別の統合結果を解析したことにする
+    write_fingerprint(
+        session.SessionTranscript(
+            day_date=transcript.day_date,
+            segments=[
+                session.AbsoluteSegment(
+                    at=transcript.segments[0].at,
+                    end_at=transcript.segments[0].end_at,
+                    text="別の中身",
+                )
+            ],
+            blocks=transcript.blocks,
+            excluded_partkeys=[],
+        )
+    )
+    assert runner.ensure_analysis(SESSION_KEY, transcript) is True
+    assert calls != [], "入力が変わったのに解析を飛ばしている"
 
 
 def test_a_broken_analysis_is_regenerated(
@@ -544,7 +614,12 @@ def test_the_saved_timeline_is_preferred(
     runner.process_session(SESSION_KEY)
 
     note = next(Path(cfg.obsidian.root).rglob("*Voice.md")).read_text(encoding="utf-8")
-    saved = daily.load_timeline(paths.analysis_path_for(SESSION_KEY))
+    transcript = runner.build_transcript(SESSION_KEY)
+    assert transcript is not None
+    saved = daily.load_timeline(
+        paths.analysis_path_for(SESSION_KEY),
+        fingerprint=session.transcript_fingerprint(transcript),
+    )
     assert saved, "Map 中間結果が保存されていない"
     assert saved[0].lines == ("Map 由来の点 0",)
     for block in saved:
@@ -566,7 +641,7 @@ def test_a_missing_timeline_falls_back(
     stub_analysis(monkeypatch, cfg)
 
     original = daily.load_timeline
-    monkeypatch.setattr(daily, "load_timeline", lambda _path: [])
+    monkeypatch.setattr(daily, "load_timeline", lambda _path, **_kw: [])
     assert runner.process_session(SESSION_KEY) is SessionOutcome.SAVED
     assert original is not daily.load_timeline
 
@@ -590,3 +665,126 @@ def test_the_transcript_uses_absolute_time(runner: Pipeline, database: Database)
     transcript = runner.build_transcript(SESSION_KEY)
     assert transcript is not None
     assert [segment.at.hour for segment in transcript.segments] == [9, 15]
+
+
+# --- 指紋（§9.4 / #108） ------------------------------------------------
+
+
+def a_transcript(*, text: str = "おはよう", blocks: int | None = None) -> session.SessionTranscript:
+    start = datetime(2026, 9, 12, 9, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+    end = start + timedelta(minutes=30)
+    return session.SessionTranscript(
+        day_date=start.date(),
+        segments=[session.AbsoluteSegment(at=start, end_at=end, text=text)],
+        blocks=[(start, end)] * (blocks if blocks is not None else 1),
+        excluded_partkeys=[],
+    )
+
+
+def test_the_fingerprint_is_stable() -> None:
+    assert session.transcript_fingerprint(a_transcript()) == session.transcript_fingerprint(
+        a_transcript()
+    )
+
+
+def test_the_fingerprint_changes_with_the_text() -> None:
+    assert session.transcript_fingerprint(a_transcript()) != session.transcript_fingerprint(
+        a_transcript(text="こんばんは")
+    )
+
+
+def test_the_fingerprint_changes_with_the_blocks() -> None:
+    assert session.transcript_fingerprint(a_transcript()) != session.transcript_fingerprint(
+        a_transcript(blocks=2)
+    )
+
+
+def test_the_fingerprint_ignores_excluded_parts() -> None:
+    """**除外された Part は解析の入力に現れない。**その増減でやり直す理由が無い。"""
+    base = a_transcript()
+    with_excluded = session.SessionTranscript(
+        day_date=base.day_date,
+        segments=base.segments,
+        blocks=base.blocks,
+        excluded_partkeys=[PartKey("DJIMIC3/x/y_orig.wav")],
+    )
+    assert session.transcript_fingerprint(base) == session.transcript_fingerprint(with_excluded)
+
+
+def test_a_segment_added_changes_the_fingerprint() -> None:
+    """**これが 2026-09-14 に起きたことである** — Part が増えたのに解析が飛ばされた。"""
+    base = a_transcript()
+    later = datetime(2026, 9, 12, 15, 9, tzinfo=ZoneInfo("Asia/Tokyo"))
+    grown = session.SessionTranscript(
+        day_date=base.day_date,
+        segments=[*base.segments, session.AbsoluteSegment(at=later, end_at=later, text="追加")],
+        blocks=base.blocks,
+        excluded_partkeys=[],
+    )
+    assert session.transcript_fingerprint(base) != session.transcript_fingerprint(grown)
+
+
+def test_a_failed_analysis_write_leaves_no_fingerprint(
+    runner: Pipeline, database: Database, cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**指紋は解析本体を書いた後に置く**（§9.4）。
+
+    順序を逆にすると、**解析の書き込みに失敗したのに指紋だけが残り、古い解析が
+    「最新」と判定される。**次回に必ずやり直せることを固定する。
+    """
+    add_session(database, state=SessionStatus.MERGED)
+    add_part(database)
+    stub_analysis(monkeypatch, cfg)
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pipeline.Pipeline, "_write_analysis", boom)
+    transcript = runner.build_transcript(SESSION_KEY)
+    assert transcript is not None
+    assert runner.ensure_analysis(SESSION_KEY, transcript) is False
+
+    fingerprint = paths.analysis_source_path(paths.analysis_path_for(SESSION_KEY))
+    assert not fingerprint.exists(), "解析を書けていないのに指紋が残っている"
+
+
+# --- 再オープンの通し（#108 の再現） ------------------------------------
+
+
+def test_a_reopened_session_is_analysed_again(
+    runner: Pipeline, database: Database, cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**Part が増えたら解析をやり直す**（§9.4 / §9.2）。
+
+    2026-09-14 の実機では 6 回の再オープンすべてで解析が飛ばされ、
+    **`parts: 8` / `blocks: 2` と書かれたノートの本文が 2 Part・56 分ぶんのまま**だった。
+    2 時間 51 分が Daily ノートから欠けた（#108）。
+    """
+    add_session(database)
+    add_part(database, hour=9)
+    calls = stub_analysis(monkeypatch, cfg)
+    assert runner.process_session(SESSION_KEY) is SessionOutcome.SAVED
+    assert len(calls) == 1
+
+    # 同じ日の新しい Part が RAW_SAVED に到達 → §9.2 の再オープン
+    add_part(database, hour=15, text="午後の打ち合わせ。")
+    assert runner.reopen_session(SESSION_KEY) is True
+    assert runner.process_session(SESSION_KEY) is SessionOutcome.SAVED
+
+    assert len(calls) == 2, "再オープンしたのに解析を飛ばしている"
+    # **2 回目の入力には新しい Part が含まれる**
+    second = calls[1]
+    assert any("午後の打ち合わせ" in seg.text for seg in second.segments)  # type: ignore[attr-defined]
+
+
+def test_processing_twice_without_new_parts_does_not_reanalyse(
+    runner: Pipeline, database: Database, cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**§9.4 は生きている。**入力が同じなら解析をやり直さない（費用の歯止め）。"""
+    add_session(database)
+    add_part(database, hour=9)
+    calls = stub_analysis(monkeypatch, cfg)
+    assert runner.process_session(SESSION_KEY) is SessionOutcome.SAVED
+    assert runner.reopen_session(SESSION_KEY) is True
+    runner.process_session(SESSION_KEY)
+    assert len(calls) == 1, "入力が同じなのに解析をやり直している"
