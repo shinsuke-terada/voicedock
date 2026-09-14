@@ -235,7 +235,7 @@ def test_analysis_resumes_from_analyzing(
     **修正前はここで `False` を返して終わり**、セッションは永久に `ANALYZING` に座った。
     """
     add_session(database, status=SessionStatus.ANALYZING)
-    monkeypatch.setattr(pipeline.Pipeline, "_analysis_is_valid", lambda *_args: True)
+    monkeypatch.setattr(pipeline.Pipeline, "_analysis_matches", lambda *_args: True)
 
     assert runner(database, cfg, logger[0]).ensure_analysis(KEY, empty_transcript())
 
@@ -259,7 +259,7 @@ def test_resuming_does_not_record_a_phantom_transition(
     到達する経路**は `test_resuming_past_the_guard_does_not_conflict` が見る。
     """
     add_session(database, status=SessionStatus.ANALYZING)
-    monkeypatch.setattr(pipeline.Pipeline, "_analysis_is_valid", lambda *_args: True)
+    monkeypatch.setattr(pipeline.Pipeline, "_analysis_matches", lambda *_args: True)
     runner(database, cfg, logger[0]).ensure_analysis(KEY, empty_transcript())
 
     recorded = transitions(database)
@@ -283,7 +283,7 @@ def test_resuming_past_the_guard_does_not_conflict(
     （意図的な破壊で確認した）。
     """
     add_session(database, status=SessionStatus.ANALYZING)
-    monkeypatch.setattr(pipeline.Pipeline, "_analysis_is_valid", lambda *_args: False)
+    monkeypatch.setattr(pipeline.Pipeline, "_analysis_matches", lambda *_args: False)
     monkeypatch.setattr(
         llm,
         "analyze_session",
@@ -314,7 +314,7 @@ def test_analysis_still_starts_from_merged(
 ) -> None:
     """陰性対照。**通常の経路が壊れていないこと。**"""
     add_session(database, status=SessionStatus.MERGED)
-    monkeypatch.setattr(pipeline.Pipeline, "_analysis_is_valid", lambda *_args: True)
+    monkeypatch.setattr(pipeline.Pipeline, "_analysis_matches", lambda *_args: True)
     assert runner(database, cfg, logger[0]).ensure_analysis(KEY, empty_transcript())
 
     row = database.get_session(KEY)

@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -53,6 +55,42 @@ class SessionTranscript:
     segments: list[AbsoluteSegment]
     blocks: list[tuple[datetime, datetime]]
     excluded_partkeys: list[PartKey]
+
+
+def transcript_fingerprint(transcript: SessionTranscript) -> str:
+    """統合結果の指紋（§9.4）。**解析をやり直すべきかの判定に使う。**
+
+    §9.4 の「完了した工程は飛ばす」は、**入力が同じである限り**成り立つ。
+    §9.2 の再オープンでは統合対象が増えるので指紋が変わり、解析はやり直される。
+    これが無いと**ノートの frontmatter が 8 Part を主張し、本文は 2 Part 分のまま**になる
+    （2026-09-14 に実機で 2 時間 51 分ぶんが Daily ノートから欠けた。#108）。
+
+    **プロンプトや設定を混ぜない。**混ぜると `llm.*` を触るたびに全セッションが
+    再解析される。ここが答えるのは「解析の入力が変わったか」だけである。
+
+    **`excluded_partkeys` も混ぜない。**除外された Part は解析の入力に現れないので、
+    その増減で解析をやり直す理由が無い。
+    """
+    payload = json.dumps(
+        {
+            "segments": [
+                {
+                    "at": segment.at.isoformat(timespec="seconds"),
+                    "end_at": segment.end_at.isoformat(timespec="seconds"),
+                    "text": segment.text,
+                }
+                for segment in transcript.segments
+            ],
+            "blocks": [
+                [start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")]
+                for start, end in transcript.blocks
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class RelativeSegment(Protocol):

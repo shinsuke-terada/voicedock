@@ -76,7 +76,7 @@ def check(path: Path, kind: NoteKind, **overrides: object) -> dict[str, CheckRes
 def test_spec_rule_counts(tmp_path: Path) -> None:
     """§13.7 の R-* / W-* と実装が 1 対 1 であること。
 
-    **件数のずれが最も危ない**（#55 の振り返り）。SPEC に W-10 を足して実装を忘れると、
+    **件数のずれが最も危ない**（#55 の振り返り）。SPEC に規則を足して実装を忘れると、
     **検証が足りないまま `SAVED` になり、Phase 7 で削除の入力になる。**
     """
     assert spec_rule_ids("13.7", "R") == [f"R-{n}" for n in range(1, 7)]
@@ -291,7 +291,10 @@ def test_w5_requires_a_closing_delimiter(tmp_path: Path) -> None:
 def test_raw_has_no_w5(tmp_path: Path) -> None:
     """§13.7 の R-* に W-5 相当は無い。**規則を勝手に増やさない。**"""
     assert "R-5" in check(write(tmp_path, build_note()), NoteKind.RAW)
-    assert len(check(write(tmp_path, build_note()), NoteKind.RAW)) == 6
+    # **件数を直書きしない。**SPEC に規則を足したら自動で追随する（規則を足すときに踏む）
+    assert len(check(write(tmp_path, build_note()), NoteKind.RAW)) == len(
+        spec_rule_ids("13.7", "R")
+    )
 
 
 # --- R-5 / W-6 session_key ----------------------------------------------
@@ -314,7 +317,8 @@ def test_unparseable_frontmatter_still_reports_every_rule(tmp_path: Path, kind: 
     """frontmatter が壊れていても**規則の件数は変わらない**（何が欠けたか全部出す）。"""
     path = write(tmp_path, "---\na: [unclosed\n---\nbody\n")
     results = check(path, kind)
-    expected = 6 if kind is NoteKind.RAW else 9
+    prefix = "R" if kind is NoteKind.RAW else "W"
+    expected = len(spec_rule_ids("13.7", prefix))
     assert len(results) == expected
 
 
@@ -436,7 +440,7 @@ def test_failed_rules_lists_the_ids(tmp_path: Path) -> None:
 def test_every_rule_is_evaluated_after_a_failure(tmp_path: Path) -> None:
     """**1 つ落ちても残りを評価する。**最初の失敗で打ち切ると直す箇所が 1 件ずつしか出ない。"""
     path = write(tmp_path, build_note(session_key="other", keys=(KEY_A,)))
-    assert len(check(path, NoteKind.DAILY)) == 9
+    assert len(check(path, NoteKind.DAILY)) == len(spec_rule_ids("13.7", "W"))
 
 
 # --- §13.5 の重複時 ------------------------------------------------------
