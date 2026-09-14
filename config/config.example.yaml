@@ -45,7 +45,7 @@ import:
   #   raw_saved : Raw ノートの保存検証まで保持（変換やり直しに強いが 1 日 8〜22 GB 滞留する）
   inbox_retain: normalized
   # Helper のハートビートがこの秒数より古ければ HELPER_UNAVAILABLE（§19.1 H-8）
-  helper_heartbeat_max_age_seconds: 300
+  helper_heartbeat_max_age_seconds: 900
 
 # --- セッション分組（§10.4） ---------------------------------
 session:

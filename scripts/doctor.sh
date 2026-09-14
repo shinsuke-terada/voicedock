@@ -10,7 +10,7 @@
 # **検査のみを行い、ホスト設定は変更しない**（§19.2）。v3.1 は `setup.sh` と `doctor.sh` に
 # 同じ検査を二重に書いており、片方だけ更新して食い違う事故があった（§21.1 に一本化した）。
 #
-# 実行順は DH-1 → DH-10 → DH-13 → DH-12 → DH-16 → DH-15（前提が積み上がる順）。
+# 実行順は DH-1 → DH-10 → DH-13 → DH-12 → DH-16 → DH-17 → DH-15（前提が積み上がる順）。
 #
 # bash 3.2 で書く（macOS 同梱。§3.3）。`voicedock-ingest` と同じ制約に従う。
 
@@ -309,6 +309,50 @@ check_launcher() {
     ok "Launcher" "ad-hoc 署名済み、plist はラッパ経由"
 }
 
+# --- DH-17: heartbeat の鮮度の閾値（§7.2 / §19.2） ----------------------
+# **致命的。**`helper_heartbeat_max_age_seconds` が LaunchAgent の `StartInterval` 以下だと、
+# **毎周期 stale と判定して取り込みを見送り**、§19.1 H-8 の healthcheck も境界で振れる。
+#
+# **Helper は実行の最後に heartbeat を書く**ので、次の書き込みまでの経過は
+# `StartInterval + 実行時間` になる。等しいだけで足りない。
+#
+# **この 2 つは別のファイルに散っており、どちらも単体では正しく見える。**
+# 両方を読めるのはホスト側の doctor だけである（コンテナは plist を見られない）。
+
+check_heartbeat_threshold() {
+    local config="$REPO_ROOT/config/config.yaml"
+    local plist="$HOME/Library/LaunchAgents/$LAUNCH_LABEL.plist"
+
+    if [ ! -f "$config" ]; then
+        skip "Heartbeat age" "config/config.yaml がありません（cp config/config.example.yaml ...）"
+        return 0
+    fi
+    if [ ! -f "$plist" ]; then
+        skip "Heartbeat age" "plist がありません（helper/install.sh を実行してください）"
+        return 0
+    fi
+
+    local threshold interval
+    threshold="$(sed -n 's/^[[:space:]]*helper_heartbeat_max_age_seconds:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        "$config" | tail -1)"
+    # **`>/` を書かない。**`test_the_doctor_writes_nothing` が「パスへのリダイレクト」と
+    # 誤検出する。`grep -A2` で該当箇所を絞ってから数字だけ取る
+    interval="$(grep -A2 StartInterval "$plist" \
+        | sed -n 's/.*<integer>\([0-9][0-9]*\)<.*/\1/p' | head -1)"
+
+    if [ -z "$threshold" ] || [ -z "$interval" ]; then
+        bad "Heartbeat age" "値を読めません（config=${threshold:-?} / StartInterval=${interval:-?}）"
+        return 1
+    fi
+    if [ "$threshold" -le "$interval" ]; then
+        bad "Heartbeat age" "閾値 ${threshold}s <= 書き込み間隔 ${interval}s"
+        cont "毎周期 stale と判定し、取り込みを見送り続けます（§7.2）"
+        cont "config.yaml の helper_heartbeat_max_age_seconds を ${interval}s より大きくしてください"
+        return 1
+    fi
+    ok "Heartbeat age" "閾値 ${threshold}s > 書き込み間隔 ${interval}s"
+}
+
 # --- DH-15: compose に /Volumes と ports: が無い（§14.4 N-3 / N-13） ----
 
 check_compose_safety() {
@@ -354,6 +398,7 @@ main() {
     check_helper_conf || status=1
     check_launch_agent || status=1
     check_launcher "$(resolve_home)" || status=1
+    check_heartbeat_threshold || status=1
     check_compose_safety || status=1
 
     printf '%s\n' "$SEPARATOR"
