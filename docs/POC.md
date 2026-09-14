@@ -463,7 +463,7 @@ P0-6 / P0-7 / P0-9 が問うていた前提そのものが無くなった。**�
 ## 10. DJI Mic 3 実機 残り（#3 で記入）
 | # | 項目 | 判定 | 根拠 |
 |---|---|---|---|
-| P0-8 | `MOUNT_MODE=ro` で `mount` が read-only、`heartbeat.json` が `mount_readonly: true`。**両者が一致する** | ✅ **PASS** | §10.1。`probe.sh` が機械判定し EXIT=0 |
+| P0-8 | `MOUNT_MODE=ro` で `mount` が read-only、`heartbeat.json` が `mount_readonly: true`。**両者が一致する** | ✅ **PASS** | §10.1。`probe.sh` が機械判定し EXIT=0。**ただし一致は間欠的に崩れていた** — §10.1.2（#107 で修正） |
 | P0-8b | `MOUNT_MODE=rw` で read-write になり `mount_readonly: false` になる | ⬜ 未実施 | |
 | P0-10 | 送信機 2 台の見え方。2 個なら `inventory.json` の `devices` が 2 エントリ | ⚠ 1 台のみ | §10.1。2 台同時は未検証 |
 | P0-11 | 録音中ファイルの mtime の進み方。`STABILITY_*` の既定が実挙動に合うか | ⚠ 静止のみ | §10.1。**録音中のファイルでは未検証** |
@@ -592,6 +592,48 @@ TX_MIC001_20260912_163444/
 実装は `started_at=parsed.started_at`（`device.py`）で**ファイル名**の時刻を使っており
 （§5.2）、`session.group_parts()` はその `started_at` から `session_key` を作る（§10.4）。
 **正しい。**§5.1 に「フォルダ名の日付は中身を代表しない」ことを明記する対象とする。
+
+### 10.1.2 報告される保護状態が実態と合わない（**#107 で起票・修正**）
+
+2026-09-14 18:08 に 6 ファイル（1.4 GB）を追加取り込みした際に判明した。
+
+**デバイスは 18:15:34 以降ずっと `read-only` のままだったが、報告値だけが変動した。**
+
+```
+18:15:34  remounted_readonly        -> heartbeat mount_readonly=true
+18:20:35  remounted_readonly        -> heartbeat mount_readonly=true
+18:25:36  remount_readonly_failed   -> heartbeat mount_readonly=FALSE   ← デバイスは ro
+18:30:47  remount_readonly_failed   -> heartbeat mount_readonly=FALSE   ← デバイスは ro
+18:35:49  remounted_readonly        -> heartbeat mount_readonly=true
+```
+
+18:35:06 の突き合わせ:
+
+```
+mount           : /dev/disk4 on /Volumes/DJIMIC3 (msdos, ..., read-only, ..., fskit)
+heartbeat.json  : "mount_readonly": false
+inventory.json  : "mount_readonly": false
+```
+
+**約 10 分間、§14.2 のロック 2-B が読む値が偽だった。**
+
+macOS の unified log に 2 種類の失敗が出ており、**どちらも同じ 1 行に潰れていた。**
+
+```
+18:08:22  unable to unmount /dev/disk4 (status code 0x00000010)   ← EBUSY。デバイスは rw のまま
+18:30:37  disk unmount approval, dissented, status = 0xF8DA0008   ← 拒否。デバイスは ro のまま
+```
+
+原因は `remount_readonly()` が**「既に読み取り専用か」を見ずに毎回 unmount していた**こと。
+読み取り専用のボリュームは unmount を拒否されるため、**成功した直後の実行が必ず「失敗」を
+報告する。**呼び手が**試行の成否から** `mount_readonly` を決めていたため、そのまま state
+ファイルへ入った。今日 1 日で 34 サイクル、うち 3 回が失敗。
+
+> **`probe.sh` は 18:11 の時点では ✅ PASS と答えた。**そのときデバイスは本当に rw で、
+> heartbeat も `false` だったので**一致していた**。`probe.sh` が見るのは一致であり、
+> 「`MOUNT_MODE=ro` が効いたか」は別の問いである。**2 つの問いを混ぜてはならない。**
+
+修正は v5.18（#107）。**観測から書く。試行の成否からではない。**
 
 ### 10.2 `rw` での採取（P0-8b）
 
