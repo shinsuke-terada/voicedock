@@ -44,7 +44,7 @@ _EVENT_ORDER: Final[tuple[str, ...]] = (
     "transcription_completed", "transcription_failed",
     "raw_note_saved", "raw_note_failed",
     "session_merged", "session_merge_failed", "session_empty", "session_reopened",
-    "llm_completed", "llm_failed",
+    "llm_completed", "llm_failed", "analysis_trimmed",
     "obsidian_saved", "obsidian_failed",
     "delete_requested", "source_deleted", "source_delete_skipped", "source_delete_pending",
     "disk_space_low",

@@ -383,3 +383,98 @@ def test_probe_sends_a_short_request(cfg: Config) -> None:
     with client_for(recorder) as client:
         probe(cfg, client=client, env=ENV)
     assert len(recorder.users()[0]) < 100
+
+
+# --- §12.2 上限は切り詰める（#112） ------------------------------------
+# 2026-09-14 の実機で、**タグ 5 個の超過で 3 時間 47 分ぶんの解析が失われた。**
+# §12.3 の修復は長さの超過に効かなかった。件数や文字数の上限は**表示の都合**であり、
+# 超過を理由に 1 日分を捨てるのは記録の破壊である（§1.3）。
+
+
+def over_limit(**overrides: object) -> str:
+    document: dict[str, object] = dict(GOOD)
+    document.update(overrides)
+    return json.dumps(document, ensure_ascii=False)
+
+
+def test_too_many_tags_are_trimmed_instead_of_failing(cfg: Config) -> None:
+    """**これが実機で起きた形である。**タグ 20 個（上限 15）。"""
+    recorder = Recorder(over_limit(tags=[f"タグ{n}" for n in range(20)]))
+    result = run_analyze(cfg, recorder)
+
+    assert result.ok, f"切り詰めずに失敗している: {result.error_message}"
+    assert result.analysis is not None
+    assert len(result.analysis.tags) == 15  # type: ignore[attr-defined]
+    assert result.trimmed == ("tags: 20 -> 15",)
+    assert len(recorder.requests) == 1, "修復を 1 往復させている（大きなプロンプトの再送）"
+
+
+def test_every_list_section_is_trimmed(cfg: Config) -> None:
+    recorder = Recorder(
+        over_limit(
+            key_points=[f"点{n}" for n in range(25)],
+            decisions=[f"決{n}" for n in range(40)],
+            ideas=[f"案{n}" for n in range(40)],
+            tags=[f"タグ{n}" for n in range(20)],
+        )
+    )
+    result = run_analyze(cfg, recorder)
+
+    assert result.ok
+    assert set(result.trimmed) == {
+        "key_points: 25 -> 20",
+        "decisions: 40 -> 30",
+        "ideas: 40 -> 30",
+        "tags: 20 -> 15",
+    }
+
+
+def test_a_long_title_is_trimmed(cfg: Config) -> None:
+    """**リストだけ直すと、次は `title` で 1 日分を失う。**"""
+    recorder = Recorder(over_limit(title="あ" * 121))
+    result = run_analyze(cfg, recorder)
+
+    assert result.ok, f"切り詰めずに失敗している: {result.error_message}"
+    assert result.analysis is not None
+    assert len(result.analysis.title) == 120  # type: ignore[attr-defined]
+    assert result.trimmed == ("title: 121 -> 120",)
+
+
+def test_a_long_summary_is_trimmed(cfg: Config) -> None:
+    recorder = Recorder(over_limit(summary="あ" * 4001))
+    result = run_analyze(cfg, recorder)
+
+    assert result.ok
+    assert result.trimmed == ("summary: 4001 -> 4000",)
+
+
+def test_exactly_at_the_limit_is_not_trimmed(cfg: Config) -> None:
+    """**上限ちょうどは切らない。**境界で 1 件削ると内容が減る。"""
+    recorder = Recorder(over_limit(tags=[f"タグ{n}" for n in range(15)]))
+    result = run_analyze(cfg, recorder)
+
+    assert result.ok
+    assert result.trimmed == ()
+    assert len(result.analysis.tags) == 15  # type: ignore[union-attr]
+
+
+def test_an_empty_summary_is_not_repaired_by_trimming(cfg: Config) -> None:
+    """**`min_length` は切り詰めない。**足りないものは作れない。
+
+    空の `summary` は本当に情報が無い場合であり、修復へ回してよい。
+    """
+    recorder = Recorder(over_limit(summary=""), over_limit(summary=""))
+    result = run_analyze(cfg, recorder)
+
+    assert not result.ok
+    assert result.error_code is ErrorCode.LLM_INVALID_JSON
+    assert len(recorder.requests) == 2, "修復へ回っていない"
+
+
+def test_a_type_error_still_goes_through_repair(cfg: Config) -> None:
+    """**変えるのは「長さの超過だけでは失敗にしない」ことだけ**（§12.3 は残る）。"""
+    recorder = Recorder(over_limit(tags="文字列"), json.dumps(GOOD, ensure_ascii=False))
+    result = run_analyze(cfg, recorder)
+
+    assert result.ok
+    assert len(recorder.requests) == 2, "型違いが修復へ回っていない"

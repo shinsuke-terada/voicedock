@@ -799,6 +799,13 @@ class Pipeline:
             )
             return False
 
+        if result.trimmed:
+            # **黙って切らない**（§12.2）。上限の 2 倍返し始めても気づけなくなる —
+            # 件数の膨張は「録音に無い内容をでっち上げている」徴候でもある（AC-1）
+            self.log.info(
+                "analysis_trimmed", session_key=session_key, fields="; ".join(result.trimmed)
+            )
+
         target = paths.analysis_path_for(session_key)
         try:
             self._write_analysis(target, result.result)
@@ -1116,6 +1123,10 @@ class Pipeline:
         fields: dict[str, str | None] = {"session_key": session_key, "error_code": code}
         if reason is not None:
             fields["reason"] = reason
+        if detail:
+            # **理由をログに出す。**`error_code` だけだと `sessions.error_message` を
+            # 直接読むまで何が起きたか分からない（2026-09-14 に実機で踏んだ。#112）
+            fields["detail"] = detail
         self.log.error(event, **fields)
 
     # --- 共通の遷移ヘルパ -----------------------------------------------
