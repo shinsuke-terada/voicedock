@@ -280,7 +280,23 @@ detect_devices() {
         # 4. ディレクトリであり読み取り可能である
         if [ ! -d "$path" ] || [ ! -r "$path" ]; then skip "$name" "not a readable directory"; continue; fi
         # 5. DJI 形式の録音が 1 件以上ある
-        if ! _has_recordings "$path"; then skip "$name" "no DJI recordings"; continue; fi
+        #
+        # **「録音が無い」と「読めない」を区別する。**macOS の TCC はリムーバブル
+        # ボリュームへのアクセスをアプリ単位で拒否するが、**`[ -r ]`（規則 4）は
+        # それを見抜けない** — `access(2)` は成功し、`opendir(3)` で初めて EPERM になる。
+        # 区別しないと glob が空になるだけなので、**権限が無いのに「録音が無い」と
+        # 報告する。**初回セットアップで最も踏みやすい失敗であり、ログが逆方向を指す
+        # （2026-09-14 に実機で踏んだ。§3.4(7)）。
+        if ! _has_recordings "$path"; then
+            # **判定は変えない。**どちらにせよこのボリュームは飛ばす。理由だけを正す。
+            # `-maxdepth 1` は列挙できるかを見るだけで、§10.2 の走査は起こさない
+            if find "$path" -maxdepth 1 >/dev/null 2>&1; then
+                skip "$name" "no DJI recordings"
+            else
+                skip "$name" "volume not listable — macOS のプライバシー設定を確認してください（§3.4(7)）"
+            fi
+            continue
+        fi
 
         DEVICES[${#DEVICES[@]}]="$name"
         info "device_detected name=$name"

@@ -569,6 +569,43 @@ def test_directory_without_recordings_is_not_a_device(tmp_path: Path, volumes: P
     assert "name=Backup SSD reason=no DJI recordings" in result.stdout, result.stdout
 
 
+def test_an_unlistable_volume_says_so(tmp_path: Path, volumes: Path) -> None:
+    """**「録音が無い」と「列挙できない」を区別する**（§5.4 規則 5 の註記）。
+
+    macOS の TCC はリムーバブルボリュームへのアクセスをアプリ単位で拒否するが、
+    **規則 4 の `[ -r ]` はそれを見抜けない** — `access(2)` は成功し、`opendir(3)` で
+    初めて `EPERM` になる。区別しないと glob が空になるだけなので、**権限が無いのに
+    「録音が無い」と報告する。**初回セットアップで最も踏みやすい失敗であり、
+    **ログが逆方向を指す**（2026-09-14 に実機で踏んだ。§3.4(7)）。
+
+    ここではモード **444** で同じ状態を作る（**テストは uid 1000 で走る**ので効く）。
+    **`000` では駄目である** — それだと規則 4 の `[ -r ]` が落ちてしまい、
+    `not a readable directory` になって**この分岐を通らない。**
+    再現したいのは「規則 4 を通り抜けたのに列挙できない」であり、
+    `444` は `-r` が真・`-x` が偽なので、まさにその形になる。
+    """
+    locked = volumes / "Locked"
+    locked.mkdir()
+    (locked / "something").mkdir()
+    locked.chmod(0o444)
+    try:
+        result = run_ingest(write_conf(tmp_path, EXCLUDE_VOLUMES="()"))
+    finally:
+        locked.chmod(0o755)
+    assert "name=Locked reason=volume not listable" in result.stdout, result.stdout
+    assert "name=Locked reason=no DJI recordings" not in result.stdout
+
+
+def test_a_listable_empty_volume_still_says_no_recordings(tmp_path: Path, volumes: Path) -> None:
+    """陰性対照。**読めるのに空**なら、理由は今までどおり `no DJI recordings` である。
+
+    これが無いと、上のテストは「常に not listable と言う」実装でも通ってしまう。
+    """
+    (volumes / "Empty").mkdir()
+    result = run_ingest(write_conf(tmp_path, EXCLUDE_VOLUMES="()"))
+    assert "name=Empty reason=no DJI recordings" in result.stdout, result.stdout
+
+
 def test_scan_depth_is_bounded(tmp_path: Path, volumes: Path) -> None:
     """`MAX_SCAN_DEPTH` より深い録音は見ない（§5.4 規則 6）。"""
     deep = volumes / DEVICE_ID / "a" / "b" / "c" / "d"
