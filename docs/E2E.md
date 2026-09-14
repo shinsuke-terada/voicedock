@@ -44,7 +44,7 @@ docker compose exec voicedock voicedock doctor   # コンテナ側（§19.2 の 
 | # | シナリオ | 判定 | 記録 |
 |---|---|---|---|
 | E2E-01 | 1 分程度の録音を 1 本。削除 OFF | ⬜ 未実施 | §3.1 |
-| E2E-02 | 変換中に USB を抜く | ⬜ 未実施 | §3.2 |
+| E2E-02 | **コピー中に** USB を抜く | ✅ **PASS** | §3.2。**変換中ではない** — 変換は inbox から読むので USB と無関係 |
 | E2E-03 | Whisper 実行中に USB を抜く | ⬜ 未実施 | §3.3 |
 | E2E-04 | Obsidian Vault を一時的に利用不可にする | ⬜ 未実施 | §3.4 |
 | E2E-05 | 同じ Mic を再接続 | ⬜ 未実施 | §3.5 |
@@ -83,21 +83,95 @@ ls -la "/Volumes/<VOL>/TX_.../"                     # ★元音声が残って�
 
 判定: ⬜ 未実施
 
-### 3.2 E2E-02 — 変換中に USB を抜く
+### 3.2 E2E-02 — コピー中に USB を抜く
 
 クラッシュしない。**部分出力が削除される。DJI 側の音声が残る。**次回接続で再試行される。
 
-```bash
-# `normalize_completed` が出る前に物理的に抜く
-docker compose logs voicedock | grep -E 'import_failed|SOURCE_MISSING|normalize'
-docker compose exec voicedock ls -la /data/staging/   # ★部分出力が残っていないこと
-ls -la "/Volumes/<VOL>/TX_.../"                       # ★DJI 側は無傷
+> **危険な窓は「Helper のコピー（デバイス → inbox）」である。**コンテナの変換は
+> inbox（内蔵ディスク）から読むので、**そのあいだに USB を抜いても何も起こらない。**
+> v5.24 までこの節は `normalize_completed` の前に抜けと書いていたが、
+> **それでは何も試験していない。**
 
-# 再接続して再試行されることを確認（§15.2 の「デバイスの再接続」）
-docker compose exec voicedock voicedock status
+#### 手順
+
+**コピーに時間のかかる状態を作る。**inbox の**墓標（`.meta.json`）を外す**と、
+その録音は再コピーされる（§10.2）。259 MB のファイル 3 件なら約 62 秒になる。
+
+```bash
+# 1. 墓標を外す（**退避しておくこと**）
+cp ~/VoiceDock/inbox/<VOL>/<FOLDER>/*.meta.json /tmp/tombstones/
+rm ~/VoiceDock/inbox/<VOL>/<FOLDER>/TX00_MIC00{3,5,6}_*.meta.json
+
+# 2. デバイスを挿す → コピーが始まる
+# 3. **30 秒ほどで物理的に抜く**
+
+# 4. 確認
+grep -E 'copy_failed|copy_size_mismatch' ~/VoiceDock/log/ingest.log
+ls -la ~/VoiceDock/inbox/<VOL>/<FOLDER>/   # ★ .partial が残っていないこと
+docker compose exec voicedock ls -la /data/staging/
+
+# 5. 再接続して再試行されることを確認（§15.2 の「デバイスの再接続」）
 ```
 
-判定: ⬜ 未実施
+> **再コピーの対象は処理済みの録音なので、二重処理は起きない**（partkey が登録済みで
+> `part_skipped reason=already_known`。§9.3）。**ただし inbox に取り残しが生まれる** —
+> 変換しない Part の原本は `inbox_retain` の経路では消えない（#120）。
+> 試験後は手で消すこと。
+
+#### 実測（2026-09-14 23:36）
+
+```text
+23:36:13  scanned name=DJIMIC3 files=12 candidates=3
+23:36:34  copied  MIC003 bytes=259254376          ← 1 件目は完了
+          （MIC005 の .partial が 64 MB まで育ったところで USB を抜いた）
+cat: .../TX00_MIC005_...wav: Device not configured
+23:36:49  WARN  copy_failed relpath=.../MIC005 pipestatus=1 0 0
+cat: .../TX00_MIC006_...wav: No such file or directory
+23:36:49  WARN  copy_failed relpath=.../MIC006 pipestatus=1 0 0
+23:36:49  INFO  ingest_finished devices=1          ← クラッシュせず正常終了
+```
+
+| 確認項目 | 結果 |
+|---|---|
+| クラッシュしない | ✅ `ingest_finished` まで到達 |
+| **部分出力が削除される** | ✅ **64 MB の `.partial` と `.sha` が両方消えている** |
+| 失敗の理由が残る | ✅ `pipestatus=1 0 0` — **`cat` だけが失敗**したことが分かる |
+| 中途半端なファイルをコンテナが読まない | ✅ 墓標が無いので**候補にすらならない**（§10.2） |
+| **DJI 側の音声が残る** | ✅ **12 件すべてサイズ一致**（下記） |
+| **次回接続で再試行される** | ✅ `candidates=2` → MIC005 / MIC006 とも完了 |
+
+**抜いた瞬間に読んでいた MIC005 を含め、デバイス上の 12 件は 1 バイトも変わっていない:**
+
+```text
+856456     TX00_MIC001_20260912_163444_orig.wav
+2963176    TX00_MIC002_20260913_233420_orig.wav
+259254376  TX00_MIC003_20260914_115939_orig.wav
+224865736  TX00_MIC004_20260914_122940_orig.wav
+259254376  TX00_MIC005_20260914_150918_orig.wav   ← コピー中に抜いた
+259254376  TX00_MIC006_20260914_153918_orig.wav
+259254376  TX00_MIC007_20260914_160918_orig.wav
+259254376  TX00_MIC008_20260914_163918_orig.wav
+259254376  TX00_MIC009_20260914_170919_orig.wav
+183665896  TX00_MIC010_20260914_173919_orig.wav
+1236616    TX00_MIC011_20260914_202800_orig.wav
+1648456    TX00_MIC012_20260914_230003_orig.wav
+```
+
+再接続後（23:39）:
+
+```text
+23:39:13  scanned name=DJIMIC3 files=12 candidates=2
+23:39:34  copied  MIC005 bytes=259254376
+23:39:54  copied  MIC006 bytes=259254376
+23:39:54  ingest_finished devices=1
+```
+
+判定: ✅ **PASS**
+
+> **ここで #120 が見つかった。**再コピーで inbox に残った `.wav` は partkey が
+> `COMPLETED` なので二度と処理されないが、`voicedock status` は
+> **`Inbox : 1 parts pending`** と報告し続けた。`Backlog : 未処理なし` と同時に出るため、
+> **どちらを信じればよいか分からない。**
 
 ### 3.3 E2E-03 — Whisper 実行中に USB を抜く
 
