@@ -4,9 +4,9 @@
 コンテナからホストへ移ったので（§4.2）、Python のテストでは動かせない。偽ボリュームを
 `tmp_path` へ組み立て、`bash helper/voicedock-ingest` を `subprocess` で実行する。
 
-**`mount_readonly: true` の経路はここでは検証できない。**`diskutil` が Linux に無いため
-再マウントは必ず失敗し、§14.2 のとおり `false` が書かれる（これが正しい挙動である）。
-`true` になることの確認は実機でしか行えない（#3 / P0-8、`mount | grep -i dji`）。
+**`mount_readonly` は `PATH` の先頭へ偽の `diskutil` / `mount` を置いて検証する**（#107）。
+本物は Linux に無く、macOS の本物を呼べば開発機のボリュームを unmount してしまう。
+実機での確認は別にある（#3 / P0-8、`scripts/probe.sh`）。
 """
 
 from __future__ import annotations
@@ -71,9 +71,18 @@ def age_files(root: Path) -> None:
 BASH = shutil.which("bash") or "/bin/bash"
 
 
-def run_ingest(conf: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def run_ingest(
+    conf: Path, *args: str, path_prefix: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    """`path_prefix` を `PATH` の先頭へ足す。
+
+    **`diskutil` / `mount` を差し替えるための口である**（#107）。本物は Linux に無く、
+    macOS の本物を呼ぶわけにもいかない（開発機のボリュームを unmount してしまう）。
+    """
     env = dict(os.environ)
     env["VOICEDOCK_HELPER_CONF"] = str(conf)
+    if path_prefix is not None:
+        env["PATH"] = f"{path_prefix}{os.pathsep}{env['PATH']}"
     return subprocess.run(  # noqa: S603
         [BASH, str(INGEST), *args],
         capture_output=True,
@@ -248,9 +257,9 @@ def test_wav_without_tombstone_is_recopied(tmp_path: Path, volumes: Path) -> Non
 def test_heartbeat_matches_spec_shape(tmp_path: Path, volumes: Path) -> None:
     """`heartbeat.json` が §7.5 の全キーを持つこと。
 
-    **`mount_readonly` は `false` である。**`diskutil` が Linux に無いため再マウントは
-    必ず失敗し、§14.2 のとおり `false` を書く（**失敗は安全側へ倒れる** — reaper は
-    検証 2 で削除を拒否する）。`true` の確認は実機でしか行えない（#3 / P0-8）。
+    **`mount_readonly` は `false` である。**偽の `diskutil` を置いていないので再マウントは
+    失敗し、`mount` も読み取り専用と言わない。§14.2 のとおり `false` を書く
+    （**失敗は安全側へ倒れる** — reaper は検証 2 で削除を拒否する）。
     """
     run_ingest(write_conf(tmp_path))
     heartbeat = read_json(tmp_path / "home" / "state" / "heartbeat.json")
@@ -731,3 +740,199 @@ def test_heartbeat_is_valid_json_even_with_a_broken_boolean(tmp_path: Path, volu
     error = heartbeat["config_error"]
     assert isinstance(error, str)
     assert error.startswith("6:")
+
+
+# --- マウントの観測（#107） ---------------------------------------------
+# **報告する値は観測から作る。再マウントの試行の成否からではない。**
+# 2026-09-14 の実機で、デバイスが読み取り専用のまま 10 分間 `mount_readonly: false` と
+# 報告された。読み取り専用のボリュームは unmount を拒否されるため、**成功の直後の実行が
+# 必ず「失敗」を報告する**ためである。
+
+
+def stub_bin(tmp_path: Path, name: str, body: str) -> Path:
+    """`PATH` の先頭へ置く偽物を作る（`test_helper_install.py` と同じ流儀）。"""
+    directory = tmp_path / "stubbin"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+    path.chmod(0o755)
+    return directory
+
+
+def stub_mount(tmp_path: Path, *, readonly: bool, volume: Path) -> Path:
+    """偽の `mount`。`_is_mounted_readonly()` が見る 1 行を出す。
+
+    **本物の `mount` の書式に合わせる** — `<node> on <path> (...)` で、読み取り専用なら
+    options に `read-only` が入る（macOS 15 の fskit msdos の実際の出力）。
+    """
+    options = "msdos, local, nodev, nosuid, read-only, noowners, noatime, fskit"
+    if not readonly:
+        options = "msdos, local, nodev, nosuid, noowners, noatime, fskit"
+    return stub_bin(tmp_path, "mount", f"echo '/dev/disk9 on {volume} ({options})'")
+
+
+def stub_diskutil(tmp_path: Path, *, calls: Path, unmount: int = 0, mount: int = 0) -> Path:
+    """偽の `diskutil`。**呼ばれたことを記録し、部分呼び出しごとに終了コードを変える。**
+
+    `unmount` と `mount readOnly` を撃ち分けられないと、`unmount_failed` と
+    `mount_failed` を区別するテストが書けない。
+    """
+    body = (
+        f'echo "$*" >> {calls}\n'
+        'case "$1" in\n'
+        f"  unmount) exit {unmount} ;;\n"
+        f"  mount) exit {mount} ;;\n"
+        "esac\n"
+        "exit 0"
+    )
+    return stub_bin(tmp_path, "diskutil", body)
+
+
+def stub_mount_becoming_readonly(tmp_path: Path, *, volume: Path) -> Path:
+    """**1 回目は書き込み可能、2 回目以降は読み取り専用**と答える偽の `mount`。
+
+    `remount_readonly()` の中の判定（1 回目）では早期 return させず、呼び手の観測
+    （2 回目）では読み取り専用と見せる。**「試行は失敗、実態は読み取り専用」という
+    2026-09-14 の実機の状況を、早期 return を残したまま再現する唯一の方法である。**
+    """
+    counter = tmp_path / "mount_calls.txt"
+    rw = "msdos, local, nodev, nosuid, noowners, noatime, fskit"
+    ro = "msdos, local, nodev, nosuid, read-only, noowners, noatime, fskit"
+    body = (
+        f"n=$(cat {counter} 2>/dev/null || echo 0)\n"
+        "n=$((n+1))\n"
+        f'echo "$n" > {counter}\n'
+        'if [ "$n" -le 1 ]; then\n'
+        f"  echo '/dev/disk9 on {volume} ({rw})'\n"
+        "else\n"
+        f"  echo '/dev/disk9 on {volume} ({ro})'\n"
+        "fi"
+    )
+    return stub_bin(tmp_path, "mount", body)
+
+
+def stub_plutil(tmp_path: Path) -> Path:
+    """偽の `plutil`。**`_device_node()` が先に落ちるのを防ぐ。**
+
+    Linux に `plutil` は無いので、置かないと理由語が必ず `no_device_node` になり、
+    unmount / mount の失敗を区別するテストが書けない。
+    """
+    return stub_bin(tmp_path, "plutil", "echo /dev/disk9")
+
+
+def test_already_readonly_does_not_unmount(tmp_path: Path, volumes: Path) -> None:
+    """既に読み取り専用なら `diskutil` を 1 度も呼ばない。
+
+    **不要な unmount をやめることが修正の本体である。**5 分ごとに unmount し直すこと自体が
+    EBUSY の機会を作り、成功しても次の実行が「失敗」を報告する（#107）。
+    """
+    calls = tmp_path / "diskutil_calls.txt"
+    stub_mount(tmp_path, readonly=True, volume=volumes / DEVICE_ID)
+    # **`plutil` も置く。**置かないと `_device_node()` が先に落ちて `diskutil` に到達せず、
+    # **早期 return を消しても通ってしまう**（意図的破壊で実際に素通りした）
+    stub_plutil(tmp_path)
+    prefix = stub_diskutil(tmp_path, calls=calls)
+
+    run_ingest(write_conf(tmp_path), path_prefix=prefix)
+
+    assert not calls.exists(), f"diskutil を呼んでいる: {calls.read_text()}"
+
+
+def test_readonly_is_reported_from_observation_not_from_the_attempt(
+    tmp_path: Path, volumes: Path
+) -> None:
+    """再マウントが失敗しても、実際に読み取り専用なら `true` を報告する。
+
+    **これが 2026-09-14 に実機で起きた誤りである**（#107）。
+    """
+    calls = tmp_path / "diskutil_calls.txt"
+    # 再マウントに入る時点では書き込み可能に見え、**呼び手が観測する時点では読み取り専用**
+    stub_mount_becoming_readonly(tmp_path, volume=volumes / DEVICE_ID)
+    stub_plutil(tmp_path)
+    prefix = stub_diskutil(tmp_path, calls=calls, unmount=1)
+
+    result = run_ingest(write_conf(tmp_path), path_prefix=prefix)
+
+    # 試行は失敗したと報告されている
+    assert "remount_readonly_failed" in result.stdout + result.stderr
+    # それでも実態は読み取り専用なので true を書く
+    heartbeat = read_json(tmp_path / "home" / "state" / "heartbeat.json")
+    assert heartbeat["mount_readonly"] is True
+    inventory = read_json(tmp_path / "home" / "state" / "inventory.json")
+    assert inventory["mount_readonly"] is True
+
+
+def test_writable_is_reported_when_the_device_is_writable(tmp_path: Path, volumes: Path) -> None:
+    """実際に書き込み可能なら `false` を報告する（逆方向の固定）。"""
+    calls = tmp_path / "diskutil_calls.txt"
+    stub_mount(tmp_path, readonly=False, volume=volumes / DEVICE_ID)
+    stub_plutil(tmp_path)
+    prefix = stub_diskutil(tmp_path, calls=calls, unmount=1)
+
+    run_ingest(write_conf(tmp_path), path_prefix=prefix)
+
+    heartbeat = read_json(tmp_path / "home" / "state" / "heartbeat.json")
+    assert heartbeat["mount_readonly"] is False
+
+
+def test_rw_mode_still_observes_the_mount(tmp_path: Path, volumes: Path) -> None:
+    """`MOUNT_MODE=rw` でも観測する。
+
+    **利用者が手で読み取り専用にしている場合がある。**そのとき削除を許すと書き込みに
+    失敗する（§14.2 のロック 2-B）。`diskutil` は呼ばない。
+    """
+    calls = tmp_path / "diskutil_calls.txt"
+    stub_mount(tmp_path, readonly=True, volume=volumes / DEVICE_ID)
+    prefix = stub_diskutil(tmp_path, calls=calls)
+
+    run_ingest(write_conf(tmp_path, MOUNT_MODE="rw"), path_prefix=prefix)
+
+    assert not calls.exists(), "MOUNT_MODE=rw で diskutil を呼んでいる"
+    heartbeat = read_json(tmp_path / "home" / "state" / "heartbeat.json")
+    assert heartbeat["mount_readonly"] is True
+
+
+@pytest.mark.parametrize(
+    ("unmount", "mount", "reason"),
+    [
+        (1, 0, "unmount_failed"),
+        (0, 1, "mount_failed"),
+        (0, 0, "still_writable"),
+    ],
+)
+def test_the_failure_reason_is_logged(
+    tmp_path: Path, volumes: Path, unmount: int, mount: int, reason: str
+) -> None:
+    """失敗の理由をログに残す。
+
+    **4 つの `return 1` が 1 つのメッセージに潰れていた。**2026-09-14 の実機では
+    「unmount が EBUSY」と「unmount が拒否された」の 2 種類が同じ行に見えており、
+    macOS の unified log を掘るまで区別できなかった（#107）。
+    """
+    calls = tmp_path / "diskutil_calls.txt"
+    stub_mount(tmp_path, readonly=False, volume=volumes / DEVICE_ID)
+    stub_plutil(tmp_path)
+    prefix = stub_diskutil(tmp_path, calls=calls, unmount=unmount, mount=mount)
+
+    result = run_ingest(write_conf(tmp_path), path_prefix=prefix)
+
+    combined = result.stdout + result.stderr
+    assert f"remount_readonly_failed name={DEVICE_ID} reason={reason}" in combined
+
+
+@pytest.mark.skipif(
+    shutil.which("diskutil") is not None,
+    reason="diskutil が PATH に在る（この試験は不在を確かめるものなので黙って通さない）",
+)
+def test_a_missing_diskutil_says_so(tmp_path: Path, volumes: Path) -> None:
+    """`diskutil` が無いときの理由語。
+
+    テストは Linux のコンテナで走る（§18.5）ので通常はこの経路を通る。**条件を `if` で
+    包んで無言の no-op にしない** — 通らなかったことが見えるように skip にする。
+    """
+    stub_mount(tmp_path, readonly=False, volume=volumes / DEVICE_ID)
+
+    result = run_ingest(write_conf(tmp_path), path_prefix=tmp_path / "stubbin")
+
+    combined = result.stdout + result.stderr
+    assert f"remount_readonly_failed name={DEVICE_ID} reason=no_diskutil" in combined
