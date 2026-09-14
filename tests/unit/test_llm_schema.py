@@ -16,7 +16,7 @@ import pytest
 from pydantic import ValidationError
 
 from tests.helpers import PROMPTS_ROOT
-from tests.spec_sync import spec_section_code, spec_text
+from tests.spec_sync import spec_section_code, spec_section_text, spec_text
 from voicedock import llm
 from voicedock.config import Config
 from voicedock.llm import (
@@ -181,10 +181,61 @@ def test_summary_has_no_item_limit(cfg: Config) -> None:
     assert cfg.llm.analysis.sections["summary"].max_items is None
 
 
-def test_the_limit_is_shown_in_the_prompt(make_config: Callable[..., Config]) -> None:
-    """**上限をプロンプトにも出す。**出さないと守られない。"""
+def test_the_item_limit_is_not_shown_in_the_prompt(make_config: Callable[..., Config]) -> None:
+    """**リストの件数の上限をモデルへ見せない**（#98）。
+
+    v5.14 までは「（最大 N 件）」をプロンプトへ出しており、docstring には
+    **「出さないと守られない」**と書いてあった。**実機の A/B がそれを否定した。**
+    モデルは上限を**埋めるべき目標**として解釈し、**録音に無い内容をでっち上げて
+    数を合わせる。**79 文字の文字起こしに対し `key_points` が 19 件（上限 20）出た。
+
+    | | `key_points` | `ideas` | `tags` |
+    |---|---|---|---|
+    | 見せる | 19 | 15 | 15 |
+    | 見せない | **5** | **3** | **7** |
+
+    §1.3 の優先順位 1 は記録の保護である。**要約に言っていないことが混ざるのは
+    記録の破壊と同じ**であり、しかも Daily は Raw より読まれる。
+    """
     cfg = make_config({"llm": {"analysis": {"sections": {"ideas": {"max_items": 7}}}}})
-    assert "最大 7 件" in render_schema_block(cfg)
+    block = render_schema_block(cfg)
+    assert "最大 7 件" not in block, block
+    assert "7" not in block.split('"ideas"')[1].split("\n")[0], block
+
+
+def test_the_spec_says_not_to_show_the_item_limit() -> None:
+    """**§12.2 がそう規定していること。**
+
+    実装だけ直しても、SPEC が元のままなら**次に実装する人が戻す。**
+    v5.14 まで実装の註記は「上限を明示する（モデルが守りやすくなる）」だった。
+    """
+    text = spec_section_text("12.2")
+    assert "リストの件数の上限をモデルへ見せてはならない" in text
+    assert "プロンプトには出さない" in text
+
+
+def test_the_character_limit_is_still_shown(make_config: Callable[..., Config]) -> None:
+    """**文字数の上限は見せたまま。**1 つの文字列の長さであって「埋めるべき個数」ではない。
+
+    ここまで消すと、**要約が際限なく伸びる**恐れがある（未測定の領域を
+    まとめて変えない）。
+    """
+    cfg = make_config({})
+    block = render_schema_block(cfg)
+    assert "文字以内" in block, block
+
+
+def test_the_limit_still_validates(make_config: Callable[..., Config]) -> None:
+    """**上限そのものは捨てていない**（§12.2）。
+
+    プロンプトから消したのは「見せ方」だけで、`max_items` は `max_length` として
+    pydantic が検証する。超過したら §12.3 の修復が走り、**修復プロンプトの
+    `{errors}` で初めて件数の上限が伝わる。**
+    """
+    cfg = make_config({"llm": {"analysis": {"sections": {"ideas": {"max_items": 2}}}}})
+    model = build_schema(cfg)
+    with pytest.raises(ValidationError, match="at most 2 items"):
+        model.model_validate(valid_payload() | {"ideas": ["a", "b", "c"]})
 
 
 # --- Pydantic 検証（§12.3 の 2） ----------------------------------------
