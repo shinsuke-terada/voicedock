@@ -464,7 +464,7 @@ P0-6 / P0-7 / P0-9 が問うていた前提そのものが無くなった。**�
 | # | 項目 | 判定 | 根拠 |
 |---|---|---|---|
 | P0-8 | `MOUNT_MODE=ro` で `mount` が read-only、`heartbeat.json` が `mount_readonly: true`。**両者が一致する** | ✅ **PASS** | §10.1。`probe.sh` が機械判定し EXIT=0。**ただし一致は間欠的に崩れていた** — §10.1.2（#107 で修正） |
-| P0-8b | `MOUNT_MODE=rw` で read-write になり `mount_readonly: false` になる | ⬜ 未実施 | |
+| P0-8b | `MOUNT_MODE=rw` で read-write になり `mount_readonly: false` になる | ✅ **PASS** | §10.2。`probe.sh` が機械判定し EXIT=0。**削除は 2 つのロックで止まったまま** |
 | P0-10 | 送信機 2 台の見え方。2 個なら `inventory.json` の `devices` が 2 エントリ | ⚠ 1 台のみ | §10.1。2 台同時は未検証 |
 | P0-11 | 録音中ファイルの mtime の進み方。`STABILITY_*` の既定が実挙動に合うか | ⚠ 静止のみ | §10.1。**録音中のファイルでは未検証** |
 | P0-12 | 受信機（RX）側にもストレージが見えるか（任意。R-7 へ記録するだけ） | ⬜ 未実施 | |
@@ -637,10 +637,68 @@ macOS の unified log に 2 種類の失敗が出ており、**どちらも同�
 
 ### 10.2 `rw` での採取（P0-8b）
 
-⬜ 未実施。`helper.conf` を `MOUNT_MODE=rw` にして再接続し、採り終えたら **`ro` へ戻す。**
+✅ **PASS**（2026-09-14 22:41）。`helper.conf` を `MOUNT_MODE=rw` にし、**取り出して挿し直した。**
 
-> **`rw` にしても削除は起きない。**ロック 2-A（`voicedock-reaper` が未配置）が残っており、
-> **削除できるプログラムが存在しない**（§14.2）。削除の有効化は #39 の運用判断である。
+> **挿し直しが要る。**`MOUNT_MODE=rw` は「再マウントしない」だけなので、**既に読み取り専用に
+> なっているデバイスはそのまま**である。前の `ro` の状態が残ったままでは測定にならない。
+
+`ingest.log`（**`remount_readonly*` の行が無く、スキャンが 1 秒で終わっている**）:
+
+```text
+2026-09-14T22:41:47+09:00 INFO  device_detected name=DJIMIC3
+2026-09-14T22:41:47+09:00 INFO  volume_skipped name=Macintosh HD reason=in EXCLUDE_VOLUMES
+2026-09-14T22:41:48+09:00 INFO  scanned name=DJIMIC3 files=11 candidates=0
+2026-09-14T22:41:48+09:00 INFO  ingest_finished devices=1
+```
+
+`probe.sh` の P0-8 節（**要約せずこのまま**）:
+
+```text
+## P0-8 マウントモードと heartbeat の一致
+
+- `helper.conf` の `MOUNT_MODE` : `rw`
+- `heartbeat.json` の `mount_readonly` : `false`
+- `heartbeat.json` の `updated_at` : `2026-09-14T22:41:48+09:00`
+
+| デバイス | `mount` | 読み取り専用 |
+|---|---|---|
+| `DJIMIC3` | `/dev/disk4 on /Volumes/DJIMIC3 (msdos, local, nodev, nosuid, noowners, noatime, fskit)` | false |
+
+- `mount` からの観測 : `false`（デバイス 1 個の論理積）
+- 判定: ✅ **PASS** — `mount` と `heartbeat.json` が一致した
+- ロック 2-B: **外れている**（`MOUNT_MODE=rw` の意図どおり。Phase 7 の状態）
+```
+
+`doctor` の表示:
+
+```text
+[!] Source deletion      DISABLED
+                             lock 1  : config.yaml=false, helper.conf=false
+                             lock 2-A: voicedock-reaper is NOT installed  <- deletion is impossible
+                             lock 2-B: MOUNT_MODE=rw (device mounted read-write)
+```
+
+**ロック 2-B を外しても削除は起きない。**残る 2 つが独立に止めている —
+とくに**ロック 2-A は「削除できるプログラムが `~/VoiceDock/bin/` に存在しない」**である
+（§14.2）。削除の有効化は #39 の運用判断である。
+
+採取後は **`ro` へ戻した。**
+
+#### `probe.sh` の判定文を直した
+
+**一致していることと「ロック 2-B が効いていること」は別の問いである。**
+v5.19 までは一致しさえすれば `ロック 2-B が実際に効いている` と書いていた。
+
+**2026-09-14 18:11 の採取では、`MOUNT_MODE=ro` なのにデバイスが書き込み可能なまま
+✅ PASS と表示していた**（§10.1.2）。**保護されていないことを保護されていると読ませていた。**
+
+いまは 3 つを区別する:
+
+| 観測 | `MOUNT_MODE` | 表示 |
+|---|---|---|
+| 読み取り専用 | — | ロック 2-B: **効いている** |
+| 書き込み可能 | `rw` | ロック 2-B: **外れている**（意図どおり。Phase 7 の状態） |
+| 書き込み可能 | `ro` | ロック 2-B: ⚠ **かかっていない** — 再マウントが成功していない |
 
 ## 11. Model Runner と LLM スループット（#13 で記入）
 
