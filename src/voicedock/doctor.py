@@ -242,12 +242,32 @@ def check_whisper_model(ctx: Context) -> list[Row]:
 def check_vad_model(ctx: Context) -> list[Row]:
     """D-9: VAD モデルが存在する（`vad.enabled` が true のとき）。
 
-    **無効なら skip にする。**`vad.enabled: false` は §10.6 が認めた運用であり、
-    そのときモデルが無いことは異常ではない。
+    **無効なら警告する。**v5.16 までは黙って skip していたが、2026-09-14 の実測で
+    **VAD を切ると破滅的である**ことが分かった（`docs/POC.md` §12.4）。同じ音声で:
+
+    | | `elapsed` | `rtf` | 文字数 | 区間 / ユニーク |
+    |---|---|---|---|---|
+    | VAD on | 209.6 秒 | 0.134 | 667 | 40 / 39 |
+    | **VAD off** | **2819.3 秒** | **1.806** | **2274** | **178 / 11** |
+
+    **13.4 倍遅くなり、文字数が 3.4 倍に増える。**増えた分は無音から生成された幻覚で、
+    178 区間のうち 74 区間が「はい、ご視聴ありがとうございました。」の繰り返しだった
+    （§22 R-15）。**`rtf 1.806` では 16 時間の録音に 29 時間かかり、
+    §21.2 Phase 2 の 8 時間要件を満たせない。**
+
+    **設定としては許すが、黙っては通さない。**「遅い」だけでなく
+    **嘘の記録が Vault に残る**ためである（§1.3 の優先順位 1）。
     """
     vad = ctx.config.transcription.vad
     if not vad.enabled:
-        return [Row(Status.SKIP, "VAD model", "transcription.vad.enabled: false")]
+        return [
+            Row(
+                Status.NOTICE,
+                "VAD model",
+                "transcription.vad.enabled: false"
+                "  <- 無音から幻覚が生成され、13 倍以上遅くなります",
+            )
+        ]
     return [_model_row("VAD model", Path(vad.model))]
 
 
