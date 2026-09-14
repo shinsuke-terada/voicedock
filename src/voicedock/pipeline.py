@@ -100,6 +100,27 @@ DELETE_EVALUATED: Final[frozenset[str]] = frozenset(
 が毎周回増え続ける。
 """
 
+NORMALIZABLE: Final[frozenset[str]] = frozenset({PartStatus.DISCOVERED, PartStatus.NORMALIZING})
+"""`ensure_normalized_audio()` が進められる Part の状態。
+
+**`NORMALIZING` を含める。**`resume_failed()` は `FAILED` を**落ちた工程へ**戻すので
+（§9.3 / §15.2）、変換で落ちた行は `NORMALIZING` に戻ってくる。`DISCOVERED` だけを
+受け付けると**戻した先に受け手がいない。**
+
+**§9.4 の巻き戻しでは足りない。**あれは**起動時の 1 回だけ**であり、工程内リトライの
+受け手にはならない。v5.25 まではそう書いてあったが、**実機で Part が 13 分座った**（#123）。
+"""
+
+TRANSCRIBABLE: Final[frozenset[str]] = frozenset({PartStatus.NORMALIZED, PartStatus.TRANSCRIBING})
+"""`ensure_part_transcript()` が進められる Part の状態。`NORMALIZABLE` と同じ理由で
+`TRANSCRIBING` を含める（Whisper で落ちた行はここへ戻る）。
+"""
+
+RAW_WRITABLE: Final[frozenset[str]] = frozenset({PartStatus.TRANSCRIBED, PartStatus.RAW_WRITING})
+"""`ensure_raw_note()` が進められる Part の状態。`NORMALIZABLE` と同じ理由で
+`RAW_WRITING` を含める（Raw ノートの書き込みで落ちた行はここへ戻る）。
+"""
+
 MERGEABLE: Final[frozenset[str]] = frozenset({SessionStatus.READY, SessionStatus.MERGING})
 """`ensure_merged()` が進められるセッションの状態。
 
@@ -229,9 +250,8 @@ class Pipeline:
         """
         if record.status in NORMALIZED_OR_BEYOND:
             return True
-        if record.status != PartStatus.DISCOVERED:
-            # `FAILED` / `SKIPPED` / `NORMALIZING`。**ここでは進めない** —
-            # `FAILED` の再投入は §15.2（#32）、`NORMALIZING` は §9.4 の巻き戻しが扱う
+        if record.status not in NORMALIZABLE:
+            # `FAILED` / `SKIPPED`。**ここでは進めない** — 再投入は §15.2（#32）
             return False
 
         source = record.inbox_path
@@ -247,7 +267,10 @@ class Pipeline:
             self.log.warning("disk_space_low", recording_key=record.partkey, reason=space.detail)
             return False
 
-        self._transition(record.partkey, PartStatus.DISCOVERED, PartStatus.NORMALIZING)
+        # **既に `NORMALIZING` なら遷移を記録しない。**戻ってきた行に
+        # `DISCOVERED → NORMALIZING` を書くと、events に在りもしない遷移が残る
+        if record.status == PartStatus.DISCOVERED:
+            self._transition(record.partkey, PartStatus.DISCOVERED, PartStatus.NORMALIZING)
         claimed = self.database.recording_by_normalized_path(
             str(audio.normalized_path_for(PartKey(record.partkey)))
         )
@@ -320,10 +343,12 @@ class Pipeline:
             return False
         if record.status in TRANSCRIBED_OR_BEYOND:
             return True
-        if record.status != PartStatus.NORMALIZED or record.normalized_path is None:
+        if record.status not in TRANSCRIBABLE or record.normalized_path is None:
             return False
 
-        self._transition(record.partkey, PartStatus.NORMALIZED, PartStatus.TRANSCRIBING)
+        # **既に `TRANSCRIBING` なら遷移を記録しない**（`NORMALIZABLE` と同じ）
+        if record.status == PartStatus.NORMALIZED:
+            self._transition(record.partkey, PartStatus.NORMALIZED, PartStatus.TRANSCRIBING)
         result = transcribe.transcribe(
             StagingPath(Path(record.normalized_path)),
             partkey=PartKey(record.partkey),
@@ -382,7 +407,7 @@ class Pipeline:
             return False
         if record.status in RAW_SAVED_OR_BEYOND:
             return True
-        if record.status != PartStatus.TRANSCRIBED or record.session_key is None:
+        if record.status not in RAW_WRITABLE or record.session_key is None:
             return False
 
         session_key = SessionKey(record.session_key)
@@ -390,7 +415,9 @@ class Pipeline:
         if not parts:
             return False
 
-        self._transition(record.partkey, PartStatus.TRANSCRIBED, PartStatus.RAW_WRITING)
+        # **既に `RAW_WRITING` なら遷移を記録しない**（`NORMALIZABLE` と同じ）
+        if record.status == PartStatus.TRANSCRIBED:
+            self._transition(record.partkey, PartStatus.TRANSCRIBED, PartStatus.RAW_WRITING)
         try:
             result = raw.write_raw_note(
                 parts,
