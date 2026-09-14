@@ -936,3 +936,148 @@ def test_a_missing_diskutil_says_so(tmp_path: Path, volumes: Path) -> None:
 
     combined = result.stdout + result.stderr
     assert f"remount_readonly_failed name={DEVICE_ID} reason=no_diskutil" in combined
+
+
+# --- 長い取り込み中の heartbeat（#117） --------------------------------
+# 1 日分の取り込みは約 11 分かかり、**`helper_heartbeat_max_age_seconds`（900）−
+# `StartInterval`（300）＝ 600 秒**を超える。最後にしか書かないと、**動いている helper を
+# コンテナが死んだと判定し、パイプライン全体を止める**（`worker.py` の `_helper_is_stale`）。
+
+
+def stub_slow_hash(tmp_path: Path, *, seconds: int = 1) -> Path:
+    """**コピーを遅くする偽の `shasum`。**
+
+    `_sha256_stdin()` は `command -v shasum` が通れば `shasum -a 256` を使う。
+    Linux には無いので、置けばこちらが選ばれる。**1 ファイルあたり `seconds` 秒**かかるので、
+    実行中に `heartbeat.json` を覗ける。
+    """
+    return stub_bin(tmp_path, "shasum", f"sleep {seconds}\nexec sha256sum")
+
+
+def heartbeat_updated_at(home: Path) -> str | None:
+    path = home / "state" / "heartbeat.json"
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = document.get("updated_at")
+    return value if isinstance(value, str) else None
+
+
+def test_the_heartbeat_is_refreshed_while_copying(tmp_path: Path, volumes: Path) -> None:
+    """**コピーの途中で `heartbeat.json` が更新される**（#117）。
+
+    **最後にしか書かないと、11 分の取り込み中にコンテナが helper を死んだと判定する。**
+    偽の `shasum` で 1 ファイルあたり 1 秒かけ、走っているあいだに覗く。
+    """
+    conf = write_conf(tmp_path)
+    home = tmp_path / "home"
+    prefix = stub_slow_hash(tmp_path)
+    env = dict(os.environ)
+    env["VOICEDOCK_HELPER_CONF"] = str(conf)
+    env["PATH"] = f"{prefix}{os.pathsep}{env['PATH']}"
+
+    seen: set[str] = set()
+    process = subprocess.Popen(  # noqa: S603
+        [BASH, str(INGEST)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
+    )
+    try:
+        while process.poll() is None:
+            value = heartbeat_updated_at(home)
+            if value is not None:
+                seen.add(value)
+            time.sleep(0.1)
+    finally:
+        process.wait(timeout=120)
+
+    assert len(seen) >= 2, (
+        f"実行中に heartbeat が 1 度しか書かれていない: {sorted(seen)}\n"
+        "**最後にしか書いていない。**長い取り込みでコンテナが止まる（#117）"
+    )
+
+
+def heartbeat_snapshot(home: Path) -> dict[str, object] | None:
+    try:
+        document: dict[str, object] = json.loads(
+            (home / "state" / "heartbeat.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    return document
+
+
+def run_and_watch(
+    tmp_path: Path, conf: Path, prefix: Path
+) -> tuple[list[dict[str, object]], subprocess.Popen[str]]:
+    """走らせながら `heartbeat.json` を覗き、**途中の状態を集める。**
+
+    **実行後の値だけを見てはならない。**最後の書き込みが上書きしてしまい、
+    途中で何を書いていたかが分からない。
+    """
+    home = tmp_path / "home"
+    env = dict(os.environ)
+    env["VOICEDOCK_HELPER_CONF"] = str(conf)
+    env["PATH"] = f"{prefix}{os.pathsep}{env['PATH']}"
+    seen: list[dict[str, object]] = []
+    process = subprocess.Popen(  # noqa: S603
+        [BASH, str(INGEST)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
+    )
+    try:
+        while process.poll() is None:
+            snapshot = heartbeat_snapshot(home)
+            if snapshot is not None and (not seen or snapshot != seen[-1]):
+                seen.append(snapshot)
+            time.sleep(0.1)
+    finally:
+        process.wait(timeout=120)
+    return seen, process
+
+
+def test_the_mid_run_heartbeat_reports_the_observed_mount(tmp_path: Path, volumes: Path) -> None:
+    """**途中の `mount_readonly` も観測から作る**（#107 の再発防止）。
+
+    `MOUNT_READONLY` を確定する前に heartbeat を書くと、**初期値の `false` が出る。**
+    それは §14.2 のロック 2-B を**開ける側**の値である。
+
+    **実行後の値では検証できない** — 最後の書き込みが `true` で上書きしてしまう。
+    走っているあいだの値を見る。
+    """
+    stub_mount(tmp_path, readonly=True, volume=volumes / DEVICE_ID)
+    prefix = stub_slow_hash(tmp_path)
+
+    seen, process = run_and_watch(tmp_path, write_conf(tmp_path), prefix)
+
+    assert process.returncode == 0
+    assert seen, "実行中に heartbeat を観測できなかった"
+    wrong = [s for s in seen if s.get("mount_readonly") is not True]
+    assert wrong == [], f"途中で mount_readonly が true 以外になっている: {wrong}"
+
+
+def test_the_inventory_is_not_written_mid_run(tmp_path: Path, volumes: Path) -> None:
+    """**`inventory.json` は途中で書かない**（#117 の判断 4）。
+
+    あれは「デバイスに何があるか」の一覧であり、**途中経過に意味が無い。**
+    """
+    conf = write_conf(tmp_path)
+    home = tmp_path / "home"
+    prefix = stub_slow_hash(tmp_path)
+    env = dict(os.environ)
+    env["VOICEDOCK_HELPER_CONF"] = str(conf)
+    env["PATH"] = f"{prefix}{os.pathsep}{env['PATH']}"
+
+    inventory = home / "state" / "inventory.json"
+    existed_early = False
+    process = subprocess.Popen(  # noqa: S603
+        [BASH, str(INGEST)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
+    )
+    try:
+        while process.poll() is None:
+            if heartbeat_updated_at(home) is not None and inventory.exists():
+                existed_early = True
+                break
+            time.sleep(0.1)
+    finally:
+        process.wait(timeout=120)
+
+    assert not existed_early, "heartbeat より先に inventory.json が書かれている"
+    assert inventory.exists(), "実行後には inventory.json がある"
