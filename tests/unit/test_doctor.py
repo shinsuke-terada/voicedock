@@ -398,6 +398,43 @@ def test_d10_fails_when_not_executable(tmp_path: Path, monkeypatch: pytest.Monke
 # --- D-11 / D-12 LLM ----------------------------------------------------
 
 
+# --- D-9: VAD（§10.6 / §22 R-15） ---------------------------------------
+
+
+def test_d9_warns_when_vad_is_disabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """**VAD を切ったら黙って通さない**（v5.16→v5.17 の変更）。
+
+    2026-09-14 の実測（同じ 26.0 分の音声。`docs/POC.md` §12.4）:
+
+    | | `elapsed` | `rtf` | 文字数 | 区間 / ユニーク |
+    |---|---|---|---|---|
+    | VAD on | 209.6 秒 | 0.134 | 667 | 40 / 39 |
+    | **VAD off** | **2819.3 秒** | **1.806** | **2274** | **178 / 11** |
+
+    **13.4 倍遅く、文字数は 3.4 倍。**増えた分は無音から生成された幻覚で、
+    178 区間のうち 74 区間が「はい、ご視聴ありがとうございました。」だった。
+    **`rtf 1.806` では §21.2 Phase 2 の 8 時間要件を満たせない**（16 時間 → 29 時間）。
+
+    v5.16 までは `[-] VAD model` と**黙って skip** していた。
+    """
+    path = healthy(tmp_path, monkeypatch, transcription={"vad": {"enabled": False}})
+    out, code = run(path, tmp_path / "state")
+    assert "[!] VAD model" in out, out
+    assert "幻覚" in out, "何が起きるかを書く"
+    assert "13 倍" in out, "どれだけ遅くなるかを書く"
+    assert code == 0, "設定としては許す（失敗ではない）"
+
+
+def test_d9_checks_the_model_when_vad_is_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """陰性対照。**有効なときはモデルの実在を見る。**何でも警告では意味が無い。"""
+    path = healthy(tmp_path, monkeypatch)
+    out, code = run(path, tmp_path / "state")
+    assert "[✓] VAD model" in out, out
+    assert code == 0
+
+
 def test_d11_shows_the_endpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     out, _code = run(healthy(tmp_path, monkeypatch), tmp_path / "state")
     assert f"[✓] {'LLM endpoint':<21}http://model-runner.docker.internal/v1/" in out
