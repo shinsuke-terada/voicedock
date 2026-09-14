@@ -364,11 +364,22 @@ def timeline_path(analysis_path: Path) -> Path:
     return analysis_path.with_suffix(".timeline.json")
 
 
-def save_timeline(analysis_path: Path, blocks: Sequence[TimelineBlock]) -> None:
+TIMELINE_SCHEMA: Final = 2
+"""`<slug>.timeline.json` の形式版。**1 は指紋を持たない**（v5.18 以前）。"""
+
+
+def save_timeline(
+    analysis_path: Path, blocks: Sequence[TimelineBlock], *, fingerprint: str
+) -> None:
     """Map 中間結果を保存する（§10.9）。**失敗しても例外にしない。**
 
     §13.4 の Timeline はこれを時刻順に並べたものであり、**再生成のために 18 回の
     LLM 呼び出しをやり直すわけにはいかない。**
+
+    **入力の指紋を併記する**（§9.4）。この関数は `OSError` を握りつぶすので、
+    **失敗すると古い Timeline がそのまま残る。**解析本体だけが新しくなり、
+    `load_timeline()` が古い Timeline を返すと、**本文が古いノートができる**（#108）。
+    指紋があれば `load_timeline()` がそれを弾ける。
     """
     payload = [
         {
@@ -378,26 +389,44 @@ def save_timeline(analysis_path: Path, blocks: Sequence[TimelineBlock]) -> None:
         }
         for block in blocks
     ]
+    document = {
+        "schema": TIMELINE_SCHEMA,
+        "transcript_sha256": fingerprint,
+        "blocks": payload,
+    }
     try:
         target = timeline_path(analysis_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
     except OSError:
         return
 
 
-def load_timeline(analysis_path: Path) -> list[TimelineBlock]:
-    """保存済みの Map 中間結果を読む。**読めなければ空**（§10.9 の代替経路へ落ちる）。"""
+def load_timeline(analysis_path: Path, *, fingerprint: str) -> list[TimelineBlock]:
+    """保存済みの Map 中間結果を読む。**読めなければ空**（§10.9 の代替経路へ落ちる）。
+
+    **指紋が一致しないものは「無い」と同じ扱いにする**（§9.4）。`save_timeline()` は
+    書き込みの失敗を握りつぶすので、**解析だけが新しく Timeline が古い**状態が起こりうる。
+    代替経路（Block ごとに `summary` の各文）は transcript から作るので**必ず今の内容になる** —
+    粒度は粗くなるが、**古い時間帯を載せたノートよりは良い。**
+
+    形式版 1（v5.18 以前。指紋を持たない配列）も一致しない扱いとする。
+    """
     try:
         document = json.loads(timeline_path(analysis_path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
-    if not isinstance(document, list):
+    if not isinstance(document, dict) or document.get("schema") != TIMELINE_SCHEMA:
+        return []
+    if document.get("transcript_sha256") != fingerprint:
+        return []
+    entries = document.get("blocks")
+    if not isinstance(entries, list):
         return []
     blocks: list[TimelineBlock] = []
-    for entry in document:
+    for entry in entries:
         if not isinstance(entry, dict):
             continue
         try:
