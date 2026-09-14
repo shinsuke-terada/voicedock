@@ -43,18 +43,18 @@ docker compose exec voicedock voicedock doctor   # コンテナ側（§19.2 の 
 
 | # | シナリオ | 判定 | 記録 |
 |---|---|---|---|
-| E2E-01 | 1 分程度の録音を 1 本。削除 OFF | ⬜ 未実施 | §3.1 |
+| E2E-01 | 1 分程度の録音を 1 本。削除 OFF | ✅ **PASS** | §3.1 |
 | E2E-02 | **コピー中に** USB を抜く | ✅ **PASS** | §3.2。**変換中ではない** — 変換は inbox から読むので USB と無関係 |
 | E2E-03 | Whisper 実行中に USB を抜く | ⬜ 未実施 | §3.3 |
 | E2E-04 | Obsidian Vault を一時的に利用不可にする | ⬜ 未実施 | §3.4 |
-| E2E-05 | 同じ Mic を再接続 | ⬜ 未実施 | §3.5 |
+| E2E-05 | 同じ Mic を再接続 | ✅ **PASS** | §3.5 |
 | E2E-06 | **1 日分（16 時間・32 Part 相当）を投入** | ⬜ 未実施 | §3.6。**P0-15b を兼ねる**（取り込み時間の実測） |
 | E2E-07 | **無音だけの Part を混ぜる** | ⬜ 未実施 | §3.7 |
 | E2E-08 | **1 本だけ Whisper を失敗させる** | ⬜ 未実施 | §3.8 |
-| E2E-09 | Daily ノート保存後に同じ日の Part を追加投入 | ⬜ 未実施 | §3.9 |
+| E2E-09 | Daily ノート保存後に同じ日の Part を追加投入 | ✅ **PASS** | §3.9 |
 | E2E-10 | 十分な試験後に削除を ON | ⬜ Phase 7 | §3.10 |
 | E2E-11 | Phase 7 移行時に後追いの一括削除 | ⬜ Phase 7 | §3.11 |
-| E2E-12 | Docker Desktop を再起動 | ⬜ 未実施 | §3.12 |
+| E2E-12 | Docker Desktop を再起動 | ✅ **PASS**（コンテナ再起動で実施） | §3.12 |
 
 **E2E-10 / E2E-11 は Phase 7 のものである**（#39 / #38）。
 §21.1 は「ND-01〜ND-31 と E2E-01〜E2E-12 の全件 PASS」を Phase 7 の前提としているが、
@@ -81,7 +81,43 @@ ls -1 "$OBSIDIAN_VAULT/Daily/Voice/Raw/"*/ "$OBSIDIAN_VAULT/Daily/Voice/Wiki/"*/
 ls -la "/Volumes/<VOL>/TX_.../"                     # ★元音声が残っていること
 ```
 
-判定: ⬜ 未実施
+#### 実測（2026-09-14 23:00。11 秒の録音 1 本）
+
+全段階のログが出た:
+
+```text
+23:00:20  stability_pending count=1
+23:00:26  copied relpath=.../TX00_MIC012_20260914_230003_orig.wav bytes=1648456
+23:00:29  part_discovered ... duration=11.22
+23:00:29  normalize_completed in_bytes=1648456 out_bytes=... elapsed_s=0.0
+23:00:53  transcription_completed chars=24 rtf=2.13 speech_ratio=0.826
+23:00:53  raw_note_saved session_key=DJIMIC3:20260914 parts=10
+23:00:53  session_merged parts=10 chars=18737
+23:03:15  analysis_trimmed fields="reduce: key_points: 22 -> 20"
+23:03:15  llm_completed chunks=6 elapsed_s=142.6
+23:03:15  obsidian_saved path="Daily/Voice/Wiki/20260914/2026-09-14 Voice.md"
+```
+
+**元音声は残っている**（デバイス上の 12 件はサイズ不変。§3.2 の一覧を参照）。
+
+#### 単一チャンクでも Timeline が生成されること
+
+**これは別の日のセッションで確認できる。**`DJIMIC3:20260912` は **1 Part・26 秒**で、
+`llm.analyze_session()` の**単一パス経路**（チャンク 1 個）を通る。
+
+```text
+parts: 1
+blocks: 1
+## Summary
+## Timeline
+### 16:34–16:34     ← **Map 中間結果が無くても見出しが出ている**
+## Key Points
+```
+
+§13.4 の代替経路（Block ごとに `summary` の各文を箇条書きにする）が働いている。
+**Timeline のためだけに LLM を再度呼んでいない。**
+
+判定: ✅ **PASS**
 
 ### 3.2 E2E-02 — コピー中に USB を抜く
 
@@ -217,7 +253,20 @@ grep -E 'already_known|import_skipped' "$VOICEDOCK_HOME/log/ingest.log"
 docker compose exec voicedock voicedock status        # ★件数が増えないこと
 ```
 
-判定: ⬜ 未実施
+#### 実測（2026-09-14。抜き挿しを 6 回以上）
+
+```text
+23:25:29  scanned name=DJIMIC3 files=12 candidates=0
+23:30:12  scanned name=DJIMIC3 files=12 candidates=0
+23:36:13  scanned name=DJIMIC3 files=12 candidates=3   ← 墓標を外した分だけ（E2E-02）
+23:39:13  scanned name=DJIMIC3 files=12 candidates=2   ← 抜いて失敗した分だけ
+23:44:55  scanned name=DJIMIC3 files=12 candidates=0
+```
+
+**`files=12` に対し `candidates=0`。**墓標（`.meta.json`）があるものは `stat` すら呼ばれない（§10.2）。
+Part の件数は **`COMPLETED: 12` のまま増えていない。**
+
+判定: ✅ **PASS**
 
 ### 3.6 E2E-06 — 1 日分（32 Part 相当）
 
@@ -271,7 +320,30 @@ docker compose logs voicedock | grep -E 'session_reopened|obsidian_saved'
 ls -1 "$OBSIDIAN_VAULT/Daily/Voice/Wiki/<日付>/"      # ★ (2) が増えていないこと
 ```
 
-判定: ⬜ 未実施
+#### 実測（2026-09-14。**4 回再オープンした**）
+
+`sessions` の行:
+
+```text
+('DJIMIC3:20260914', 'COMPLETED', part_count=10, regenerated_count=4, failed_part_count=0,
+ 'Daily/Voice/Wiki/20260914/2026-09-14 Voice.md')
+```
+
+Wiki フォルダ:
+
+```text
+$ ls -1 "$OBSIDIAN_VAULT/Daily/Voice/Wiki/20260914/"
+2026-09-14 Voice.md
+```
+
+**4 回作り直して 1 ファイルのまま。**` (2)` は生まれていない（§13.5 の同名衝突規則が
+`voicedock_session_key` の一致を見て上書きする）。
+
+> **この 4 回のうち 1 回で #108 が見つかった。**再オープンしても LLM 解析が
+> やり直されず、**`parts: 8` と書かれたノートの本文が 2 Part 分のまま**だった。
+> 修正後の再オープン（#112 の修正と合わせて）で、**9 Part 全部が載ったノートに直った。**
+
+判定: ✅ **PASS**
 
 ### 3.10 E2E-10 — 削除を ON（**Phase 7**）
 
@@ -301,7 +373,35 @@ docker compose logs voicedock | grep -E 'recovery_completed|service_started'
 docker compose exec voicedock voicedock status        # ★二重処理されていないこと
 ```
 
-判定: ⬜ 未実施
+#### 実測（2026-09-14）
+
+**途中状態からの再開**（22:21。`FAILED` のセッションが残っていた状態で再起動）:
+
+```text
+22:21:04  INFO  service_started version=0.1.0 schema_version=1
+22:21:04  INFO  recovery_completed requeued=1          ← FAILED を再投入した
+22:23:25  INFO  llm_completed session_key=DJIMIC3:20260914 chunks=5 elapsed_s=141.0
+22:23:25  INFO  obsidian_saved ... bytes=13402         ← 完走した
+```
+
+**二重処理しないこと**（23:48。すべて `COMPLETED` の状態で再起動）:
+
+```text
+23:48:30  INFO  service_stopping version=0.1.0
+23:48:30  INFO  service_started version=0.1.0 schema_version=1
+```
+
+| | 再起動前 | 再起動後 |
+|---|---|---|
+| Part `COMPLETED` | 12 | **12** |
+| Part `FAILED` | 0 | **0** |
+
+> **実施したのは `docker compose restart` である。**Docker Desktop 自体の終了・再起動は
+> **他のコンテナも巻き込む**ため行っていない。**コンテナから見れば同じ**
+> （プロセスが落ちて上がり、`/data` の SQLite から状態を読み直す）が、
+> **Docker Desktop の再起動そのものは E2E-06 の当日に併せて行うこと。**
+
+判定: ✅ **PASS**（上記の留保つき）
 
 ## 4. §21.3 MVP 完成条件
 
