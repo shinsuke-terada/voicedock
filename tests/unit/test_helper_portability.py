@@ -45,9 +45,9 @@ def bash_files() -> list[Path]:
     assert missing == [], f"静的検査の対象が足りない: {missing}"
 
     found = sorted((REPO_ROOT / "scripts").glob("*.sh"))
-    found += [p for p in sorted(HELPER_DIR.iterdir()) if p.is_file() and p.suffix != ".conf"]
-    # `.plist` は XML であって bash ではない
-    return [p for p in found if p.suffix not in {".plist"}]
+    found += [p for p in sorted(HELPER_DIR.iterdir()) if p.is_file()]
+    # `.plist` は XML、`.c` は C、`.conf` は設定。**いずれも bash ではない**
+    return [p for p in found if p.suffix not in {".plist", ".c", ".conf"}]
 
 
 def test_the_scan_picks_up_every_script() -> None:
@@ -62,6 +62,7 @@ def test_the_scan_picks_up_every_script() -> None:
         assert path in found, f"{path.name} が静的検査の対象から漏れている"
     missing = sorted(p.name for p in (REPO_ROOT / "scripts").glob("*.sh") if p not in found)
     assert missing == [], f"scripts/ のスクリプトが静的検査から漏れている: {missing}"
+    assert not any(p.suffix == ".c" for p in found), "C のソースを bash として検査している"
 
 
 def strip_comments(text: str) -> str:

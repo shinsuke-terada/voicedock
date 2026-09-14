@@ -48,6 +48,10 @@ resolve_home() {
 VD_HOME="$(resolve_home)"
 
 check_home() {
+    # **`/Users` 配下の制約は macOS（VirtioFS）のものである**（§4.1）。
+    # `doctor.sh` の同じ検査と揃えて Darwin に限る — そうしないと Linux 上の
+    # テストから `install.sh` を一度も走らせられない（挙動が検査できない）
+    [ "$(uname -s)" = "Darwin" ] || return 0
     case "$VD_HOME" in
         /Users/*) ;;
         *) die "VOICEDOCK_HOME は /Users 配下でなければなりません（VirtioFS の制約。§4.1）: $VD_HOME" ;;
@@ -105,6 +109,45 @@ install_ingest() {
     info "voicedock-ingest を配置しました: $VD_HOME/bin/"
 }
 
+# **launchd がシェルスクリプトを直接起動するとデバイスを読めない**（§3.4(7)）。
+# ad-hoc 署名した小さなラッパを挟むと通る。2026-09-14 に実機で A/B を取った（#95）。
+#
+# **失敗してもインストールは続ける。**Helper が入らないより、TCC 未解決でも
+# 入っているほうがましである。**ただし黙って通さない** — doctor の DH-16 が
+# 恒久的に検査し、`--status` にも出す。
+
+install_launcher() {           # 成功したら 0
+    local source="$HELPER_DIR/voicedock-ingest-launcher.c"
+    local target="$VD_HOME/bin/voicedock-ingest-launcher"
+
+    [ -f "$source" ] || { warn "ラッパのソースがありません: $source"; return 1; }
+
+    if ! command -v cc >/dev/null 2>&1; then
+        warn "cc が見つかりません。ラッパを作れません（Xcode Command Line Tools が要ります）"
+        warn "  → LaunchAgent は macOS の TCC でデバイスを読めません（§3.4(7)）。"
+        warn "  → xcode-select --install のあと ./helper/install.sh を再実行してください"
+        rm -f "$target"
+        return 1
+    fi
+
+    if ! cc -O2 -Wall -o "$target" "$source" 2>&1; then
+        warn "ラッパのビルドに失敗しました: $source"
+        rm -f "$target"
+        return 1
+    fi
+
+    # **ad-hoc 署名で足りる**（開発者証明書は要らない）。TCC は署名の有無を見る
+    if ! codesign -s - --force "$target" >/dev/null 2>&1; then
+        warn "ラッパの署名に失敗しました。TCC の許可が届きません"
+        rm -f "$target"
+        return 1
+    fi
+
+    chmod 755 "$target"
+    info "ラッパを作りました（ad-hoc 署名済み）: $target"
+    return 0
+}
+
 install_reaper() {
     # **黙って何もしてはならない。**「ロック 2-A を解除したつもり」の誤解を生む
     [ -f "$HELPER_DIR/voicedock-reaper" ] \
@@ -121,7 +164,37 @@ install_plist() {
     local template="$HELPER_DIR/$LABEL.plist"
     [ -f "$template" ] || die "$LABEL.plist がありません: $HELPER_DIR"
     mkdir -p "$PLIST_DIR"
-    sed "s|@VOICEDOCK_HOME@|$VD_HOME|g" "$template" > "$PLIST_PATH"
+
+    # **ラッパが在るときだけラッパ経由にする。**無いのに指すと launchd が起動に失敗し、
+    # 「取り込めない」ではなく「何も動かない」になる
+    local launcher=""
+    if [ -x "$VD_HOME/bin/voicedock-ingest-launcher" ]; then
+        launcher="$VD_HOME/bin/voicedock-ingest-launcher"
+    else
+        warn "ラッパ無しで配置します。**LaunchAgent はデバイスを読めません**（§3.4(7)）"
+    fi
+
+    # **行は awk に組み立てさせる。**`-v` に改行を含む値は渡せない（`newline in string`）。
+    # 渡そうとして plist を空にした事故がある（#95）
+    awk -v home="$VD_HOME" -v launcher="$launcher" -v script="$VD_HOME/bin/voicedock-ingest" '
+        { gsub(/@VOICEDOCK_HOME@/, home) }
+        /@PROGRAM_ARGUMENTS@/ {
+            if (launcher != "") printf "        <string>%s</string>\n", launcher
+            printf "        <string>%s</string>\n", script
+            next
+        }
+        { print }
+    ' "$template" > "$PLIST_PATH"
+
+    # **書けたことを確かめる。**空の plist を bootstrap すると LaunchAgent ごと死ぬ。
+    # `awk -v` に改行を含む値を渡そうとして実際に空にした事故がある（#95）
+    [ -s "$PLIST_PATH" ] || die "plist が空です: $PLIST_PATH"
+    grep -q "voicedock-ingest" "$PLIST_PATH" \
+        || die "plist に ProgramArguments が入っていません: $PLIST_PATH"
+    if command -v plutil >/dev/null 2>&1; then
+        plutil -lint "$PLIST_PATH" >/dev/null 2>&1 \
+            || die "plist が XML として壊れています: $PLIST_PATH"
+    fi
     info "plist を配置しました: $PLIST_PATH"
 
     # load / unload は非推奨。bootstrap / bootout を使う
@@ -162,6 +235,13 @@ status() {
         fi
     else
         printf 'helper.conf       : - (ingest が未配置)\n'
+    fi
+
+    # ラッパ（§3.4(7)）。**無いと LaunchAgent がデバイスを読めない**
+    if [ -x "$VD_HOME/bin/voicedock-ingest-launcher" ]; then
+        printf 'launcher          : installed（LaunchAgent は TCC の許可を受け取れます）\n'
+    else
+        printf 'launcher          : **MISSING** — LaunchAgent はデバイスを読めません（§3.4(7)）\n'
     fi
 
     # 安全ロック 2-A（§14.2）
@@ -206,9 +286,14 @@ main() {
         --uninstall)   uninstall ;;
         --help | -h)   usage ;;
         --with-reaper)
-            check_home; make_tree; write_conf; install_ingest; install_reaper; install_plist ;;
+            check_home; make_tree; write_conf; install_ingest
+            install_launcher || true
+            install_reaper; install_plist ;;
         "")
-            check_home; make_tree; write_conf; install_ingest; install_plist
+            check_home; make_tree; write_conf; install_ingest
+            # **失敗しても続ける**（install_launcher の註記）。plist 側が有無を見て決める
+            install_launcher || true
+            install_plist
             printf '\n'
             info "完了しました。./helper/install.sh --status で確認してください"
             info "voicedock-reaper は配置していません（安全ロック 2-A。§14.2）" ;;

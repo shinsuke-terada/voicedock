@@ -10,7 +10,7 @@
 # **検査のみを行い、ホスト設定は変更しない**（§19.2）。v3.1 は `setup.sh` と `doctor.sh` に
 # 同じ検査を二重に書いており、片方だけ更新して食い違う事故があった（§21.1 に一本化した）。
 #
-# 実行順は DH-1 → DH-10 → DH-13 → DH-12 → DH-15（前提が積み上がる順）。
+# 実行順は DH-1 → DH-10 → DH-13 → DH-12 → DH-16 → DH-15（前提が積み上がる順）。
 #
 # bash 3.2 で書く（macOS 同梱。§3.3）。`voicedock-ingest` と同じ制約に従う。
 
@@ -271,6 +271,44 @@ check_launch_agent() {
     fi
 }
 
+# --- DH-16: ラッパ（§3.4(7) / §19.2） -----------------------------------
+# **致命的。**launchd がシェルスクリプトを直接起動すると macOS の TCC でデバイスを
+# 読めず、**録音が 1 本も取り込まれない。**2026-09-14 に実機で A/B を取った（#95）:
+#
+#   plist の program = voicedock-ingest（スクリプト直接） → volume not listable
+#   plist の program = ラッパ（ad-hoc 署名済み）          → devices=1
+#
+# **症状は「デバイスが繋がっていない」と区別がつかない**ので、ここで名指しする。
+
+check_launcher() {
+    local home="$1"
+    local launcher="$home/bin/voicedock-ingest-launcher"
+
+    if [ ! -x "$launcher" ]; then
+        bad "Launcher" "ラッパがありません: $launcher"
+        cont "LaunchAgent は macOS の TCC でデバイスを読めません（§3.4(7)）"
+        cont "xcode-select --install のあと ./helper/install.sh を再実行してください"
+        return 1
+    fi
+
+    # **署名が要る。**未署名だと TCC が許可の付与先を決められない
+    if command -v codesign >/dev/null 2>&1 && ! codesign -v "$launcher" >/dev/null 2>&1; then
+        bad "Launcher" "ラッパが署名されていません: $launcher"
+        cont "./helper/install.sh を再実行してください（ad-hoc 署名し直します）"
+        return 1
+    fi
+
+    # **plist が実際にラッパを指しているか。**ラッパが在るだけでは意味が無い
+    local plist="$HOME/Library/LaunchAgents/$LAUNCH_LABEL.plist"
+    if [ -f "$plist" ] && ! grep -q "voicedock-ingest-launcher" "$plist"; then
+        bad "Launcher" "plist がラッパを経由していません: $plist"
+        cont "./helper/install.sh を再実行してください"
+        return 1
+    fi
+
+    ok "Launcher" "ad-hoc 署名済み、plist はラッパ経由"
+}
+
 # --- DH-15: compose に /Volumes と ports: が無い（§14.4 N-3 / N-13） ----
 
 check_compose_safety() {
@@ -315,6 +353,7 @@ main() {
     check_compose_config || status=1
     check_helper_conf || status=1
     check_launch_agent || status=1
+    check_launcher "$(resolve_home)" || status=1
     check_compose_safety || status=1
 
     printf '%s\n' "$SEPARATOR"
