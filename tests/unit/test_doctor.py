@@ -86,7 +86,7 @@ def healthy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **patch: Any) -> Pa
     write_heartbeat(
         tmp_path / "state",
         updated_at=NOW.isoformat(),
-        helper_version="5.4.0",
+        helper_version="5.5.0",
         mount_readonly=True,
         mount_mode="ro",
         # **三重ロックの 3 つを明示する。**省くと D-17 が `unknown` を出し、
@@ -128,7 +128,7 @@ def test_all_ok_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert lines[11] == f"[✓] {'LLM response':<21}ai/test-model  (4.1s, 12 tokens)"
     assert lines[12].startswith(f"[✓] {'Obsidian vault':<21}")
     assert "(readable, writable, folders exist)" in lines[12]
-    expected_helper = f"[✓] {'Helper':<21}running (last seen 0s ago, v5.4.0, mount=readOnly)"
+    expected_helper = f"[✓] {'Helper':<21}running (last seen 0s ago, v5.5.0, mount=readOnly)"
     assert lines[13].startswith(expected_helper)
     # D-18 の続き行（実効値の表示）
     assert lines[14].strip().startswith("INCLUDE_VOLUMES:")
@@ -598,7 +598,7 @@ def test_d13_checks_an_existing_output_folder(
 
 def test_d18_reports_a_running_helper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     out, code = run(healthy(tmp_path, monkeypatch), tmp_path / "state")
-    assert f"[✓] {'Helper':<21}running (last seen 0s ago, v5.4.0, mount=readOnly)" in out
+    assert f"[✓] {'Helper':<21}running (last seen 0s ago, v5.5.0, mount=readOnly)" in out
     assert "INCLUDE_VOLUMES:" in out
     assert "EXCLUDE_VOLUMES:" in out
     assert code == EXIT_OK
@@ -622,7 +622,7 @@ def test_d18_fails_on_a_stale_heartbeat(tmp_path: Path, monkeypatch: pytest.Monk
     """
     path = healthy(tmp_path, monkeypatch)
     old = NOW - timedelta(seconds=99999)
-    write_heartbeat(tmp_path / "state", updated_at=old.isoformat(), helper_version="5.4.0")
+    write_heartbeat(tmp_path / "state", updated_at=old.isoformat(), helper_version="5.5.0")
     out, code = run(path, tmp_path / "state")
     assert "[✗] Helper" in out
     assert "stale" in out
@@ -652,7 +652,7 @@ def test_d18_shows_the_effective_volume_lists(
     write_heartbeat(
         tmp_path / "state",
         updated_at=NOW.isoformat(),
-        helper_version="5.4.0",
+        helper_version="5.5.0",
         mount_readonly=True,
         include_volumes=["DJIMIC3"],
         exclude_volumes=["Macintosh HD"],
@@ -709,7 +709,7 @@ def test_d17_matches_the_spec_enabled_example(
     write_heartbeat(
         tmp_path / "state",
         updated_at=NOW.isoformat(),
-        helper_version="5.4.0",
+        helper_version="5.5.0",
         delete_source_audio=True,
         reaper_installed=True,
         mount_readonly=False,

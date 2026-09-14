@@ -363,12 +363,51 @@ def test_a_running_helper_is_reported(cfg: Config, state_root: Path) -> None:
         updated_at=(NOW - timedelta(seconds=42)).isoformat(),
         helper_version="5.2.0",
         mount_mode="ro",
+        mount_readonly=True,
     )
     value = row_value(text(cfg, state_root), "Helper")
     assert value.startswith("running")
     assert "42s ago" in value
     assert "5.2.0" in value
-    assert "mount=ro" in value
+    assert "mount=readOnly" in value
+    assert "MOUNT_MODE=ro" in value
+
+
+@pytest.mark.parametrize(
+    ("mount_readonly", "expected"),
+    [(True, "readOnly"), (False, "writable"), (None, status.UNKNOWN)],
+)
+def test_the_helper_row_shows_the_observed_mount(
+    cfg: Config, state_root: Path, mount_readonly: bool | None, expected: str
+) -> None:
+    """`mount=` は**実測**である（#107）。
+
+    2026-09-14 の実機で、`status` が `mount=ro`（設定の意図）と表示している間に
+    `doctor` が `mount=writable`（実測）と表示していた。**同じラベルで逆のことを
+    言っていた**。毎日見るのは `status` の方である。
+    """
+    write_heartbeat(
+        state_root,
+        updated_at=NOW.isoformat(),
+        mount_mode="ro",
+        mount_readonly=mount_readonly,
+    )
+    assert f"mount={expected}" in row_value(text(cfg, state_root), "Helper")
+
+
+def test_the_helper_row_shows_the_intent_next_to_the_observation(
+    cfg: Config, state_root: Path
+) -> None:
+    """**食い違いが見えること。**食い違い自体が異常の徴候である（#107）。"""
+    write_heartbeat(
+        state_root,
+        updated_at=NOW.isoformat(),
+        mount_mode="ro",
+        mount_readonly=False,
+    )
+    value = row_value(text(cfg, state_root), "Helper")
+    assert "mount=writable" in value
+    assert "MOUNT_MODE=ro" in value
 
 
 def test_a_stale_helper_is_reported(cfg: Config, state_root: Path) -> None:
