@@ -72,7 +72,7 @@ def sandbox(tmp_path: Path) -> dict[str, Path]:
     return {"repo": repo, "home": home, "bin": bin_dir, "tmp": tmp_path}
 
 
-def run(sandbox: dict[str, Path], *args: str) -> subprocess.CompletedProcess[str]:
+def run(sandbox: dict[str, Path], *args: str, **env: str) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
     environment.update(
         {
@@ -81,6 +81,7 @@ def run(sandbox: dict[str, Path], *args: str) -> subprocess.CompletedProcess[str
             "VOICEDOCK_HOME": str(sandbox["home"] / "VoiceDock"),
         }
     )
+    environment.update(env)
     return subprocess.run(  # noqa: S603 - argv はリスト。shell=True を使わない
         ["/bin/bash", str(sandbox["repo"] / "helper" / "install.sh"), *args],
         capture_output=True,
@@ -133,20 +134,25 @@ def test_codesign_is_actually_called(sandbox: dict[str, Path]) -> None:
 # --- `cc` が無いとき（退避） ---------------------------------------------
 
 
+NO_COMPILER = {"VOICEDOCK_CC": "definitely-not-a-compiler"}
+"""**`PATH` から `cc` を消す形では作れない。**CI のランナーには本物の `cc` が在り、
+偽物を消すと `/usr/bin/cc` が見つかってしまう（`shutil.which` で同じ誤りをして CI で落ちた）。
+`install.sh` の差し替え口を使う。
+"""
+
+
 def test_install_succeeds_without_a_compiler(sandbox: dict[str, Path]) -> None:
     """**陰性対照。**`cc` が無くてもインストールは成功する。
 
     Helper が入らないより、TCC 未解決でも入っているほうがましである。
     """
-    (sandbox["bin"] / "cc").unlink()
-    result = run(sandbox)
+    result = run(sandbox, **NO_COMPILER)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_a_missing_compiler_is_warned_about_loudly(sandbox: dict[str, Path]) -> None:
     """**黙って通さない。**何をすれば直るかまで書く。"""
-    (sandbox["bin"] / "cc").unlink()
-    result = run(sandbox)
+    result = run(sandbox, **NO_COMPILER)
     combined = result.stdout + result.stderr
     assert "cc が見つかりません" in combined, combined
     assert "xcode-select --install" in combined, "直し方を示す"
@@ -158,8 +164,7 @@ def test_the_plist_falls_back_to_the_script(sandbox: dict[str, Path]) -> None:
 
     「取り込めない」より悪い状態なので、退避時はスクリプト直接にする。
     """
-    (sandbox["bin"] / "cc").unlink()
-    run(sandbox)
+    run(sandbox, **NO_COMPILER)
     args = program_arguments(sandbox)
     assert len(args) == 1, args
     assert args[0].endswith("voicedock-ingest"), args
