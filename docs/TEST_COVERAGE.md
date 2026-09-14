@@ -52,7 +52,8 @@
 | 通しフロー（inbox → 変換 → Whisper → Raw → merge → LLM → Daily → 保存検証） | `tests/integration/test_pipeline_flow.py` |
 | ネットワークを使わないこと（§14.5 / §14.4 N-7） | `tests/unit/test_no_network.py`（遮断は `tests/conftest.py` の `no_network` が autouse で掛ける） |
 | 偽 inbox / 偽ボリュームの組み立て | `tests/unit/test_fake_tree.py` `tests/unit/test_make_wav.py` |
-| ホスト側 doctor（§19.2 の DH 表 5 件） | `tests/unit/test_doctor_host.py`（`docker` / `launchctl` は `PATH` の偽物に差し替える） |
+| ホスト側 doctor（§19.2 の DH 表 6 件） | `tests/unit/test_doctor_host.py`（`docker` / `launchctl` は `PATH` の偽物に差し替える） |
+| Helper の配備（ラッパのビルドと署名、plist の中身。§3.4(7)） | `tests/unit/test_helper_install.py`（`cc` / `codesign` / `launchctl` は `PATH` の偽物に差し替える） |
 | 削除禁止 ND-01〜17 / 21〜23 / 30 / 31（コンテナ層。§20.4） | `tests/unit/test_no_delete.py`（CI の `no-delete` job で必須） |
 | 削除禁止 ND-18〜20 / 24〜29（reaper 層。§20.4） | `tests/unit/test_reaper.py`（CI の `no-delete` job で必須） |
 | reaper 本体（§14.1.1 の 12 項目） | `tests/unit/test_reaper.py` `tests/unit/test_helper_portability.py` |

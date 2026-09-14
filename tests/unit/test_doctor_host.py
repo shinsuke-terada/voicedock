@@ -86,6 +86,12 @@ def host(tmp_path: Path) -> dict[str, Path]:
         '{\n  "UseVirtualizationFramework": true,\n  "AutoStart": false\n}\n', encoding="utf-8"
     )
 
+    # **ラッパ（§3.4(7) / DH-16）。**実機では `cc` が作る Mach-O だが、
+    # ここは「在って実行可能で、plist が経由していること」だけを見るので中身は問わない
+    launcher = home / "bin" / "voicedock-ingest-launcher"
+    launcher.write_text('#!/bin/sh\nexec "$@"\n', encoding="utf-8")
+    launcher.chmod(0o755)
+
     ingest = home / "bin" / "voicedock-ingest"
     ingest.write_bytes(INGEST.read_bytes())
     ingest.chmod(0o755)
@@ -155,11 +161,15 @@ def rows(output: str) -> list[str]:
 # --- 全体（§19.2 の出力の形） -------------------------------------------
 
 
-def test_the_host_checks_are_five_rows(host: dict[str, Path]) -> None:
-    """**DH は 5 件である**（§19.2）。削った検査を勝手に足さない。"""
+def test_the_host_checks_are_six_rows(host: dict[str, Path]) -> None:
+    """**DH は 6 件である**（§19.2）。削った検査を勝手に足さない。
+
+    v5.14 で DH-16（ラッパ）が増えた。**ラッパが無いと録音が 1 本も取り込まれない**
+    のに、症状は「デバイスが繋がっていない」と区別がつかない（#95）。
+    """
     result = run(host)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert len(rows(result.stdout)) == 5, result.stdout
+    assert len(rows(result.stdout)) == 6, result.stdout
 
 
 LABELS: tuple[str, ...] = (
@@ -167,6 +177,7 @@ LABELS: tuple[str, ...] = (
     "Compose config",
     "Helper config",
     "LaunchAgent",
+    "Launcher",
     "Compose safety",
 )
 """DH の 5 行のラベル。**順序も §19.2 の実行順（DH-1 → 10 → 13 → 12 → 15）である。**"""
@@ -213,7 +224,7 @@ def _label_of(line: str) -> str:
 
 def test_the_summary_counts_the_rows(host: dict[str, Path]) -> None:
     result = run(host)
-    assert "5 checks passed, 0 failed, 0 notices" in result.stdout, result.stdout
+    assert "6 checks passed, 0 failed, 0 notices" in result.stdout, result.stdout
 
 
 # --- DH-1: Apple Virtualization Framework(§3.2) -------------------------
@@ -391,6 +402,64 @@ def test_dh12_is_skipped_without_launchctl(host: dict[str, Path], tmp_path: Path
     assert result.returncode == 0
 
 
+# --- DH-16: ラッパ（§3.4(7)） -------------------------------------------
+
+
+def test_dh16_fails_when_the_launcher_is_missing(host: dict[str, Path]) -> None:
+    """**ラッパが無いと録音が 1 本も取り込まれない**（§3.4(7)）。
+
+    launchd がシェルスクリプトを直接起動すると macOS の TCC でデバイスを読めない。
+    **症状は「デバイスが繋がっていない」と区別がつかない**ので、doctor が名指しする。
+    """
+    (host["home"] / "bin" / "voicedock-ingest-launcher").unlink()
+    result = run(host)
+    assert result.returncode == EXIT_DOCTOR_FATAL
+    assert "ラッパがありません" in result.stdout
+    assert "TCC" in result.stdout, "原因を名指しすること"
+
+
+def test_dh16_fails_when_the_launcher_is_not_executable(host: dict[str, Path]) -> None:
+    """**在るだけでは足りない。**launchd は実行できなければ起動に失敗する。"""
+    (host["home"] / "bin" / "voicedock-ingest-launcher").chmod(0o644)
+    result = run(host)
+    assert result.returncode == EXIT_DOCTOR_FATAL
+    assert "ラッパがありません" in result.stdout
+
+
+def test_dh16_fails_when_the_plist_bypasses_the_launcher(host: dict[str, Path]) -> None:
+    """**ラッパが在っても plist が経由していなければ意味が無い。**
+
+    `install.sh` を古い版で走らせた後にラッパだけ置いた、という状態がこれである。
+    """
+    agents = host["home"].parent / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True, exist_ok=True)
+    (agents / "com.voicedock.ingest.plist").write_text(
+        "<plist><dict><key>ProgramArguments</key><array>"
+        f"<string>{host['home']}/bin/voicedock-ingest</string>"
+        "</array></dict></plist>\n",
+        encoding="utf-8",
+    )
+    result = run(host)
+    assert result.returncode == EXIT_DOCTOR_FATAL
+    assert "plist がラッパを経由していません" in result.stdout
+
+
+def test_dh16_passes_when_the_plist_goes_through_the_launcher(host: dict[str, Path]) -> None:
+    """陰性対照。**正しい plist なら通ること。**何でも落ちる検査では意味が無い。"""
+    agents = host["home"].parent / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True, exist_ok=True)
+    (agents / "com.voicedock.ingest.plist").write_text(
+        "<plist><dict><key>ProgramArguments</key><array>"
+        f"<string>{host['home']}/bin/voicedock-ingest-launcher</string>"
+        f"<string>{host['home']}/bin/voicedock-ingest</string>"
+        "</array></dict></plist>\n",
+        encoding="utf-8",
+    )
+    result = run(host)
+    assert result.returncode == 0, result.stdout
+    assert "[✓] Launcher" in result.stdout
+
+
 # --- DH-15: /Volumes と ports:（§14.4 N-3 / N-13） ----------------------
 
 
@@ -461,13 +530,13 @@ def spec_dh_ids() -> set[str]:
 
 
 def test_the_host_checks_match_the_spec_count() -> None:
-    """§19.2 の DH 表が 5 件で、`doctor.sh` が全部の ID に触れていること。
+    """§19.2 の DH 表が 6 件で、`doctor.sh` が全部の ID に触れていること。
 
-    **件数のずれが最も危ない**（#55 の振り返り）。SPEC に DH-16 を足して実装を忘れると、
+    **件数のずれが最も危ない**（#55 の振り返り）。SPEC に DH-17 を足して実装を忘れると、
     **検査が足りないまま「総仕上げ完了」になる。**
     """
     listed = spec_dh_ids()
-    assert listed == {"DH-1", "DH-10", "DH-12", "DH-13", "DH-15"}, sorted(listed)
+    assert listed == {"DH-1", "DH-10", "DH-12", "DH-13", "DH-15", "DH-16"}, sorted(listed)
 
     body = DOCTOR.read_text(encoding="utf-8")
     missing = [name for name in listed if name not in body]
