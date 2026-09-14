@@ -158,7 +158,8 @@ def _context(
         updated_at=(now - timedelta(seconds=3600 if stale else 10)).isoformat(),
         **{k: v for k, v in overrides.items() if k in _HEARTBEAT_KEYS},
     )
-    monkeypatch.setenv("VOICEDOCK_LLM_URL", "http://model-runner.docker.internal/engines/v1")
+    # **Compose 5.5.1 が実際に注入する形**（docs/POC.md §11.1.1）
+    monkeypatch.setenv("VOICEDOCK_LLM_URL", "http://model-runner.docker.internal/v1/")
     monkeypatch.setenv("VOICEDOCK_LLM_MODEL", "qwen3-30b-a3b")
 
     cfg = _config(tmp_path, whisper, model)
