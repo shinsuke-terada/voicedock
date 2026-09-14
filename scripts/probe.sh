@@ -204,12 +204,14 @@ EOF
 
 report_p0_8() {            # $1=heartbeat, $2=conf, $3=件数, $4...=devices
     local heartbeat="$1" conf="$2" count="$3"; shift 3
-    local reported observed="true" state name absent=0
+    local reported observed="true" state name absent=0 mode
 
     printf '## P0-8 マウントモードと heartbeat の一致\n\n'
 
+    mode="$(conf_value "$conf" MOUNT_MODE)"
+    [ -n "$mode" ] || mode="unknown"
     reported="$(json_bool "$heartbeat" mount_readonly)"
-    printf -- '- `helper.conf` の `MOUNT_MODE` : `%s`\n' "$(conf_value "$conf" MOUNT_MODE)"
+    printf -- '- `helper.conf` の `MOUNT_MODE` : `%s`\n' "$mode"
     printf -- '- `heartbeat.json` の `mount_readonly` : `%s`\n' "$reported"
     printf -- '- `heartbeat.json` の `updated_at` : `%s`\n\n' "$(json_scalar "$heartbeat" updated_at)"
 
@@ -242,6 +244,22 @@ report_p0_8() {            # $1=heartbeat, $2=conf, $3=件数, $4...=devices
 
     printf -- '- `mount` からの観測 : `%s`（デバイス %s 個の論理積）\n' "$observed" "$count"
 
+# ロック 2-B が実際にどうなっているかを 1 行で述べる（§14.2）。
+#
+# **一致しているかどうかとは別の問いである。**`MOUNT_MODE=ro` を意図したのに
+# 書き込み可能なら、一致していても**保護はされていない。**
+lock_2b_line() {           # $1=観測（true/false）, $2=helper.conf の MOUNT_MODE
+    if [ "$1" = "true" ]; then
+        printf -- '- ロック 2-B: **効いている**（デバイスは読み取り専用）\n\n'
+    elif [ "$2" = "rw" ]; then
+        printf -- '- ロック 2-B: **外れている**（`MOUNT_MODE=rw` の意図どおり。Phase 7 の状態）\n\n'
+    else
+        # **`%s` と引数を同じ printf に置く。**分けると `%s` が空で出る（実機で踏んだ）
+        printf -- '- ロック 2-B: ⚠ **かかっていない** — `MOUNT_MODE=%s` を意図したが' "$2"
+        printf -- 'デバイスは書き込み可能である。**再マウントが成功していない**\n\n'
+    fi
+}
+
     # **`heartbeat.json` が読めないときは「不明」として扱い、FAIL にしない**（§7.5）。
     # Helper が一度も走っていないだけかもしれず、それは実装のバグではない
     if [ "$reported" = "unknown" ]; then
@@ -251,7 +269,12 @@ report_p0_8() {            # $1=heartbeat, $2=conf, $3=件数, $4...=devices
     fi
 
     if [ "$reported" = "$observed" ]; then
-        printf -- '- 判定: ✅ **PASS** — 一致した（ロック 2-B が実際に効いている。§14.2）\n\n'
+        printf -- '- 判定: ✅ **PASS** — `mount` と `heartbeat.json` が一致した\n'
+        # **一致と「ロックが効いている」は別の問いである。**v5.19 までは一致しさえすれば
+        # 「ロック 2-B が実際に効いている」と書いていた。2026-09-14 の実機で、
+        # `MOUNT_MODE=ro` なのにデバイスが書き込み可能なまま **✅ PASS と表示した**
+        # （`docs/POC.md` §10.1.2）。**保護されていないことを保護されていると読ませていた**
+        lock_2b_line "$observed" "$mode"
     else
         printf -- '- 判定: ✗ **FAIL** — `mount`=`%s` に対し `heartbeat.json`=`%s`。**一致しないなら実装のバグである**\n\n' \
             "$observed" "$reported"
