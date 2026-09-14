@@ -33,16 +33,19 @@ MODEL_KEY = "summarizer"
 
 
 def compose_document() -> dict[str, Any]:
-    return yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    document: dict[str, Any] = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    return document
 
 
 def spec_compose() -> dict[str, Any]:
     """§18.2 の `yaml` ブロック（規範）。"""
-    return yaml.safe_load(spec_section_code("18.2", "yaml"))
+    document: dict[str, Any] = yaml.safe_load(spec_section_code("18.2", "yaml"))
+    return document
 
 
 def config_example() -> dict[str, Any]:
-    return yaml.safe_load(CONFIG_EXAMPLE.read_text(encoding="utf-8"))
+    document: dict[str, Any] = yaml.safe_load(CONFIG_EXAMPLE.read_text(encoding="utf-8"))
+    return document
 
 
 # --- 注入する側と読む側の名前が一致すること -----------------------------
