@@ -194,7 +194,6 @@ def test_raw_note_is_skipped_when_already_done(
     [
         ("ensure_normalized_audio", PartStatus.FAILED),
         ("ensure_normalized_audio", PartStatus.SKIPPED),
-        ("ensure_normalized_audio", PartStatus.NORMALIZING),
         ("ensure_part_transcript", PartStatus.DISCOVERED),
         ("ensure_part_transcript", PartStatus.FAILED),
         ("ensure_raw_note", PartStatus.NORMALIZED),
@@ -204,10 +203,16 @@ def test_raw_note_is_skipped_when_already_done(
 def test_a_wrong_state_does_not_advance(
     runner: Pipeline, database: Database, stage: str, state: str
 ) -> None:
-    """**手前の状態でなければ進めない。**
+    """**手前の状態でなければ進めない。**`FAILED` / `SKIPPED` の再投入は §15.2 の契機が行う。
 
-    `FAILED` の再投入は §15.2（#32）、`NORMALIZING` は §9.4 の巻き戻しが扱う。
-    **ここで勝手に進めると、巻き戻し前の部分出力を「完了」として扱いうる。**
+    **進行中状態（`NORMALIZING` / `TRANSCRIBING` / `RAW_WRITING`）はここに書かない。**
+    v5.25 までは `NORMALIZING` を「§9.4 の巻き戻しが扱う」として弾いていたが、
+    **巻き戻しは起動時の 1 回だけである。**工程内リトライ（§15.2）の戻り先でもあるので、
+    弾くと**戻した先に受け手がいなくなり、Part が永久に座る**（2026-09-15 に実機で
+    13 分座った。#123）。受け付けることは `test_part_resume.py` が固定している。
+
+    **「巻き戻し前の部分出力を完了として扱う」懸念は `audio.normalize()` が担う** —
+    出力を検証して再利用する冪等判定であり、壊れていれば作り直す。
     """
     record = add_part(database, state=state)
     assert getattr(runner, stage)(record) is False
