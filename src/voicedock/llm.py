@@ -29,6 +29,7 @@ from typing import Any, Final
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
+from pydantic.fields import FieldInfo
 
 from voicedock.config import AnalysisConfig, Config, LlmConfig, SectionConfig
 from voicedock.errors import ErrorCode
@@ -448,6 +449,8 @@ class AnalyzeResult:
     elapsed_seconds: float = 0.0
     repairs: int = 0
     """repair を試した回数。0 なら 1 回目で通った。"""
+    trimmed: tuple[str, ...] = ()
+    """宣言された上限へ切り詰めた項目（`"tags: 20 -> 15"`）。**黙って切らない**（§12.2）。"""
 
     @property
     def ok(self) -> bool:
@@ -496,9 +499,14 @@ def analyze(
 
     raw = completion.content or ""
     for attempt in range(cfg.llm.repair_attempts + 1):
-        validated, failure = _validate(raw, model)
+        validated, failure, trimmed = _validate(raw, model)
         if validated is not None:
-            return AnalyzeResult(analysis=validated, elapsed_seconds=elapsed, repairs=attempt)
+            return AnalyzeResult(
+                analysis=validated,
+                elapsed_seconds=elapsed,
+                repairs=attempt,
+                trimmed=trimmed,
+            )
         if attempt == cfg.llm.repair_attempts:
             return AnalyzeResult(
                 analysis=None,
@@ -506,6 +514,7 @@ def analyze(
                 error_message=failure,
                 elapsed_seconds=elapsed,
                 repairs=attempt,
+                trimmed=trimmed,
             )
         # **transcript 本文を再送しない**（§12.3）
         retry = complete(
@@ -535,15 +544,63 @@ def analyze(
     )
 
 
-def _validate(raw: str, model: type[BaseModel]) -> tuple[BaseModel | None, str]:
-    """抽出 → Pydantic 検証。失敗したら `(None, エラー説明)`。"""
+def _validate(raw: str, model: type[BaseModel]) -> tuple[BaseModel | None, str, tuple[str, ...]]:
+    """抽出 → **上限へ寄せる** → Pydantic 検証。失敗したら `(None, エラー説明, 切り詰め)`。"""
     document = extract_json(raw)
     if document is None:
-        return None, "応答から JSON を抽出できませんでした"
+        return None, "応答から JSON を抽出できませんでした", ()
+    document, trimmed = coerce_limits(document, model)
     try:
-        return model.model_validate(document), ""
+        return model.model_validate(document), "", trimmed
     except ValidationError as exc:
-        return None, _errors_of(exc)
+        return None, _errors_of(exc), trimmed
+
+
+def coerce_limits(
+    document: dict[str, object], model: type[BaseModel]
+) -> tuple[dict[str, object], tuple[str, ...]]:
+    """宣言された上限へ寄せる（§12.2）。**切り詰めた項目の説明を返す。**
+
+    **件数や文字数の上限は表示の都合であり、記録の正しさではない。**タグを 15 個に
+    切っても失われるものは無いが、**超過を理由に 1 日分の解析を捨てるのは記録の破壊**
+    である（§1.3）。2026-09-14 の実機で、**タグ 5 個の超過で 3 時間 47 分ぶんが
+    失われた**（#112）。
+
+    **修復を待たない。**§12.3 の修復は長さの超過には効かなかった（実機）。Reduce 段の
+    プロンプトは 18,000 字級であり、**大きなプロンプトを 2 回投げてたいてい直らない。**
+
+    **上限はスキーマから読む。**`cfg` を引き回すと設定とスキーマの 2 箇所に上限が散り、
+    また食い違う。`build_schema()` が `cfg` から作っているので、そこが唯一の出所である。
+
+    **`min_length` は扱わない。**足りないものは作れない。空の `summary` は本当に情報が
+    無い場合であり、修復へ回してよい。
+    """
+    result = dict(document)
+    notes: list[str] = []
+    for name, field in model.model_fields.items():
+        limit = _max_len_of(field)
+        if limit is None or name not in result:
+            continue
+        value = result[name]
+        if not isinstance(value, (list, str)) or len(value) <= limit:
+            continue
+        notes.append(f"{name}: {len(value)} -> {limit}")
+        result[name] = value[:limit]
+    return result, tuple(notes)
+
+
+def _max_len_of(field: FieldInfo) -> int | None:
+    """フィールドの上限。
+
+    **`annotated_types` を import しない。**pydantic の間接依存であり、直接使うなら
+    依存として宣言しなければならない。制約は `max_length` 属性を持つので、
+    **属性で見れば足りる**（`MinLen` は `min_length` なので取り違えない）。
+    """
+    for constraint in field.metadata:
+        value = getattr(constraint, "max_length", None)
+        if value is not None:
+            return int(value)
+    return None
 
 
 def _errors_of(exc: ValidationError) -> str:
@@ -745,6 +802,8 @@ class SessionAnalysis:
     error_message: str | None = None
     elapsed_seconds: float = 0.0
     reduce_depth: int = 0
+    trimmed: tuple[str, ...] = ()
+    """宣言された上限へ切り詰めた項目（§12.2）。**黙って切らない** — 呼び手がログに出す。"""
 
     @property
     def ok(self) -> bool:
@@ -799,10 +858,12 @@ def analyze_session(
             error_code=single.error_code,
             error_message=single.error_message,
             elapsed_seconds=single.elapsed_seconds,
+            trimmed=single.trimmed,
         )
 
     elapsed = 0.0
     partials: list[BaseModel] = []
+    trimmed: list[str] = []
     for chunk in chunks:
         mapped = analyze(
             chunk.text, cfg=cfg, kind=PromptKind.MAP, endpoint=endpoint, client=client, env=env
@@ -816,7 +877,9 @@ def analyze_session(
                 error_code=mapped.error_code,
                 error_message=mapped.error_message,
                 elapsed_seconds=elapsed,
+                trimmed=tuple(trimmed),
             )
+        trimmed += [f"map: {note}" for note in mapped.trimmed]
         partials.append(mapped.analysis)
 
     reduced = reduce_phase(partials, cfg=cfg, endpoint=endpoint, client=client, env=env)
@@ -828,6 +891,7 @@ def analyze_session(
         error_message=reduced.error_message,
         elapsed_seconds=elapsed + reduced.elapsed_seconds,
         reduce_depth=reduced.reduce_depth,
+        trimmed=tuple(trimmed) + reduced.trimmed,
     )
 
 
@@ -838,6 +902,7 @@ class ReduceResult:
     error_message: str | None = None
     elapsed_seconds: float = 0.0
     reduce_depth: int = 0
+    trimmed: tuple[str, ...] = ()
 
 
 def reduce_phase(
@@ -868,6 +933,7 @@ def reduce_phase(
             error_message=final.error_message,
             elapsed_seconds=final.elapsed_seconds,
             reduce_depth=depth,
+            trimmed=tuple(f"reduce: {note}" for note in final.trimmed),
         )
 
     if depth >= REDUCE_MAX_DEPTH:
@@ -881,6 +947,7 @@ def reduce_phase(
 
     elapsed = 0.0
     folded: list[BaseModel] = []
+    folded_trimmed: list[str] = []
     for bundle in _bundles(partials, cfg.llm.max_chars_per_request):
         mapped = analyze(
             _as_json(bundle),
@@ -898,7 +965,9 @@ def reduce_phase(
                 error_message=mapped.error_message,
                 elapsed_seconds=elapsed,
                 reduce_depth=depth,
+                trimmed=tuple(folded_trimmed),
             )
+        folded_trimmed += [f"reduce{depth}: {note}" for note in mapped.trimmed]
         folded.append(mapped.analysis)
 
     deeper = reduce_phase(
@@ -910,6 +979,7 @@ def reduce_phase(
         error_message=deeper.error_message,
         elapsed_seconds=elapsed + deeper.elapsed_seconds,
         reduce_depth=deeper.reduce_depth,
+        trimmed=tuple(folded_trimmed) + deeper.trimmed,
     )
 
 
