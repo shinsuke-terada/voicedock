@@ -66,7 +66,11 @@ transcription:
   executable: /usr/local/bin/whisper-cli
   model: /models/whisper/ggml-large-v3-turbo-q5_0.bin
   language: ja
-  threads: 6                     # 0 で自動（nproc と 8 の小さい方）
+  # **0（自動）を既定とする。**`min(nproc, 8)` に解決する。
+  # 2026-09-14 の実測（26.0 分の音声 / VAD 有効。docs/POC.md §12.3）:
+  #   threads 4 → 303.1 秒 / 6 → 209.6 秒 / 7 → 176.0 秒
+  # **頭打ちが無く、4→7 で 1.72 倍とほぼ線形に効く。**機械の CPU 数を焼き込まない
+  threads: 0                     # 0 で自動（nproc と 8 の小さい方）
   # タイムアウト = clamp(duration × factor, min, max)
   timeout_factor: 3.0
   min_timeout_seconds: 600
