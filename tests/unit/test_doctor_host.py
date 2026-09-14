@@ -71,6 +71,28 @@ def helper_conf_text(*, volumes: Path, home: Path) -> str:
     return text
 
 
+def write_plist(tmp_path: Path, *, start_interval: int, through_launcher: bool, home: Path) -> Path:
+    """`~/Library/LaunchAgents/com.voicedock.ingest.plist` を組み立てる。
+
+    **`StartInterval` は DH-17 が読む**（`helper_heartbeat_max_age_seconds` との関係）。
+    """
+    agents = tmp_path / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True, exist_ok=True)
+    programs = [f"{home}/bin/voicedock-ingest"]
+    if through_launcher:
+        programs.insert(0, f"{home}/bin/voicedock-ingest-launcher")
+    entries = "".join(f"<string>{p}</string>" for p in programs)
+    path = agents / "com.voicedock.ingest.plist"
+    path.write_text(
+        "<plist><dict>"
+        f"<key>ProgramArguments</key><array>{entries}</array>"
+        f"<key>StartInterval</key><integer>{start_interval}</integer>"
+        "</dict></plist>\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 @pytest.fixture
 def host(tmp_path: Path) -> dict[str, Path]:
     """DH-1〜DH-15 が全部通る状態のホストを組み立てる。"""
@@ -108,6 +130,14 @@ def host(tmp_path: Path) -> dict[str, Path]:
     (repo / "scripts" / "doctor.sh").write_bytes(DOCTOR.read_bytes())
     (repo / "scripts" / "doctor.sh").chmod(0o755)
     (repo / ".env").write_text(f"OBSIDIAN_VAULT={vault}\nVOICEDOCK_HOME={home}\n", encoding="utf-8")
+
+    # DH-17: `config.yaml` と plist の両方が要る。**既定は正しい関係**にしておき、
+    # 個々のテストが崩す（何でも落ちる検査にしないため）
+    (repo / "config").mkdir(parents=True, exist_ok=True)
+    (repo / "config" / "config.yaml").write_text(
+        "import:\n  helper_heartbeat_max_age_seconds: 900\n", encoding="utf-8"
+    )
+    write_plist(tmp_path, start_interval=300, through_launcher=True, home=home)
 
     bin_dir = tmp_path / "bin"
     config = COMPOSE_CONFIG.format(vault=vault, inbox=home / "inbox")
@@ -161,15 +191,15 @@ def rows(output: str) -> list[str]:
 # --- 全体（§19.2 の出力の形） -------------------------------------------
 
 
-def test_the_host_checks_are_six_rows(host: dict[str, Path]) -> None:
-    """**DH は 6 件である**（§19.2）。削った検査を勝手に足さない。
+def test_the_host_checks_are_seven_rows(host: dict[str, Path]) -> None:
+    """**DH は 7 件である**（§19.2）。削った検査を勝手に足さない。
 
     v5.14 で DH-16（ラッパ）が増えた。**ラッパが無いと録音が 1 本も取り込まれない**
     のに、症状は「デバイスが繋がっていない」と区別がつかない（#95）。
     """
     result = run(host)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert len(rows(result.stdout)) == 6, result.stdout
+    assert len(rows(result.stdout)) == 7, result.stdout
 
 
 LABELS: tuple[str, ...] = (
@@ -178,6 +208,7 @@ LABELS: tuple[str, ...] = (
     "Helper config",
     "LaunchAgent",
     "Launcher",
+    "Heartbeat age",
     "Compose safety",
 )
 """DH の 5 行のラベル。**順序も §19.2 の実行順（DH-1 → 10 → 13 → 12 → 15）である。**"""
@@ -224,7 +255,7 @@ def _label_of(line: str) -> str:
 
 def test_the_summary_counts_the_rows(host: dict[str, Path]) -> None:
     result = run(host)
-    assert "6 checks passed, 0 failed, 0 notices" in result.stdout, result.stdout
+    assert "7 checks passed, 0 failed, 0 notices" in result.stdout, result.stdout
 
 
 # --- DH-1: Apple Virtualization Framework(§3.2) -------------------------
@@ -431,14 +462,7 @@ def test_dh16_fails_when_the_plist_bypasses_the_launcher(host: dict[str, Path]) 
 
     `install.sh` を古い版で走らせた後にラッパだけ置いた、という状態がこれである。
     """
-    agents = host["home"].parent / "Library" / "LaunchAgents"
-    agents.mkdir(parents=True, exist_ok=True)
-    (agents / "com.voicedock.ingest.plist").write_text(
-        "<plist><dict><key>ProgramArguments</key><array>"
-        f"<string>{host['home']}/bin/voicedock-ingest</string>"
-        "</array></dict></plist>\n",
-        encoding="utf-8",
-    )
+    write_plist(host["tmp"], start_interval=300, through_launcher=False, home=host["home"])
     result = run(host)
     assert result.returncode == EXIT_DOCTOR_FATAL
     assert "plist がラッパを経由していません" in result.stdout
@@ -446,18 +470,57 @@ def test_dh16_fails_when_the_plist_bypasses_the_launcher(host: dict[str, Path]) 
 
 def test_dh16_passes_when_the_plist_goes_through_the_launcher(host: dict[str, Path]) -> None:
     """陰性対照。**正しい plist なら通ること。**何でも落ちる検査では意味が無い。"""
-    agents = host["home"].parent / "Library" / "LaunchAgents"
-    agents.mkdir(parents=True, exist_ok=True)
-    (agents / "com.voicedock.ingest.plist").write_text(
-        "<plist><dict><key>ProgramArguments</key><array>"
-        f"<string>{host['home']}/bin/voicedock-ingest-launcher</string>"
-        f"<string>{host['home']}/bin/voicedock-ingest</string>"
-        "</array></dict></plist>\n",
-        encoding="utf-8",
-    )
+    write_plist(host["tmp"], start_interval=300, through_launcher=True, home=host["home"])
     result = run(host)
     assert result.returncode == 0, result.stdout
     assert "[✓] Launcher" in result.stdout
+
+
+# --- DH-17: heartbeat の鮮度の閾値（§7.2 / §19.2） ----------------------
+
+
+@pytest.mark.parametrize("threshold", [300, 120])
+def test_dh17_fails_when_the_threshold_is_not_larger(host: dict[str, Path], threshold: int) -> None:
+    """**閾値が書き込み間隔以下だと、毎周期 stale と判定して取り込みを見送る。**
+
+    **等しいだけでも駄目である。**Helper は実行の最後に heartbeat を書くので、
+    次の書き込みまでの経過は `StartInterval + 実行時間` になる。
+    2026-09-14 に実機で踏んだ（#104）— 既定値が両方 300 で、5 分ごとに
+    `helper_heartbeat_stale` が出て取り込みを見送っていた。
+    """
+    (host["repo"] / "config" / "config.yaml").write_text(
+        f"import:\n  helper_heartbeat_max_age_seconds: {threshold}\n", encoding="utf-8"
+    )
+    result = run(host)
+    assert result.returncode == EXIT_DOCTOR_FATAL
+    assert f"閾値 {threshold}s <= 書き込み間隔 300s" in result.stdout, result.stdout
+
+
+def test_dh17_reads_the_interval_from_the_plist(host: dict[str, Path]) -> None:
+    """**書き込み間隔は plist から読む。**決め打ちしない。
+
+    `StartInterval` を変えたら、閾値との関係もそれに追随しなければならない。
+    """
+    write_plist(host["tmp"], start_interval=1800, through_launcher=True, home=host["home"])
+    result = run(host)
+    assert result.returncode == EXIT_DOCTOR_FATAL
+    assert "閾値 900s <= 書き込み間隔 1800s" in result.stdout, result.stdout
+
+
+def test_dh17_passes_with_margin(host: dict[str, Path]) -> None:
+    """陰性対照。**余裕があれば通ること。**"""
+    result = run(host)
+    assert result.returncode == 0, result.stdout
+    assert "[✓] Heartbeat age" in result.stdout
+    assert "閾値 900s > 書き込み間隔 300s" in result.stdout
+
+
+def test_dh17_is_skipped_without_a_config(host: dict[str, Path]) -> None:
+    """`config.yaml` を作る前は**失敗ではなく skip**（`cp` がまだの段階）。"""
+    (host["repo"] / "config" / "config.yaml").unlink()
+    result = run(host)
+    assert "[-] Heartbeat age" in result.stdout
+    assert result.returncode == 0
 
 
 # --- DH-15: /Volumes と ports:（§14.4 N-3 / N-13） ----------------------
@@ -536,7 +599,7 @@ def test_the_host_checks_match_the_spec_count() -> None:
     **検査が足りないまま「総仕上げ完了」になる。**
     """
     listed = spec_dh_ids()
-    assert listed == {"DH-1", "DH-10", "DH-12", "DH-13", "DH-15", "DH-16"}, sorted(listed)
+    assert listed == {"DH-1", "DH-10", "DH-12", "DH-13", "DH-15", "DH-16", "DH-17"}, sorted(listed)
 
     body = DOCTOR.read_text(encoding="utf-8")
     missing = [name for name in listed if name not in body]
