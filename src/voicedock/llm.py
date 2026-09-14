@@ -150,7 +150,28 @@ def render_schema_block(cfg: Config, *, partial: bool = False) -> str:
 
 
 def _example(name: str, field: Any) -> str:
-    """1 項目の説明。**上限を明示する**（モデルが守りやすくなる）。"""
+    """1 項目の説明。
+
+    **リストの件数の上限をモデルへ見せてはならない。**`max_items` を「上限」ではなく
+    **埋めるべき目標**として解釈し、**録音に無い内容をでっち上げて数を合わせる。**
+    2026-09-14 に実機で A/B を取った（#98）。79 文字の文字起こしに対し:
+
+    | | `key_points` | `ideas` | `tags` |
+    |---|---|---|---|
+    | 「（最大 N 件）」を見せる | **19**（上限 20） | **15** | **15**（上限 15） |
+    | 見せない | **5** | **3** | **7** |
+
+    `prompts/analyze_ja.txt` は「発言に存在しない事実を追加しないでください」
+    「推測や補完を行わないでください」と明示しているが、**散文の制約より
+    スキーマの数字のほうが強く効いた。**
+
+    **上限そのものは捨てていない。**`max_items` は引き続き `max_length` として
+    pydantic が検証し（§12.2）、超過したら §12.3 の修復が走る。修復プロンプトは
+    `{errors}` を渡すので、**そこで初めて件数の上限が伝わる。**
+
+    **文字数の上限（`title` / `summary`）はそのまま見せる。**こちらは 1 つの文字列の
+    長さであって「埋めるべき個数」ではない。**ただし同じ偏りが無いかは未測定である。**
+    """
     limit = getattr(field, "metadata", None)
     maximum = _max_length(limit)
     if name == "title":
@@ -158,10 +179,8 @@ def _example(name: str, field: Any) -> str:
     if name == "summary":
         return f'"全体の要約（{maximum or SUMMARY_MAX} 文字以内）"'
     if name == "tasks":
-        suffix = f"（最大 {maximum} 件）" if maximum else ""
-        return f'[{{"text": "やること", "due": "2026-08-30 または null"}}]{suffix}'
-    suffix = f"（最大 {maximum} 件）" if maximum else ""
-    return f'["..."]{suffix}'
+        return '[{"text": "やること", "due": "2026-08-30 または null"}]'
+    return '["..."]'
 
 
 def _max_length(metadata: object) -> int | None:
