@@ -16,7 +16,7 @@ import pytest
 from pydantic import ValidationError
 
 from tests.helpers import PROMPTS_ROOT
-from tests.spec_sync import spec_section_code, spec_text
+from tests.spec_sync import spec_section_code, spec_section_text, spec_text
 from voicedock import llm
 from voicedock.config import Config
 from voicedock.llm import (
@@ -201,6 +201,17 @@ def test_the_item_limit_is_not_shown_in_the_prompt(make_config: Callable[..., Co
     block = render_schema_block(cfg)
     assert "最大 7 件" not in block, block
     assert "7" not in block.split('"ideas"')[1].split("\n")[0], block
+
+
+def test_the_spec_says_not_to_show_the_item_limit() -> None:
+    """**§12.2 がそう規定していること。**
+
+    実装だけ直しても、SPEC が元のままなら**次に実装する人が戻す。**
+    v5.14 まで実装の註記は「上限を明示する（モデルが守りやすくなる）」だった。
+    """
+    text = spec_section_text("12.2")
+    assert "リストの件数の上限をモデルへ見せてはならない" in text
+    assert "プロンプトには出さない" in text
 
 
 def test_the_character_limit_is_still_shown(make_config: Callable[..., Config]) -> None:
