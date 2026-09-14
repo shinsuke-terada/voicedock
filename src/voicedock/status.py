@@ -158,7 +158,7 @@ class Locks:
         return (
             f"{state}  (lock1={str(self.lock1).lower()}, "
             f"lock2A={_reaper_text(self.reaper_installed)}, "
-            f"lock2B={_mount_text(self.mount_readonly)})"
+            f"lock2B={mount_text(self.mount_readonly)})"
         )
 
 
@@ -168,7 +168,12 @@ def _reaper_text(installed: bool | None) -> str:
     return "reaper present" if installed else "reaper absent"
 
 
-def _mount_text(readonly: bool | None) -> str:
+def mount_text(readonly: bool | None) -> str:
+    """観測されたマウント状態の表示語。**`status` と `doctor` で同じ語を使う**（#107）。
+
+    **`None` を `writable` に丸めない。**Helper が値を書けなかったことと、デバイスが
+    書き込み可能であることは別の事実であり、後者は §14.2 のロック 2-B を開ける。
+    """
     if readonly is None:
         return UNKNOWN
     return "readOnly" if readonly else "writable"
@@ -326,9 +331,13 @@ def _helper_text(beat: Heartbeat | None, cfg: Config, now: datetime) -> str:
     stale = beat.is_stale(now, cfg.import_.helper_heartbeat_max_age_seconds)
     seen = UNKNOWN if age is None else f"{age:.0f}s ago"
     state = "stale" if stale else "running"
+    # **実測を出す。設定値ではない**（#107）。`doctor` の DH-12 と同じ語を使う。
+    # `mount_mode` は「そうしたい」であり、`mount_readonly` は「そうなっている」である。
+    # **両方を出す** — 食い違い自体が異常の徴候だからである
+    observed = mount_text(beat.mount_readonly)
     detail = (
         f"{state}   (last seen {seen}, {beat.helper_version or UNKNOWN}, "
-        f"mount={beat.mount_mode or UNKNOWN})"
+        f"mount={observed} (MOUNT_MODE={beat.mount_mode or UNKNOWN}))"
     )
     if beat.config_error:
         detail += f"\n{' ' * (LABEL_WIDTH + 3)}config_error: {beat.config_error}"
@@ -342,7 +351,7 @@ def _inventory(state_root: Path, cfg: Config) -> str:
         return f"{UNKNOWN}  (inventory.json がありません)"
     if found.is_empty:
         return "0"
-    mode = _mount_text(found.mount_readonly)
+    mode = mount_text(found.mount_readonly)
     names = ", ".join(sorted(found.devices))
     return f"{len(found.devices)}  ({names}, {mode})"
 

@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-HELPER_VERSION="5.4.0"
+HELPER_VERSION="5.5.0"
 LOG_MAX_BYTES=5242880       # 5 MiB。超えたら .1 へ退避する（§10.1 手順 2）
 LOCK_STALE_SECONDS=21600    # 6 時間。PID の再利用とハングへの歯止め（§10.1 手順 1）
 META_SCHEMA=1
@@ -509,14 +509,20 @@ _device_node() {           # $1=volume path
         | plutil -extract DeviceNode raw - -o - 2>/dev/null
 }
 
-remount_readonly() {       # $1=volume path。成功なら 0
+remount_readonly() {       # $1=volume path。成功なら 0、失敗なら理由語を stdout へ
     local node
-    command -v diskutil >/dev/null 2>&1 || return 1
-    node="$(_device_node "$1")" || return 1
-    [ -n "$node" ] || return 1
-    diskutil unmount "$1" >/dev/null 2>&1 || return 1
-    diskutil mount readOnly "$node" >/dev/null 2>&1 || return 1
-    _is_mounted_readonly "$1"
+    # **既に目的の状態なら何もしない。**読み取り専用のボリュームは unmount を拒否され
+    # （DiskArbitration の dissent 0xF8DA0008）、**成功した直後の実行が必ず「失敗」を
+    # 報告することになる。**加えて、5 分ごとに unmount し直すこと自体が EBUSY の機会を
+    # 作る（2026-09-14 に実機で 34 サイクル中 3 回踏んだ。#107）
+    _is_mounted_readonly "$1" && return 0
+    command -v diskutil >/dev/null 2>&1 || { printf 'no_diskutil'; return 1; }
+    node="$(_device_node "$1")" || { printf 'no_device_node'; return 1; }
+    [ -n "$node" ] || { printf 'no_device_node'; return 1; }
+    diskutil unmount "$1" >/dev/null 2>&1 || { printf 'unmount_failed'; return 1; }
+    diskutil mount readOnly "$node" >/dev/null 2>&1 || { printf 'mount_failed'; return 1; }
+    # **理由語は固定文字列にする。**diskutil のメッセージはロケールで変わる
+    _is_mounted_readonly "$1" || { printf 'still_writable'; return 1; }
 }
 
 # --- state の書き出し（§7.5。どちらも .tmp → mv） -----------------------
@@ -759,23 +765,31 @@ main() {
         info "no_device_detected root=$VOLUMES_ROOT"
     fi
 
-    local device_id path all_readonly=1 i
+    local device_id path all_readonly=1 i reason
     i=0
     while [ "$i" -lt ${#DEVICES[@]} ]; do
         device_id="${DEVICES[$i]}"
         path="$VOLUMES_ROOT/$device_id"
 
         if [ "${MOUNT_MODE}" = "ro" ]; then
-            if remount_readonly "$path"; then
+            if reason="$(remount_readonly "$path")"; then
                 info "remounted_readonly name=$device_id"
             else
-                # 取り込みは続行する（記録を優先。§1.3）。失敗は安全側へ倒れる（§14.2）
-                warn "remount_readonly_failed name=$device_id"
-                all_readonly=0
+                # 取り込みは続行する（記録を優先。§1.3）。**理由語を残す** — 5 つの
+                # 失敗経路が 1 行に潰れていると、ログだけでは原因を切り分けられない
+                warn "remount_readonly_failed name=$device_id reason=${reason:-unknown}"
             fi
-        else
-            all_readonly=0
         fi
+
+        # **観測して決める。試行の成否からではない**（§14.2 のロック 2-B が読む値である）。
+        # 読み取り専用で再マウントされた後は unmount が拒否されるため、**成功の直後の実行が
+        # 「失敗」を報告する。**それを信じると、デバイスが保護されているのに
+        # `mount_readonly: false` を書く（2026-09-14 に実機で 10 分間そうなった。#107）。
+        #
+        # **`MOUNT_MODE=rw` でも観測する。**利用者が手で読み取り専用にしている場合があり、
+        # そのとき削除を許すと書き込みに失敗する。`_is_mounted_readonly()` 自身が
+        # 「diskutil の終了コードを信用しない」と書いているのと同じ理由である
+        _is_mounted_readonly "$path" || all_readonly=0
 
         # **空き容量は remount の後に測る。**読み取り専用での再マウントは
         # 空き容量を変えないが、失敗して別の扱いになった場合に実際の状態を映す

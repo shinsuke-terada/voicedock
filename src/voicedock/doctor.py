@@ -444,7 +444,9 @@ def check_helper(ctx: Context) -> list[Row]:
     age = beat.age_seconds(moment)
     limit = ctx.config.import_.helper_heartbeat_max_age_seconds
     seen = "不明" if age is None else f"{age:.0f}s ago"
-    mount = "readOnly" if beat.mount_readonly else "writable"
+    # **`None` を `writable` に丸めない**（#107）。Helper が値を書けなかったことと、
+    # デバイスが書き込み可能であることは別の事実である
+    mount = status.mount_text(beat.mount_readonly)
     detail = f"(last seen {seen}, v{beat.helper_version or '?'}, mount={mount})"
 
     extra = [
