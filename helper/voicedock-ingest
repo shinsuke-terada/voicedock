@@ -367,8 +367,13 @@ check_stability() {
     [ ${#CAND_SRC[@]} -gt 0 ] || return 0
     _sample_all
 
-    # 即断: mtime が STABILITY_FAST_PATH_SECONDS 以上前なら安定と確定する
-    # （録音中のファイルだけが新しい mtime を持つ）
+    # 即断: mtime が STABILITY_FAST_PATH_SECONDS 以上前なら安定と確定する。
+    #
+    # **「新しい mtime ＝ 録音中」ではない。**DJI Mic 3 は **PC へ接続すると録音を自動停止する**
+    # ため、USB 経路では「録音中のファイル」は現れない（2026-09-14 実機。P0-11）。
+    # 実際に新しい mtime を持つのは**直前に録音を終えたファイル**であり、
+    # **停止直後は WAV のヘッダ確定（finalize）の途中でマウントされうる。**
+    # 即断から外して確認へ回す意味はそこにある
     local now i pending
     now="$(_now_epoch)"
     pending=0
