@@ -461,34 +461,137 @@ P0-6 / P0-7 / P0-9 が問うていた前提そのものが無くなった。**�
 ---
 
 ## 10. DJI Mic 3 実機 残り（#3 で記入）
-
-**`./scripts/probe.sh` を実機で 1 回叩き、出力をこの節へそのまま貼る。**
-§0 の記録の規約どおり、要約した数値だけを書かない。
-
-```bash
-./helper/install.sh              # #53。まだなら
-# DJI を USB 接続する（launchd の StartOnMount で ingest が走る）
-./scripts/probe.sh > /tmp/probe-ro.md
-```
-
-**P0-8 は probe が機械判定する。**`mount` の read-only と `heartbeat.json` の
-`mount_readonly` が食い違えば `✗` を出し、**終了コードが非 0 になる。**
-一致しないなら実装のバグであり、**その場で採り直しても直らない。**
-
 | # | 項目 | 判定 | 根拠 |
 |---|---|---|---|
-| P0-8 | `MOUNT_MODE=ro` で `mount` が read-only、`heartbeat.json` が `mount_readonly: true`。**両者が一致する** | ⬜ 未実施 | |
+| P0-8 | `MOUNT_MODE=ro` で `mount` が read-only、`heartbeat.json` が `mount_readonly: true`。**両者が一致する** | ✅ **PASS** | §10.1。`probe.sh` が機械判定し EXIT=0 |
 | P0-8b | `MOUNT_MODE=rw` で read-write になり `mount_readonly: false` になる | ⬜ 未実施 | |
-| P0-10 | 送信機 2 台の見え方。2 個なら `inventory.json` の `devices` が 2 エントリ | ⬜ 未実施 | |
-| P0-11 | 録音中ファイルの mtime の進み方。`STABILITY_*` の既定が実挙動に合うか | ⬜ 未実施 | |
+| P0-10 | 送信機 2 台の見え方。2 個なら `inventory.json` の `devices` が 2 エントリ | ⚠ 1 台のみ | §10.1。2 台同時は未検証 |
+| P0-11 | 録音中ファイルの mtime の進み方。`STABILITY_*` の既定が実挙動に合うか | ⚠ 静止のみ | §10.1。**録音中のファイルでは未検証** |
 | P0-12 | 受信機（RX）側にもストレージが見えるか（任意。R-7 へ記録するだけ） | ⬜ 未実施 | |
-| P0-13 | `_orig` 保存をオフにできるか。**denoised が生成される設定があるか**（R-28） | ⬜ 未実施 | |
+| P0-13 | `_orig` 保存をオフにできるか。**denoised が生成される設定があるか**（R-28） | ✅ **denoised 無し** | §10.1。2 件とも `_orig` のみ |
 | P0-14 | バッテリー交換・充電で中断したときのファイルの分かれ方（§13.4 の Block） | ⬜ 未実施 | |
-| P0-15 | 64 ファイルでの ingest 1 回の所要時間。`StartInterval`（300 秒）で間に合うか | ⬜ 未実施 | |
+| P0-15 | 64 ファイルでの ingest 1 回の所要時間。`StartInterval`（300 秒）で間に合うか | ⚠ 2 件で 0.84 秒 | §10.1。64 ファイルは未検証 |
 
-### 10.1 `ro` での採取
+### 10.0 TCC — リムーバブルボリュームへのアクセス（**最初に踏む壁**）
 
-⬜ 未実施。`./scripts/probe.sh` の出力を貼る。
+**DJI を接続しても `volume_skipped reason=no DJI recordings` が出続けた。**
+実際は macOS の TCC がボリュームの列挙を拒んでいた。
+
+```text
+$ mount | grep -i djimic3
+/dev/disk4 on /Volumes/DJIMIC3 (msdos, local, nodev, nosuid, noowners, noatime, fskit)
+
+$ [ -r /Volumes/DJIMIC3 ] && echo "-r: true"
+-r: true                                    ← 規則 4 は通る
+
+$ find /Volumes/DJIMIC3 -maxdepth 1 >/dev/null 2>&1; echo $?
+1                                           ← 実際は列挙できない
+
+$ ls -la /Volumes/DJIMIC3
+ls: /Volumes/DJIMIC3: Operation not permitted
+```
+
+**`[ -r ]` は TCC の拒否を見抜けない**（`access(2)` は成功し `opendir(3)` で初めて `EPERM`）。
+そのため規則 5 の glob が空になり、**権限が無いのに「録音が無い」と報告していた。**
+v5.12（Z-1 / Z-2）で §3.4(7) を足し、理由を区別するようにした。
+
+**ターミナルへの許可と LaunchAgent への許可は別である。**フルディスクアクセスに
+ターミナルアプリを追加した後の実測:
+
+```text
+（ターミナルから手動実行）
+2026-09-14T00:43:18+09:00 INFO  device_detected name=DJIMIC3
+2026-09-14T00:43:19+09:00 INFO  remounted_readonly name=DJIMIC3
+2026-09-14T00:43:19+09:00 INFO  scanned name=DJIMIC3 files=2 candidates=2
+2026-09-14T00:43:19+09:00 INFO  copied relpath=TX_MIC001_20260912_163444/TX00_MIC001_20260912_163444_orig.wav bytes=856456
+2026-09-14T00:43:19+09:00 INFO  copied relpath=TX_MIC001_20260912_163444/TX00_MIC002_20260913_233420_orig.wav bytes=2963176
+2026-09-14T00:43:19+09:00 INFO  ingest_finished devices=1
+
+（launchctl kickstart -k gui/$UID/com.voicedock.ingest）
+2026-09-14T00:44:52+09:00 INFO  volume_skipped name=DJIMIC3 reason=volume not listable — macOS のプライバシー設定を確認してください（§3.4(7)）
+2026-09-14T00:44:52+09:00 INFO  ingest_finished devices=0
+```
+
+> **`voicedock-ingest` はシェルスクリプトである。**TCC の許可対象としてスクリプトを
+> 登録できるかは未確認。**Helper の配備方式に関わる論点**なので #95 に残す。
+
+**副作用として `heartbeat.json` が上書きされる。**列挙できない実行でも Helper は
+`mount_readonly: false` を書くため、**直前の成功した採取が 300 秒以内に消える。**
+`probe.sh` を「接続したらまず叩く」と定めているのはこのためである（§10.2 の註記）。
+
+### 10.1 `ro` での採取（P0-8 / P0-10 / P0-11 / P0-13 / P0-15）
+
+**`./scripts/probe.sh` の出力**（2026-09-14 00:43:19 の ingest 直後。EXIT=0）:
+
+```text
+## P0-8 マウントモードと heartbeat の一致
+
+- `helper.conf` の `MOUNT_MODE` : `ro`
+- `heartbeat.json` の `mount_readonly` : `true`
+- `heartbeat.json` の `updated_at` : `2026-09-14T00:43:19+09:00`
+
+| デバイス | `mount` | 読み取り専用 |
+|---|---|---|
+| `DJIMIC3` | `/dev/disk4 on /Volumes/DJIMIC3 (msdos, local, nodev, nosuid, read-only, noowners, noatime, fskit)` | true |
+
+- `mount` からの観測 : `true`（デバイス 1 個の論理積）
+- 判定: ✅ **PASS** — 一致した（ロック 2-B が実際に効いている。§14.2）
+
+## P0-10 デバイスの見え方
+
+- `inventory.json` の `devices` : **1 個**
+
+| デバイス | 録音 | 空き容量 | `df -Pk` |
+|---|---|---|---|
+| `DJIMIC3` | 2 | 30017847296 | `/dev/disk4    29344000 29696  29314304     1%    /Volumes/DJIMIC3` |
+
+## P0-11 安定性判定
+
+- `STABILITY_FAST_PATH_SECONDS` : `60`
+- `STABILITY_INTERVAL_SECONDS`  : `3`
+- `STABILITY_CHECKS`            : `2`
+
+対象: `/Volumes/DJIMIC3/TX_MIC001_20260912_163444/TX00_MIC002_20260913_233420_orig.wav`
+
+| # | size mtime |
+|---|---|
+| 1 | `2963176 1789310060` |
+| 2 | `2963176 1789310060` |
+
+## P0-13 `_orig` 以外の有無
+
+- `inventory.json` の録音 : **2 件**
+- うち `_orig` 以外 : **0 件**
+```
+
+**P0-8 の意味**: `voicedock-ingest` は `diskutil` の終了コードを信用せず、`mount` の出力で
+読み取り専用を独立確認してから `true` を書く（`_is_mounted_readonly()`）。`probe.sh` は
+同じ式を `mount` から**独立に**組み立てて突き合わせる。**一致したということは、
+安全ロック 2-B が実機の上で OS レベルに効いていることの実証である**（§14.2）。
+
+**P0-13 の意味**: 2 件とも `_orig` であり、**denoised は 1 件も生成されていない。**
+#2 の P0-4（録音 2 本とも `_orig` のみ）と一致する。§5.3 で `_orig` 固定にした代償
+（読まなかったファイルがデバイスに溜まり続ける）は、**この設定では現実になっていない。**
+§22 R-28 は当面顕在化しない。
+
+**P0-15**: 取り込み済み 2 件の再走査で **0.84 秒**（`candidates=0`）。
+`StartInterval`（300 秒）に対しては桁で余裕がある。**ただし 64 ファイルでは未計測。**
+
+### 10.1.1 フォルダ名の日付は中身を縛らない（**新しい発見**）
+
+```text
+TX_MIC001_20260912_163444/
+  TX00_MIC001_20260912_163444_orig.wav     ← 9/12
+  TX00_MIC002_20260913_233420_orig.wav     ← 9/13（同じフォルダ）
+```
+
+**フォルダ名は最初の録音の時刻であり、中身の録音日を縛らない。**
+`session_key` を**フォルダ名**から導いていたら、9/13 の録音が 9/12 の Daily ノートへ
+混ざるところだった。
+
+実装は `started_at=parsed.started_at`（`device.py`）で**ファイル名**の時刻を使っており
+（§5.2）、`session.group_parts()` はその `started_at` から `session_key` を作る（§10.4）。
+**正しい。**§5.1 に「フォルダ名の日付は中身を代表しない」ことを明記する対象とする。
 
 ### 10.2 `rw` での採取（P0-8b）
 
@@ -497,47 +600,256 @@ P0-6 / P0-7 / P0-9 が問うていた前提そのものが無くなった。**�
 > **`rw` にしても削除は起きない。**ロック 2-A（`voicedock-reaper` が未配置）が残っており、
 > **削除できるプログラムが存在しない**（§14.2）。削除の有効化は #39 の運用判断である。
 
----
-
 ## 11. Model Runner と LLM スループット（#13 で記入）
 
-⬜ 未実施。
+⚠ **一部のみ。**疎通と初回のレイテンシは採れたが、**スループット判定は保留**
+（測ったチャンクが小さすぎる）。**`models` 長構文での注入は未検証。**
 
-```bash
-docker desktop enable model-runner && docker model status
-docker model pull <§18.2 のタグ>
-./scripts/fetch-models.sh
-make up
-docker compose exec voicedock env | grep VOICEDOCK_LLM   # 注入の確認
+### 11.0 モデルの取得
+
+```text
+$ docker desktop enable model-runner
+$ docker model status
+Docker Model Runner is running
+BACKEND    STATUS         DETAILS
+llama.cpp  Running        llama.cpp b9879-metal (sha256:b70706f4...)
+diffusers  Not Installed
+mlx        Not Installed
+vllm       Not Installed
+
+$ docker model pull ai/qwen3:30b-a3b-instruct-2507-q4_K_M
+Downloaded 18.56GB of 18.56GB
+Model pulled successfully
 ```
 
-| # | 項目 | 実測 |
-|---|---|---|
-| `docker model status` | running か | ⬜ |
-| モデルタグ | 実際に pull できたタグ。**thinking 系でないこと**（§12.3） | ⬜ |
-| `VOICEDOCK_LLM_URL` | **実際の形**（`/engines/v1` の有無）。Compose 5.5.1 での注入 | ⬜ |
-| `response_format` | `{"type":"json_object"}` が受理されるか | ⬜ |
-| 20,000 字 1 チャンク | latency（秒） | ⬜ |
-| 18 チャンク換算 | **30 分以内か**（§21.2 Phase 3） | ⬜ |
-| ホスト RAM | `docker stats` の実測（§4.3 の試算 18 GB の検証） | ⬜ |
+**バックエンドは `llama.cpp`（Metal）である。**`mlx` は未導入。§23 の Mac ネイティブ化を
+検討するときの出発点になる。
 
-**判定は `./scripts/perf-report.sh --llm` でも出せる**（`llm_completed` ログから）。
+`./scripts/fetch-models.sh`:
+
+```text
+fetched: /models/whisper/ggml-large-v3-turbo-q5_0.bin
+fetched: /models/whisper/ggml-silero-v5.1.2.bin
+-rw-r--r-- 1 1000 1000 574041195 ggml-large-v3-turbo-q5_0.bin
+-rw-r--r-- 1 1000 1000    885098 ggml-silero-v5.1.2.bin
+394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2  ggml-large-v3-turbo-q5_0.bin
+29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf  ggml-silero-v5.1.2.bin
+```
+
+**uid 1000 所有で 2 ファイル。**受け入れ条件を満たす。
+
+> **ただし named volume の名前が食い違っていた**（§12.0(1)）。`fetch-models.sh` は
+> `voicedock-models` へ書き、Compose は `voicedock_voicedock-models` をマウントしていた。
+> v5.13（AA-1）で `name:` を明示して解決。
+
+### 11.1 エンドポイントの実際の形
+
+**コンテナ内から 2 通りとも到達できた。**
+
+```text
+$ docker compose exec voicedock python -c "import httpx; print(httpx.get(URL + '/models').text)"
+
+http://model-runner.docker.internal/engines/v1/models   → 200
+http://host.docker.internal:12434/engines/v1/models     → 200
+
+{"object":"list","data":[{"id":"docker.io/ai/qwen3:30b-a3b-instruct-2507-q4_K_M",
+ "object":"model","created":0,"owned_by":"docker","dmr":{}}]}
+```
+
+| 記録事項 | 実測 |
+|---|---|
+| URL の形 | **`/engines/v1` を含む。**`§12.1` の `{URL}/chat/completions` がそのまま使える |
+| ホスト名 | `model-runner.docker.internal`（ポート指定なし）と `host.docker.internal:12434` の両方 |
+| **モデル id** | **`docker.io/` 接頭辞が付く** — `ai/qwen3:...` ではなく `docker.io/ai/qwen3:...` が返る |
+
+> **`models` 長構文での注入は未検証である。**`compose.yaml` の `models:` は
+> `TODO(#13)` のままで、本節の実測は**環境変数を手で与えた**もの
+> （`VOICEDOCK_LLM_URL` / `VOICEDOCK_LLM_MODEL`）。
+> **Compose 5.5.1 が実際に何を注入するか（とくにモデル id に接頭辞が付くか）は
+> 長構文を入れてから確かめること。**§22 R-21 はここに掛かっている。
+
+### 11.2 実音声での LLM 実行（**Daily ノートが出た**）
+
+```text
+2026-09-14T01:52:20+09:00 INFO  service_started version=0.1.0 schema_version=1
+2026-09-14T01:52:42+09:00 INFO  llm_completed session_key=DJIMIC3:20260912 chunks=1 elapsed_s=21.8
+2026-09-14T01:52:42+09:00 INFO  obsidian_saved session_key=DJIMIC3:20260912 path="Daily/Voice/Wiki/20260912/2026-09-12 Voice.md" bytes=1504
+2026-09-14T01:52:50+09:00 INFO  llm_completed session_key=DJIMIC3:20260913 chunks=1 elapsed_s=8.0
+2026-09-14T01:52:50+09:00 INFO  obsidian_saved session_key=DJIMIC3:20260913 path="Daily/Voice/Wiki/20260913/2026-09-13 Voice.md" bytes=2700
+```
+
+**Phase 1〜6 が実音声で端から端まで通った。**取り込み → 変換 → Whisper → Raw ノート →
+統合 → LLM → Daily ノート → 保存検証 → `COMPLETED`。
+
+| # | 実測 |
+|---|---|
+| 1 チャンク（初回。モデル読み込み込み） | **21.8 秒** |
+| 1 チャンク（2 回目。暖機後） | **8.0 秒** |
+| 18 チャンク換算（暖機後） | 約 2.4 分 |
+| 判定 | ⬜ **保留** |
+
+> **判定を出さない理由。**測ったチャンクは **11 文字と 79 文字**であり、
+> §21.2 Phase 3 が想定する **20,000 文字**とは桁が 3 つ違う。
+> **入力長にほぼ比例する工程なので、この数字から 30 分以内かは言えない。**
+> 20,000 文字 1 チャンクの実測が要る（#13 の受け入れ条件）。
+
+`response_format: {"type":"json_object"}` の受理可否は未確認（本番経路は
+§12.3 の独自抽出を使うため、非対応でも動く）。
+
+### 11.3 品質の問題（**#98 で起票**）
+
+**20 秒・79 文字の文字起こしから `Key Points` が 19 項目生成された。**
+「参加者の表情は明るかった」など、**文字起こしに存在しない内容**である。
+
+| 項目 | `config.yaml` | 実際 |
+|---|---|---|
+| `key_points` | `max_items: 20` | **19** |
+| `tags` | `max_items: 15` | **15**（`default_tags` の 2 件を除く） |
+
+**`tags` は上限にぴったり一致している。**JSON スキーマの `maxItems` がモデルへ渡り、
+**埋めるべき数**として解釈されている。`prompts/analyze_ja.txt` は
+「発言に存在しない事実を追加しないでください」「推測や補完を行わないでください」と
+明示しているが、**散文の制約よりスキーマの数字のほうが強く効いた。**
+
+§1.3 の優先順位 1 は記録の保護である。**要約に言っていないことが混ざるのは記録の破壊と同じ**
+であり、しかも Daily は Raw より読まれる。#98 で直す。
+
+### 11.4 ホスト側の RAM
+
+⬜ 未測定（18.5 GB のモデルを常駐させた状態での `docker stats` を採ること）。
 
 ---
 
 ## 12. 文字起こし性能（#22 で記入）
 
-⬜ 未実施。
+⬜ **判定は保留**（測った音声が 26 秒しかない）。ただし**初めて実音声がパイプラインを通った。**
 
 ```bash
-docker compose logs voicedock | ./scripts/perf-report.sh
+docker compose logs voicedock | ./scripts/perf-report.sh --asr
 ```
 
-| # | 項目 | 実測 |
-|---|---|---|
-| `rtf` | Part ごとの real-time factor | ⬜ |
-| `speech_ratio` | VAD 有効時 / 無効時 | ⬜ |
-| 1 日分（32 Part） | **実 `elapsed_s` の合計と外挿。8 時間以内か**（§21.2 Phase 2） | ⬜ |
-| `threads` | 4 / 6 / 7 の比較（Docker VM は 7 CPU 割当） | ⬜ |
-| 採用モデル | 未達なら `large-v3-turbo-q5_0` → `medium-q5_0` → `small-q5_1` | ⬜ |
-| 幻覚（R-15） | 無音区間で VAD がどの程度抑制するか（定性） | ⬜ |
+### 12.0 起動までに踏んだ 2 件
+
+**(1) named volume の名前が食い違っていた。**`scripts/fetch-models.sh` は
+`voicedock-models` へ 574 MB を書き込むが、`compose.yaml` は `volumes:` に
+`voicedock-models:` と書いただけだったので、**Compose がプロジェクト名を前置して
+`voicedock_voicedock-models` を作り、空の volume をマウントしていた。**
+
+```text
+$ docker volume ls | grep voicedock
+local     voicedock-models              ← fetch-models.sh が入れた（574 MB）
+local     voicedock_voicedock-models    ← compose が作ってマウントした（空）
+```
+
+**症状は「取得したのに D-8 がモデルを見つけない」であり、取得の失敗と区別がつかない。**
+v5.13（AA-1）で `name:` を明示した。
+
+**(2) `config.yaml` が v5.0 以前のままだった。**V-1（設定検証）が起動を中止した。
+
+```text
+voicedock: 設定エラー（SPEC §7.3）。起動を中止します: /app/config/config.yaml
+  V-1  CONFIG_UNKNOWN_KEY  audio.transcribe_variant
+  V-1  CONFIG_UNKNOWN_KEY  retry.auto_retry_failed_after_hours
+  V-1  CONFIG_UNKNOWN_KEY  retry.auto_retry_max_rounds
+```
+
+3 つとも v5.0 で削除したキーである（§5.3 の `_orig` 固定、§15.2 の無条件再評価）。
+**これは製品の不具合ではない。**未知キーを拒んで起動を止める V-1 が設計どおり働き、
+**何が古いかを名指しした。**`config.example.yaml` から作り直して解決。
+
+### 12.1 実音声での通し（E2E-01 の前半）
+
+```text
+2026-09-14T00:59:33+09:00 INFO  service_started version=0.1.0 schema_version=1
+2026-09-14T00:59:33+09:00 INFO  part_discovered recording_key=DJIMIC3/TX_MIC001_20260912_163444/TX00_MIC001_20260912_163444_orig.wav tx=TX00 mic=1 started_at=2026-09-12T16:34:44+09:00 duration=5.72
+2026-09-14T00:59:33+09:00 INFO  part_discovered recording_key=DJIMIC3/TX_MIC001_20260912_163444/TX00_MIC002_20260913_233420_orig.wav tx=TX00 mic=2 started_at=2026-09-13T23:34:20+09:00 duration=20.35
+2026-09-14T00:59:33+09:00 INFO  normalize_completed recording_key=.../TX00_MIC001_..._orig.wav in_bytes=856456 out_bytes=183176 elapsed_s=0.0
+2026-09-14T01:00:00+09:00 INFO  transcription_completed recording_key=.../TX00_MIC001_..._orig.wav elapsed_s=27.2 chars=11 rtf=4.76 speech_ratio=0.708
+2026-09-14T01:00:00+09:00 INFO  raw_note_saved session_key=DJIMIC3:20260912 parts=1 bytes=390
+2026-09-14T01:00:00+09:00 INFO  normalize_completed recording_key=.../TX00_MIC002_..._orig.wav in_bytes=2963176 out_bytes=651336 elapsed_s=0.0
+2026-09-14T01:00:29+09:00 INFO  transcription_completed recording_key=.../TX00_MIC002_..._orig.wav elapsed_s=29.0 chars=79 rtf=1.423 speech_ratio=0.765
+2026-09-14T01:00:29+09:00 INFO  raw_note_saved session_key=DJIMIC3:20260913 parts=1 bytes=596
+2026-09-14T01:00:29+09:00 INFO  session_merged session_key=DJIMIC3:20260912 parts=1 excluded=0 chars=11
+2026-09-14T01:00:29+09:00 ERROR llm_failed session_key=DJIMIC3:20260912 error_code=LLM_UNAVAILABLE
+```
+
+**確かめられたこと:**
+
+| | |
+|---|---|
+| ffmpeg 変換 | 48 kHz/24 bit → 16 kHz/16 bit（856,456 → 183,176 B）。実機の Broadcast Wave を読めた |
+| Whisper | 日本語の transcript を生成。**VAD も動作**（`speech_ratio` が出ている） |
+| Raw ノート | Vault に 2 枚（`Daily/Voice/Raw/20260912/`・`20260913/`）。frontmatter に自然キー・Timeline 見出し |
+| **§10.1.1 の裏づけ** | **同じフォルダの 2 件が `DJIMIC3:20260912` と `DJIMIC3:20260913` の別セッションになった。**フォルダ名（`20260912`）ではなく**ファイル名**の時刻で分組されている |
+| LLM 未接続時の振る舞い | `llm_failed error_code=LLM_UNAVAILABLE`。**クラッシュせず名前の付いた誤りとして残る**（§15.1） |
+
+Raw ノート（実物）:
+
+```markdown
+---
+type: "voice-raw"
+voicedock_session_key: "DJIMIC3:20260913"
+voicedock_recording_keys:
+  - "DJIMIC3/TX_MIC001_20260912_163444/TX00_MIC002_20260913_233420_orig.wav"
+date: "2026-09-13"
+parts: 1
+source: "DJI Mic 3"
+---
+
+# 2026-09-13 の文字起こし（生データ）
+
+> 自動文字起こしの生データ。未編集。
+
+## 23:34–23:34
+
+### 23:34:21
+
+（文字起こし本文）
+```
+
+### 12.1.1 Obsidian での表示（目視確認）
+
+Obsidian で開いて確認した（2026-09-14）。
+
+| | |
+|---|---|
+| 配置 | `Daily / Voice / Raw / 20260913 / 2026-09-13 raw` — §13.2 の階層どおり |
+| frontmatter の型 | `date` はカレンダー型、`parts` は数値型、残りはテキスト型として解釈された |
+| Timeline | `23:34–23:34` の下に `23:34:21` が入れ子で表示された（§10.8） |
+
+> **`voicedock_session_key` が外部リンクとして描画される。**`DJIMIC3:20260913` の
+> `<名前>:<値>` という形が URI スキームに見えるためで、クリックすると `DJIMIC3:` を
+> 開こうとする。**YAML の値は変わらないので、保存検証（W-6）にも §14.1 の削除条件にも
+> 影響しない。**見た目だけの問題であり、当面は手を入れない。
+>
+> 気にするなら `voicedock_session_key` の値を `DJIMIC3/20260913` のように
+> 区切り文字を変えることになるが、**§8.1 の自然キーを表示の都合で変えるのは筋が悪い**
+> （ログ・DB・ノートで識別子が 2 系統になる。§16.2 が短い別名を作らないと決めたのと同じ理由）。
+
+### 12.2 文字起こし性能（#22 の第一報。**判定は保留**）
+
+| # | 音声 | elapsed | rtf | speech_ratio |
+|---|---|---|---|---|
+| 1 | 5.7 s | 27.2 s | 4.76 | 0.708 |
+| 2 | 20.4 s | 29.0 s | 1.423 | 0.765 |
+
+**この 2 点から固定費と可変費を分離できる。**
+
+```text
+音声の差   20.38 - 5.71 = 14.67 s
+所要の差   29.0  - 27.2 =  1.8  s
+→ 限界レート   1.8 / 14.67 = 0.123 s/s
+→ 1 回の固定費 27.2 - 0.123 × 5.71 ≈ 26.5 s
+```
+
+**固定費の正体は whisper-cli が毎回 574 MB のモデルを読むことである。**
+30 分 Part なら 1 本あたり `26.5 + 0.123 × 1800 ≈ 247 s`、32 本で **約 2.2 時間**。
+§21.2 Phase 2 の 8 時間には収まる見込みだが、**26 秒の実測からの推定にすぎない。**
+
+> **`perf-report.sh` はここで一度嘘をついた。**Part 数で外挿していたため
+> 「1 Part = 13 秒」として 32 倍し、**0.25 時間で ✅ PASS** と答えた。
+> 音声長で外挿すると固定費が効いて **34.46 時間で ✗ FAIL** になる。**どちらも当てにならない。**
+> 1 日分の 10% に満たない実測では**判定しない**（`⬜ 保留`、終了コード 8）ように直した（#95）。
+> **偽の PASS を掴むくらいなら「足りない」と言う。**
+
+**判定には 30 分程度の Part を数本流す必要がある**（1 日分の 10% ＝ 約 1.6 時間の音声）。

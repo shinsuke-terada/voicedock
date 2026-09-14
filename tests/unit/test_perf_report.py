@@ -25,6 +25,22 @@ pytestmark = pytest.mark.skipif(not REPORT.is_file(), reason="scripts/ がマウ
 
 EXIT_BELOW_TARGET = 6
 EXIT_NO_DATA = 7
+EXIT_INSUFFICIENT = 8
+
+DAY_SECONDS = 16 * 3600
+"""1 日分の音声（§21.2 Phase 2）。判定に足るかの分母になる。"""
+
+
+def sample(*, audio_s: float, ratio: float, parts: int = 1) -> str:
+    """合計 `audio_s` 秒の音声を `parts` 本に分け、処理時間を `audio × ratio` にしたログ。
+
+    **`ratio` がそのまま判定になる** — 1 日分への外挿は
+    `elapsed 合計 / 音声合計 × 16 時間` なので、`ratio <= 0.5` が 8 時間以内である。
+    """
+    each = audio_s / parts
+    return "\n".join(
+        asr_line(f"D/T/{i}_orig.wav", elapsed=each * ratio, rtf=ratio) for i in range(parts)
+    )
 
 
 def run(logs: str, *args: str) -> subprocess.CompletedProcess[str]:
@@ -80,9 +96,14 @@ def as_json(line: str) -> str:
 
 
 def script_constants() -> dict[str, int]:
-    """スクリプト冒頭の 5 つの定数を読む。"""
+    """スクリプトの **`# SPEC ` 印が付いた**定数だけを読む。
+
+    印で選ぶのは、**この道具の方針にすぎない定数**（`MIN_COVERAGE_PERCENT` など）を
+    SPEC との突き合わせに巻き込まないためである。`\\s+#` で拾っていた頃は、
+    直後に註釈ブロックが来る無関係な定数まで拾っていた。
+    """
     body = REPORT.read_text(encoding="utf-8")
-    found = dict(re.findall(r"^([A-Z_]+)=(\d+)\s+#", body, re.M))
+    found = dict(re.findall(r"^([A-Z_]+)=(\d+)[ \t]+# SPEC ", body, re.M))
     return {name: int(value) for name, value in found.items()}
 
 
@@ -95,40 +116,86 @@ def test_the_thresholds_come_from_the_spec() -> None:
 
 
 def test_a_fast_run_passes() -> None:
-    logs = "\n".join(asr_line(f"D/T/{i}_orig.wav", elapsed=331.4) for i in range(4))
-    result = run(logs, "--asr")
+    result = run(sample(audio_s=DAY_SECONDS * 0.5, ratio=0.12, parts=16), "--asr")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "✅ **PASS**" in result.stdout
 
 
 def test_a_slow_run_fails() -> None:
-    logs = asr_line("D/T/a_orig.wav", elapsed=1200)
-    result = run(logs, "--asr")
+    result = run(sample(audio_s=DAY_SECONDS * 0.5, ratio=1.2, parts=16), "--asr")
     assert result.returncode == EXIT_BELOW_TARGET
     assert "✗ **FAIL**" in result.stdout
 
 
+# --- 判定に足りないデータ（**実機で踏んだ**） ----------------------------
+
+
+def test_a_tiny_sample_is_not_judged() -> None:
+    """**26 秒の録音 2 本で「8 時間以内」と答えてはならない**（2026-09-14 / #95）。
+
+    Part 数で外挿すると「1 Part = 13 秒」として 32 倍し、**0.25 時間で PASS** と答える。
+    音声長で外挿すると固定費（1 回あたりのモデル読み込み）が効いて **34 時間で FAIL** と答える。
+    **どちらも当てにならない。**だから判定しない。
+    """
+    result = run(sample(audio_s=26.1, ratio=2.15, parts=2), "--asr")
+    assert result.returncode == EXIT_INSUFFICIENT, result.stdout
+    assert "⬜ **保留**" in result.stdout
+    assert "PASS" not in result.stdout
+    assert "FAIL" not in result.stdout
+
+
+def test_a_sample_just_over_the_threshold_is_judged() -> None:
+    """陰性対照。**閾値を超えれば判定する。**保留が既定になっては道具の意味が無い。"""
+    result = run(sample(audio_s=DAY_SECONDS * 0.11, ratio=0.12, parts=4), "--asr")
+    assert result.returncode == 0, result.stdout
+    assert "✅ **PASS**" in result.stdout
+
+
+def test_the_measured_audio_length_is_shown() -> None:
+    """**測った音声の長さと 1 日分に対する割合を必ず出す。**
+
+    読んだ人が「この数字はどれだけの実測に基づくか」を判断できないと、
+    外挿を鵜呑みにするしかない。
+    """
+    result = run(sample(audio_s=DAY_SECONDS * 0.5, ratio=0.12, parts=16), "--asr")
+    assert "測った音声の長さ" in result.stdout
+    assert "50.00%" in result.stdout, result.stdout
+
+
 @pytest.mark.parametrize(
-    ("elapsed", "expected"),
-    [(899.0, 0), (901.0, EXIT_BELOW_TARGET)],
+    ("ratio", "expected"),
+    [(0.49, 0), (0.51, EXIT_BELOW_TARGET)],
 )
-def test_the_eight_hour_boundary_flips(elapsed: float, expected: int) -> None:
-    """**境界のすぐ上と下で反転すること。**`900 * 32 / 3600 = 8.0` 時間。"""
-    result = run(asr_line("D/T/a_orig.wav", elapsed=elapsed), "--asr")
+def test_the_eight_hour_boundary_flips(ratio: float, expected: int) -> None:
+    """**境界のすぐ上と下で反転すること。**
+
+    1 日分 16 時間を 8 時間で処理する ＝ **音声長あたり 0.5**。
+    """
+    result = run(sample(audio_s=DAY_SECONDS * 0.2, ratio=ratio, parts=8), "--asr")
     assert result.returncode == expected, result.stdout
 
 
-def test_the_judgement_does_not_use_the_average_rtf() -> None:
-    """**平均 `rtf` からの換算では PASS になるが、実 `elapsed_s` では FAIL になる形。**
+def test_the_judgement_does_not_use_the_part_count() -> None:
+    """**Part 数で外挿しないこと。**
 
-    `rtf=0.1` なら 16 時間 × 0.1 = 1.6 時間で悠々 PASF に見えるが、
-    実際に 1 Part へ 1200 秒かけているので 32 Part では 10.7 時間かかる。
-    **短い Part ばかり測ったときに楽観へ倒れる**のがこの換算の危うさである。
+    2 本で十分な音声長を測った場合と、同じ音声長を 64 本に割った場合で、
+    **判定は変わってはならない。**Part 数で外挿していると、本数を変えただけで
+    答えが動く（実機で踏んだ誤りがこれである。#95）。
     """
-    logs = "\n".join(asr_line(f"D/T/{i}_orig.wav", elapsed=1200, rtf=0.1) for i in range(2))
-    result = run(logs, "--asr")
-    assert result.returncode == EXIT_BELOW_TARGET, result.stdout
-    assert "10.67 時間" in result.stdout
+    few = run(sample(audio_s=DAY_SECONDS * 0.5, ratio=0.12, parts=2), "--asr")
+    many = run(sample(audio_s=DAY_SECONDS * 0.5, ratio=0.12, parts=64), "--asr")
+    assert few.returncode == many.returncode == 0, few.stdout + many.stdout
+    for line in ("1 日分（16 時間）への外挿",):
+        assert _line_with(few.stdout, line) == _line_with(many.stdout, line), (
+            few.stdout + "\n---\n" + many.stdout
+        )
+
+
+def _line_with(text: str, needle: str) -> str:
+    for line in text.splitlines():
+        if needle in line:
+            return line
+    raise AssertionError(f"{needle!r} が出力に無い:\n{text}")
 
 
 @pytest.mark.parametrize(
@@ -153,7 +220,8 @@ def test_text_and_json_agree() -> None:
     ]
     text = run("\n".join(lines))
     js = run("\n".join(as_json(line) for line in lines))
-    assert text.returncode == js.returncode == 0, text.stdout + js.stdout
+    # **判定そのものは問わない。**見たいのは「形式が変わっても同じ答えになる」こと
+    assert text.returncode == js.returncode, text.stdout + js.stdout
     assert text.stdout == js.stdout
 
 

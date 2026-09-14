@@ -17,6 +17,7 @@ import shutil
 import subprocess
 
 import pytest
+import yaml
 
 from tests.helpers import REPO_ROOT
 from tests.spec_sync import spec_section_code, spec_text
@@ -174,6 +175,26 @@ def test_the_volume_is_declared_in_compose() -> None:
     compose = (REPO_ROOT / "compose.yaml").read_text(encoding="utf-8")
     assert "voicedock-models:/models/whisper" in compose
     assert re.search(r"^  voicedock-models:", compose, re.M)
+
+
+def test_every_volume_pins_its_name() -> None:
+    """**`name:` を明示していること**（§18.2。v5.12→v5.13 の変更 AA-1）。
+
+    書かないと Compose が**プロジェクト名を前置**して `voicedock_voicedock-models` になり、
+    `fetch-models.sh` が書き込む `voicedock-models` とは**別の volume** をマウントする。
+    症状は「574 MB を取得したのに D-8 がモデルを見つけない」であり、
+    **取得の失敗と区別がつかない**（2026-09-14 に実機で踏んだ。#95）。
+
+    宣言の有無だけを見ていた `test_the_volume_is_declared_in_compose` は、
+    **名前が食い違っていても緑のままだった。**
+    """
+    compose = yaml.safe_load((REPO_ROOT / "compose.yaml").read_text(encoding="utf-8"))
+    declared = compose.get("volumes") or {}
+    assert declared, "compose.yaml に volumes が無い"
+    for key, options in declared.items():
+        assert isinstance(options, dict) and options.get("name") == key, (
+            f"volume {key!r} に name: が無い（Compose がプロジェクト名を前置する）"
+        )
 
 
 def test_the_makefile_has_a_models_target() -> None:
