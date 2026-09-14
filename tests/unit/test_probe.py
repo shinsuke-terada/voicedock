@@ -49,13 +49,14 @@ def build_home(
     mount_readonly: bool | None = True,
     devices: dict[str, list[str]] | None = None,
     heartbeat_text: str | None = None,
+    mount_mode: str = "ro",
 ) -> Path:
     """`<VOICEDOCK_HOME>` を組み立てる。`mount_readonly=None` で heartbeat を置かない。"""
     home = tmp_path / "VoiceDock"
     (home / "state").mkdir(parents=True)
     (home / "log").mkdir()
     (home / "helper.conf").write_text(
-        'MOUNT_MODE="ro"\n'
+        f'MOUNT_MODE="{mount_mode}"\n'
         "STABILITY_FAST_PATH_SECONDS=60\n"
         "STABILITY_INTERVAL_SECONDS=0\n"
         "STABILITY_CHECKS=2\n",
@@ -156,6 +157,48 @@ def test_agreement_passes(tmp_path: Path) -> None:
     result = run_probe(tmp_path, home=home, mount_lines=[mounted(tmp_path, DEVICE, readonly=True)])
     assert result.returncode == 0, result.stdout + result.stderr
     assert "✅ **PASS**" in p0_8_section(result.stdout)
+
+
+def test_a_readonly_device_says_the_lock_is_in_effect(tmp_path: Path) -> None:
+    """**一致と「ロックが効いている」は別の問いである。**
+
+    v5.19 までは一致しさえすれば「ロック 2-B が実際に効いている」と書いていた。
+    """
+    home = build_home(tmp_path, mount_readonly=True)
+    result = run_probe(tmp_path, home=home, mount_lines=[mounted(tmp_path, DEVICE, readonly=True)])
+    section = p0_8_section(result.stdout)
+    assert "✅ **PASS**" in section
+    assert "ロック 2-B: **効いている**" in section
+
+
+def test_rw_mode_says_the_lock_is_released_on_purpose(tmp_path: Path) -> None:
+    """`MOUNT_MODE=rw` なら**外れているのが意図どおり**である（Phase 7 の状態。P0-8b）。"""
+    home = build_home(tmp_path, mount_readonly=False, mount_mode="rw")
+    result = run_probe(tmp_path, home=home, mount_lines=[mounted(tmp_path, DEVICE, readonly=False)])
+    section = p0_8_section(result.stdout)
+    assert result.returncode == 0
+    assert "✅ **PASS**" in section
+    assert "ロック 2-B: **外れている**" in section
+
+
+def test_ro_mode_with_a_writable_device_says_the_lock_is_not_applied(tmp_path: Path) -> None:
+    """**これが 2026-09-14 の 18:11 に実機で起きた形である**（`docs/POC.md` §10.1.2）。
+
+    `MOUNT_MODE=ro` を意図したのにデバイスは書き込み可能。`mount` と `heartbeat` は
+    **一致しているので PASS** だが、**保護はされていない。**
+    v5.19 までは「ロック 2-B が実際に効いている」と表示していた —
+    **保護されていないことを保護されていると読ませていた。**
+    """
+    home = build_home(tmp_path, mount_readonly=False, mount_mode="ro")
+    result = run_probe(tmp_path, home=home, mount_lines=[mounted(tmp_path, DEVICE, readonly=False)])
+    section = p0_8_section(result.stdout)
+    assert result.returncode == 0, "一致はしているので FAIL ではない"
+    assert "✅ **PASS**" in section
+    assert "ロック 2-B: ⚠ **かかっていない**" in section
+    # **意図した値そのものを見る。**文言だけを見ていたため、`%s` と引数が別の `printf` に
+    # 分かれていて `MOUNT_MODE=` が空で出る不具合を通していた（実機で踏んだ）
+    assert "`MOUNT_MODE=ro`" in section
+    assert "効いている" not in section
 
 
 def test_a_readwrite_mount_with_a_true_heartbeat_fails(tmp_path: Path) -> None:
