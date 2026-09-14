@@ -656,17 +656,57 @@ http://host.docker.internal:12434/engines/v1/models     → 200
  "object":"model","created":0,"owned_by":"docker","dmr":{}}]}
 ```
 
-| 記録事項 | 実測 |
+| 記録事項 | 実測（`/models` を直接叩いた場合） |
 |---|---|
-| URL の形 | **`/engines/v1` を含む。**`§12.1` の `{URL}/chat/completions` がそのまま使える |
+| URL の形 | `/engines/v1` を含む形で 200 が返る |
 | ホスト名 | `model-runner.docker.internal`（ポート指定なし）と `host.docker.internal:12434` の両方 |
-| **モデル id** | **`docker.io/` 接頭辞が付く** — `ai/qwen3:...` ではなく `docker.io/ai/qwen3:...` が返る |
+| モデル id | `/models` の一覧は **`docker.io/` 接頭辞つき**で返す（`docker.io/ai/qwen3:...`） |
 
-> **`models` 長構文での注入は未検証である。**`compose.yaml` の `models:` は
-> `TODO(#13)` のままで、本節の実測は**環境変数を手で与えた**もの
-> （`VOICEDOCK_LLM_URL` / `VOICEDOCK_LLM_MODEL`）。
-> **Compose 5.5.1 が実際に何を注入するか（とくにモデル id に接頭辞が付くか）は
-> 長構文を入れてから確かめること。**§22 R-21 はここに掛かっている。
+### 11.1.1 `models` 長構文が実際に注入する値（**上と違う**）
+
+`compose.yaml` に §18.2 の長構文を書いて `make up` した結果:
+
+```text
+$ docker compose exec voicedock env | grep VOICEDOCK_LLM
+VOICEDOCK_LLM_URL=http://model-runner.docker.internal/v1/
+VOICEDOCK_LLM_MODEL=ai/qwen3:30b-a3b-instruct-2507-q4_K_M
+```
+
+| | 手で与えていた値 | **Compose 5.5.1 が注入する値** |
+|---|---|---|
+| URL | `http://model-runner.docker.internal/engines/v1` | **`http://model-runner.docker.internal/v1/`** |
+| モデル id | `docker.io/ai/qwen3:30b-a3b-instruct-2507-q4_K_M` | **`ai/qwen3:30b-a3b-instruct-2507-q4_K_M`** |
+
+**どちらも違った。**`/engines/v1` ではなく `/v1/`（**末尾スラッシュつき**）であり、
+モデル id に `docker.io/` 接頭辞は**付かない**。`/models` の一覧が接頭辞つきで返すのとは別である。
+
+**両方ともそのまま通る:**
+
+```text
+endpoint_of: Endpoint(base_url='http://model-runner.docker.internal/v1/',
+                      model='ai/qwen3:30b-a3b-instruct-2507-q4_K_M')
+chat_url   : http://model-runner.docker.internal/v1/chat/completions
+status: 200
+body  : {"choices":[{"message":{"role":"assistant","content":"2"}}], ...}
+```
+
+> **末尾スラッシュを吸収しているのは `Endpoint.chat_url` である**（§12.1）。
+> `base_url.rstrip("/")` を挟んでおり、註記に「`.../v1` と `.../v1/` の両方が注入されうる」
+> と書いてあった。**その想定が当たっていた** — `httpx` の URL 結合に任せていたら
+> `urljoin` の規則で `v1` が消えていた。
+
+**§22 R-21（Compose 5 系での `models` 長構文の実挙動）はこれで閉じる。**
+
+コンテナ側 doctor が初めて全項目通った:
+
+```text
+[✓] LLM endpoint         http://model-runner.docker.internal/v1/
+[✓] LLM response         ai/qwen3:30b-a3b-instruct-2507-q4_K_M  (0.3s, 30 tokens)
+────────────────────────────────────────────────────────
+12 checks passed, 0 failed, 1 notices
+```
+
+（1 notices は `Source deletion DISABLED` ＝ 三重ロックが掛かっている表示である。）
 
 ### 11.2 実音声での LLM 実行（**Daily ノートが出た**）
 

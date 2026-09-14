@@ -78,7 +78,9 @@ def healthy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **patch: Any) -> Pa
             },
         },
     )
-    monkeypatch.setenv("VOICEDOCK_LLM_URL", "http://model-runner.docker.internal/engines/v1")
+    # **Compose 5.5.1 が実際に注入する形**（2026-09-14 実測。docs/POC.md §11.1.1）。
+    # `/engines/v1` ではなく `/v1/` で、**末尾にスラッシュが付く**
+    monkeypatch.setenv("VOICEDOCK_LLM_URL", "http://model-runner.docker.internal/v1/")
     monkeypatch.setenv("VOICEDOCK_LLM_MODEL", "ai/test-model")
     monkeypatch.setattr(llm, "probe", lambda *_args, **_kwargs: GOOD_PROBE)
     write_heartbeat(
@@ -398,7 +400,7 @@ def test_d10_fails_when_not_executable(tmp_path: Path, monkeypatch: pytest.Monke
 
 def test_d11_shows_the_endpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     out, _code = run(healthy(tmp_path, monkeypatch), tmp_path / "state")
-    assert f"[✓] {'LLM endpoint':<21}http://model-runner.docker.internal/engines/v1" in out
+    assert f"[✓] {'LLM endpoint':<21}http://model-runner.docker.internal/v1/" in out
 
 
 def test_d11_fails_without_the_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
