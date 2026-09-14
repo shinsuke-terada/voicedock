@@ -18,6 +18,11 @@ LABEL="com.voicedock.ingest"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HELPER_DIR="$REPO_ROOT/helper"
 PLIST_DIR="$HOME/Library/LaunchAgents"
+
+# **テストからの差し替え口。**既定は実機の位置である。
+# CI のランナーには本物の `cc` が在るため、「コンパイラが無い」経路を
+# `PATH` の細工では作れない（`doctor.sh` の `VOICEDOCK_DOCKER_SETTINGS_DIR` と同じ趣旨）
+CC="${VOICEDOCK_CC:-cc}"
 PLIST_PATH="$PLIST_DIR/$LABEL.plist"
 
 info()  { printf '[install] %s\n' "$1"; }
@@ -122,7 +127,7 @@ install_launcher() {           # 成功したら 0
 
     [ -f "$source" ] || { warn "ラッパのソースがありません: $source"; return 1; }
 
-    if ! command -v cc >/dev/null 2>&1; then
+    if ! command -v "$CC" >/dev/null 2>&1; then
         warn "cc が見つかりません。ラッパを作れません（Xcode Command Line Tools が要ります）"
         warn "  → LaunchAgent は macOS の TCC でデバイスを読めません（§3.4(7)）。"
         warn "  → xcode-select --install のあと ./helper/install.sh を再実行してください"
@@ -130,7 +135,7 @@ install_launcher() {           # 成功したら 0
         return 1
     fi
 
-    if ! cc -O2 -Wall -o "$target" "$source" 2>&1; then
+    if ! "$CC" -O2 -Wall -o "$target" "$source" 2>&1; then
         warn "ラッパのビルドに失敗しました: $source"
         rm -f "$target"
         return 1
