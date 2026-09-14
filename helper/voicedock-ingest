@@ -481,6 +481,14 @@ copy_candidates() {        # $1=device_id
         write_meta "$device_id" "$rel" "$size" "$mtime" "$sha" > "$dst_dir/$name.meta.json.tmp"
         mv "$dst_dir/$name.meta.json.tmp" "$dst_dir/$name.meta.json"
         info "copied relpath=$rel bytes=$size"
+        # **コピー 1 件ごとに heartbeat を更新する**（#117）。1 日分の取り込みは約 11 分
+        # かかり、**`helper_heartbeat_max_age_seconds`（900）− `StartInterval`（300）
+        # ＝ 600 秒**を超える。最後にしか書かないと、**動いている helper をコンテナが
+        # 死んだと判定し、パイプライン全体を止める**（`worker.py` の `_helper_is_stale`）。
+        #
+        # **`inventory.json` は書かない。**あれは「デバイスに何があるか」の一覧であり、
+        # 途中経過に意味が無い（判断 4）
+        write_heartbeat
         i=$((i + 1))
     done
 }
@@ -796,6 +804,17 @@ main() {
         # 「diskutil の終了コードを信用しない」と書いているのと同じ理由である
         _is_mounted_readonly "$path" || all_readonly=0
 
+        # **途中経過でも heartbeat を書けるようにする**（#117）。ここまでに観測した
+        # デバイスの論理積であり、**残りが書き込み可能なら後で `false` に戻る。**
+        # 途中で `true` に見えるのは**削除を止める側**なので安全である
+        # （§14.2 のロック 2-B は `mount_readonly == false` で開く）
+        if [ "$all_readonly" -eq 1 ]; then
+            MOUNT_READONLY="true"
+        else
+            MOUNT_READONLY="false"
+        fi
+        write_heartbeat
+
         # **空き容量は remount の後に測る。**読み取り専用での再マウントは
         # 空き容量を変えないが、失敗して別の扱いになった場合に実際の状態を映す
         inventory_free_add "$device_id" "$(_free_bytes "$path")"
@@ -816,6 +835,8 @@ main() {
         i=$((i + 1))
     done
 
+    # **デバイスが 0 個なら `MOUNT_READONLY` は初期値の `false` のままである。**
+    # ループ内で更新するようになった（#117）ので、ここは最終確認だけを行う
     if [ ${#DEVICES[@]} -gt 0 ] && [ "$all_readonly" -eq 1 ]; then
         MOUNT_READONLY="true"
     fi
