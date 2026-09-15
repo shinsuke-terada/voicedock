@@ -27,7 +27,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import IO, Any, Final
 
-from voicedock import db, llm, paths, raw, status, transcribe
+from voicedock import db, device, llm, paths, raw, status, transcribe
 from voicedock.config import (
     ConfigError,
     ConfigUnreadable,
@@ -469,6 +469,47 @@ def check_helper(ctx: Context) -> list[Row]:
     return [Row(Status.OK, "Helper", f"running {detail}", tuple(extra))]
 
 
+def check_inbox_orphans(ctx: Context) -> list[Row]:
+    """D-20: **inbox に取り残しが無い**（§10.2 / #120）。
+
+    partkey が終端状態（`FAILED` を除く）の原本が inbox に残っていると、
+    **二度と処理されないのにディスクを使い続ける。**`inbox_retain` の削除は変換の後に
+    行われるので、**変換しない Part の原本は誰も消さない。**
+
+    **`FAIL` にしない。**記録が失われているわけではなく、ディスクを使っているだけである。
+    **自動で消しもしない** — inbox は Helper が書く領域であり、コンテナが消してよいのは
+    §10.5 の `inbox_retain` の経路だけである（§14.4 の封じ込めと同じ考え方）。
+    **見えるようにして、消す判断は利用者に委ねる。**
+    """
+    root = Path(ctx.config.import_.inbox_root)
+    if not root.is_dir():
+        return [Row(Status.SKIP, "Inbox orphans", f"{root} がありません")]
+
+    orphaned = status.orphaned_partkeys(ctx.config)
+    if orphaned is None:
+        return [Row(Status.SKIP, "Inbox orphans", "DB を読めません")]
+
+    count = 0
+    total = 0
+    for candidate in device.list_inbox_parts(root, tz=ctx.config.tz).parts:
+        if candidate.partkey in orphaned:
+            count += 1
+            total += candidate.source.size
+    if count == 0:
+        return [Row(Status.OK, "Inbox orphans", "none")]
+    return [
+        Row(
+            Status.NOTICE,
+            "Inbox orphans",
+            f"{count} files, {total / 1024 / 1024 / 1024:.1f} GiB",
+            (
+                "処理済みの Part の原本が inbox に残っている。**二度と処理されない**",
+                "`inbox_retain` の経路では消えない。**消すかどうかは利用者が決める**",
+            ),
+        )
+    ]
+
+
 def check_source_deletion(ctx: Context) -> list[Row]:
     """D-17: **削除モードの状態を必ず表示する。三重ロックの 3 つすべてを個別に**（§19.2）。
 
@@ -539,6 +580,7 @@ CHECKS: Final[tuple[Check, ...]] = (
     Check(id="D-12", fatal=True, labels=("LLM response",), run=check_llm_response),
     Check(id="D-13", fatal=True, labels=("Obsidian vault",), run=check_vault),
     Check(id="D-18", fatal=True, labels=("Helper",), run=check_helper),
+    Check(id="D-20", fatal=False, labels=("Inbox orphans",), run=check_inbox_orphans),
     Check(
         id="D-17",
         fatal=False,
