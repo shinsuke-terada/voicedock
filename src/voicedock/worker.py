@@ -116,6 +116,7 @@ class Worker:
         self.close_idle_sessions()
         self.process_pending_parts()
         self.process_ready_sessions()
+        self.evaluate_deletions()
         self.requeue_failed(inventory)
         return True
 
@@ -266,6 +267,45 @@ class Worker:
                 db.EntityType.SESSION,
                 session_key,
             )
+
+    def evaluate_deletions(self) -> None:
+        """`SAVED` 以降のセッションの §14.1 を再評価する（§10.0 / §14.3）。
+
+        **`process_ready_sessions()` では拾えない。**あちらの走査対象は
+        `pipeline.PROCESSABLE`（統合・解析・書き込み）であり、**`SAVED` は入っていない。**
+        一度 `SAVED` に座ったセッションは、**新しい Part が届いて再オープンされない
+        かぎり誰も触らなかった**（v5.41→v5.42 の変更 BD-1。実機で判明）。
+
+        **`PROCESSABLE` を広げてはならない。**あれは「Daily ノートを書き直す」経路の
+        入口であり、`SAVED` を入れると**書き終えたノートを毎周回作り直す。**
+
+        **`delete_evaluation_delay()` に従う。**5 秒ごとに実ファイル検証を繰り返す
+        ビジーループを避ける（§15.2）。**この関数は v5.41 までテストからしか
+        呼ばれていなかった。**
+        """
+        runner = pipeline.Pipeline(
+            database=self.database, cfg=self.cfg, log=self.log, now=self.now()
+        )
+        for session_key in self.deletable_session_keys():
+            if self.stopper.should_stop():
+                return
+            runner.delete_sources_if_safe(SessionKey(session_key))
+
+    def deletable_session_keys(self) -> list[str]:
+        """再評価の時期が来た `DELETE_EVALUATED` のセッション（§14.3）。
+
+        **`updated_at` からの経過が `delete_evaluation_delay()` を超えたものだけ。**
+        """
+        moment = self.now()
+        found: list[str] = []
+        for key, status, attempts, updated in self.database.sessions_for_delete_evaluation():
+            if status not in pipeline.DELETE_EVALUATED:
+                continue
+            delay = pipeline.delete_evaluation_delay(attempts, self.cfg)
+            if (moment - updated).total_seconds() < delay:
+                continue
+            found.append(key)
+        return found
 
     def ready_session_keys(self) -> list[str]:
         """`process_session()` に渡すセッション（§9.3）。

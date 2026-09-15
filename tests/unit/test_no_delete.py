@@ -775,6 +775,80 @@ def test_the_watchdog_terms_are_present_in_the_formula() -> None:
     assert "analysis" not in source, "解析結果を条件に戻している（AY-1）"
 
 
+# --- 再試行の経路（#154）------------------------------------------------
+
+
+def test_a_pending_part_can_be_retried(scene: Scene) -> None:
+    """**`SOURCE_DELETE_PENDING → SOURCE_DELETING` は §9.3 の正規の辺である。**
+
+    v5.41 まで遷移元が `RAW_SAVED` の決め打ちで、**再試行の経路そのものが
+    `TransitionConflict` で落ちていた**（#154。実機で判明）。
+    """
+    scene.rearm()
+    scene.set_part(status=PartStatus.SOURCE_DELETE_PENDING)
+
+    scene.evaluate()
+
+    assert scene.requests() != [], "再試行で要求が書かれない"
+    assert scene.part().status == PartStatus.SOURCE_DELETING
+
+
+def test_a_part_already_requested_is_not_requested_again(scene: Scene) -> None:
+    """**`SOURCE_DELETING` は飛ばす。**自己遷移は `PART_TRANSITIONS` に無く、
+    同じ Part の要求が二重に並ぶ（§10.12）。
+    """
+    scene.rearm()
+    scene.set_part(status=PartStatus.SOURCE_DELETING)
+
+    scene.evaluate()
+
+    assert scene.requests() == [], "二重に要求を出した"
+
+
+def test_a_completed_part_is_left_to_the_backlog(scene: Scene) -> None:
+    """**通常運用の経路から `COMPLETED` を消しにいかない。**
+
+    `PART_DELETABLE` に入っているのは §17.1 の `cleanup --backlog`（#38）のためである。
+    """
+    scene.rearm()
+    scene.set_part(status=PartStatus.COMPLETED)
+
+    scene.evaluate()
+
+    assert scene.requests() == []
+
+
+def test_one_conflict_does_not_stop_the_rest(scene: Scene) -> None:
+    """**1 件の食い違いでセッション全体の評価を止めない。**
+
+    実機では 5 本が `RAW_SAVED` で待っていたのに、**先頭 1 件の例外で 1 件も
+    評価されなかった。**
+    """
+    scene.rearm()
+    other = partkey_for(
+        DEVICE_ID,
+        DevicePath(PurePosixPath("TX_MIC001_20260912_100000/TX00_MIC001_20260912_100000_orig.wav")),
+    )
+    scene.database.insert_recording(
+        Recording(
+            partkey=other,
+            device_id=DEVICE_ID,
+            source_folder="TX_MIC001_20260912_100000",
+            transmitter_id="TX00",
+            mic_index=1,
+            started_at="2026-09-12T10:00:00+09:00",
+            status=PartStatus.SOURCE_DELETING,  # ← 飛ばされる側
+            updated_at="2026-09-12T10:00:00+09:00",
+            session_key=SESSION_KEY,
+        )
+    )
+
+    scene.evaluate()
+
+    assert scene.requests() != [], "先頭の 1 件で止まった"
+    assert scene.part().status == PartStatus.SOURCE_DELETING
+
+
 # --- ロック 2-B で止まらない（#145）------------------------------------
 
 
