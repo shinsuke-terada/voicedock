@@ -24,7 +24,7 @@ from voicedock.config import Config
 from voicedock.db import Database, Recording, Session
 from voicedock.errors import EXIT_OK, ErrorCode
 from voicedock.paths import DevicePath, partkey_for
-from voicedock.states import PartStatus, SessionStatus
+from voicedock.states import PART_TERMINAL, PartStatus, SessionStatus
 
 JST = ZoneInfo("Asia/Tokyo")
 NOW = datetime(2026, 9, 13, 9, 0, 0, tzinfo=JST)
@@ -564,3 +564,102 @@ def test_the_two_formats_keep_their_own_constants() -> None:
     assert status.LABEL_WIDTH == 22
     assert doctor.LABEL_WIDTH == 21
     assert status.SEPARATOR == doctor.SEPARATOR, "区切り線だけは §19.2 / §17.2 で同じ 56 桁"
+
+
+# --- inbox の取り残し（#120） -------------------------------------------
+# **`pending` は「これから処理される」という意味である。**partkey が終端状態の
+# ファイルは二度と処理されないので、同じ数に混ぜてはならない。
+# 2026-09-15 に実機で、処理されない 259 MB を `1 parts pending` と報告し続けた
+# （`Backlog : 未処理なし` と同時に出るので、どちらを信じればよいか分からない）。
+
+
+def inbox_pair(
+    cfg: Config,
+    *,
+    stem: str = "TX00_MIC001_20260912_120950",
+    folder: str = "TX_MIC001_20260912_120950",
+    size: int = 1024,
+) -> Path:
+    """Helper が置いた形（`.wav` + `.meta.json`）を作る（§10.2）。"""
+    root = Path(cfg.import_.inbox_root) / DEVICE / folder
+    root.mkdir(parents=True, exist_ok=True)
+    wav = root / f"{stem}_orig.wav"
+    wav.write_bytes(b"x" * size)
+    (root / f"{stem}_orig.wav.meta.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "device_id": DEVICE,
+                "relpath": f"{folder}/{stem}_orig.wav",
+                "size": size,
+                "mtime": 1789000000.0,
+                "sha256": "0" * 64,
+                "copied_at": "2026-09-12T12:09:50+09:00",
+                "helper_version": "5.5.0",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return wav
+
+
+def test_orphaned_states_is_terminal_minus_failed() -> None:
+    """**定数そのものを固定する。**
+
+    下の parametrize は `ORPHANED_STATES` を元にしているので、
+    **空にするとテストケースが 0 個になって黙って消える**（意図的破壊で踏んだ）。
+    検証対象を parametrize の元にしてはならない。
+    """
+    assert PartStatus.COMPLETED in status.ORPHANED_STATES
+    assert PartStatus.SKIPPED in status.ORPHANED_STATES
+    assert PartStatus.RAW_SAVED in status.ORPHANED_STATES
+    # **`FAILED` は取り残しにしない**（§15.2 で再投入される）
+    assert PartStatus.FAILED not in status.ORPHANED_STATES
+    assert len(status.ORPHANED_STATES) == len(PART_TERMINAL) - 1
+
+
+@pytest.mark.parametrize(
+    "state",
+    sorted(status.ORPHANED_STATES),
+)
+def test_a_terminal_part_is_reported_as_an_orphan(
+    cfg: Config, state_root: Path, database: Database, state: str
+) -> None:
+    """**終端状態の原本は `pending` に数えない。**二度と処理されない（#120）。"""
+    part(database, state=state)
+    inbox_pair(cfg)
+
+    value = row_value(text(cfg, state_root), "Inbox")
+    assert value.startswith("0 parts pending")
+    assert "取り残し 1 件" in value
+
+
+def test_a_failed_part_is_still_pending(cfg: Config, state_root: Path, database: Database) -> None:
+    """**`FAILED` は取り残しにしない。**§15.2 でデバイス再接続とサービス起動のたびに
+    再投入されるので、**処理待ちである。**
+    """
+    part(database, state=PartStatus.FAILED)
+    inbox_pair(cfg)
+
+    value = row_value(text(cfg, state_root), "Inbox")
+    assert value.startswith("1 parts pending")
+    assert "取り残し" not in value
+
+
+def test_an_unknown_part_is_pending(cfg: Config, state_root: Path, database: Database) -> None:
+    """**DB に行が無いものは処理待ちである。**まだ discover していないだけ。"""
+    inbox_pair(cfg)
+
+    value = row_value(text(cfg, state_root), "Inbox")
+    assert value.startswith("1 parts pending")
+    assert "取り残し" not in value
+
+
+def test_no_orphans_prints_no_parenthesis(
+    cfg: Config, state_root: Path, database: Database
+) -> None:
+    """**0 件なら括弧ごと出さない。**正常な状態に注意を引かない。"""
+    part(database, state=PartStatus.DISCOVERED)
+    inbox_pair(cfg)
+
+    assert "(" not in row_value(text(cfg, state_root), "Inbox")
