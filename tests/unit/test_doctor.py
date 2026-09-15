@@ -57,15 +57,21 @@ def fake_tool(path: Path, version: str = "7.1") -> Path:
 
 
 def healthy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **patch: Any) -> Path:
-    """**D-1〜D-18 がすべて通る**環境を作り、設定ファイルのパスを返す。
+    """**D-1〜D-20 がすべて通る**環境を作り、設定ファイルのパスを返す。
 
-    `/data` と `/obsidian` 相当を `tmp_path` 配下へ向け、スキーマを適用した DB と
+    `/data` と `/obsidian` と `/inbox` 相当を `tmp_path` 配下へ向け、スキーマを適用した DB と
     偽 ffmpeg / ffprobe と `heartbeat.json` を置く。LLM は `llm.probe` を差し替える。
+
+    **`inbox_root` を必ず `tmp_path` 配下にする。**既定のままだと `/inbox` を見るので、
+    **開発イメージでは通り、CI の runner では SKIP になる**（2026-09-15 に踏んだ）。
+    **環境に依存する検査結果を fixture の外に残さない。**
     """
     data_root = tmp_path / "data"
     data_root.mkdir(exist_ok=True)
     vault = tmp_path / "obsidian"
     vault.mkdir(exist_ok=True)
+    inbox = tmp_path / "inbox"
+    inbox.mkdir(exist_ok=True)
     monkeypatch.setattr(paths, "DATA_ROOT", data_root)
     monkeypatch.setattr(paths, "VAULT_ROOT", vault)
     with db.connect(data_root / "voicedock.db"):
@@ -77,6 +83,7 @@ def healthy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **patch: Any) -> Pa
         {
             "database": {"path": str(data_root / "voicedock.db")},
             "obsidian": {"root": str(vault)},
+            "import": {"inbox_root": str(inbox)},
             "audio": {
                 "ffmpeg": str(fake_tool(tools / "ffmpeg")),
                 "ffprobe": str(fake_tool(tools / "ffprobe")),
@@ -795,11 +802,9 @@ def inbox_pair_for(path: Path, *, device: str = "DJIMIC3") -> None:
 
 def test_d20_notices_an_orphan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """**取り残しは `NOTICE`。`FAIL` にしない**（記録は失われていない。#120）。"""
-    inbox = tmp_path / "inbox"
-    inbox.mkdir(exist_ok=True)
-    path = healthy(tmp_path, monkeypatch, **{"import": {"inbox_root": str(inbox)}})
+    path = healthy(tmp_path, monkeypatch)
     cfg = load_config(path)
-    inbox_pair_for(inbox)
+    inbox_pair_for(Path(cfg.import_.inbox_root))
     with db.connect(cfg.database.path, busy_timeout_ms=1000, tz=cfg.tz) as opened:
         opened.insert_recording(_orphan_row())
 
@@ -813,11 +818,9 @@ def test_d20_is_ok_when_the_part_is_not_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """処理待ちの原本は取り残しではない。"""
-    inbox = tmp_path / "inbox"
-    inbox.mkdir(exist_ok=True)
-    path = healthy(tmp_path, monkeypatch, **{"import": {"inbox_root": str(inbox)}})
+    path = healthy(tmp_path, monkeypatch)
     cfg = load_config(path)
-    inbox_pair_for(inbox)
+    inbox_pair_for(Path(cfg.import_.inbox_root))
     with db.connect(cfg.database.path, busy_timeout_ms=1000, tz=cfg.tz) as opened:
         opened.insert_recording(_orphan_row(state=PartStatus.DISCOVERED))
 
