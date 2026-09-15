@@ -1100,3 +1100,74 @@ def test_the_inventory_is_not_written_mid_run(tmp_path: Path, volumes: Path) -> 
 
     assert inventory.exists(), "実行後には inventory.json がある"
     assert len(seen) == 1, f"inventory.json が複数回書かれている: {sorted(seen)}"
+
+
+# --- reaper の起動（#152）-----------------------------------------------
+
+
+def place_reaper(tmp_path: Path, body: str) -> Path:
+    """`<VOICEDOCK_HOME>/bin/voicedock-reaper` に偽物を置く。
+
+    **本物を呼ばない。**呼ばれた印だけを残す。
+    """
+    bin_dir = tmp_path / "home" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    path = bin_dir / "voicedock-reaper"
+    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def test_the_reaper_runs_after_the_ingest(tmp_path: Path, volumes: Path) -> None:
+    """**取り込みの後に reaper を呼ぶ**（§10.1 手順 7 / #152）。
+
+    v5.40 まで**呼ぶものが存在しなかった。**LaunchAgent は ingest の 1 つだけで、
+    ingest も reaper を呼ばなかったので、**削除要求は誰にも読まれずタイムアウトしていた。**
+    `doctor` は `voicedock-reaper is INSTALLED` と出すので、**動く状態に見える。**
+    """
+    conf = write_conf(tmp_path)
+    marker = tmp_path / "reaper-ran"
+    place_reaper(tmp_path, f'date +%s > "{marker}"')
+
+    result = run_ingest(conf)
+
+    assert result.returncode == 0, result.stderr
+    assert marker.is_file(), "reaper が呼ばれていない"
+
+
+def test_the_reaper_is_not_run_when_absent(tmp_path: Path, volumes: Path) -> None:
+    """**配置されていなければ何もしない**（安全ロック 2-A。§14.2）。"""
+    conf = write_conf(tmp_path)
+    result = run_ingest(conf)
+
+    assert result.returncode == 0, result.stderr
+    assert "reaper" not in result.stderr.lower(), result.stderr
+
+
+def test_a_failing_reaper_does_not_fail_the_ingest(tmp_path: Path, volumes: Path) -> None:
+    """**削除の失敗で取り込みを落とさない。**
+
+    取り込みは記録の保全、削除は容量の解放であり、**優先順位が違う**（§1.3）。
+    ただし**黙って握りつぶさない。**
+    """
+    conf = write_conf(tmp_path)
+    place_reaper(tmp_path, "exit 3")
+
+    result = run_ingest(conf)
+
+    assert result.returncode == 0, "reaper の失敗で取り込みが落ちた"
+    assert "ingest_finished" in result.stdout, "取り込みが最後まで進んでいない"
+    assert "reaper_failed exit=3" in result.stderr, "失敗と終了コードを黙って握りつぶした"
+
+
+def test_the_reaper_runs_after_the_copy(tmp_path: Path, volumes: Path) -> None:
+    """**呼ぶのはコピーと墓標の後。**先に呼ぶと、その回の取り込みぶんを見られない。"""
+    conf = write_conf(tmp_path)
+    marker = tmp_path / "inbox-at-reaper-time"
+    inbox = tmp_path / "home" / "inbox"
+    place_reaper(tmp_path, f'find "{inbox}" -name "*.meta.json" 2>/dev/null | wc -l > "{marker}"')
+
+    run_ingest(conf)
+
+    assert marker.is_file(), "reaper が呼ばれていない"
+    assert int(marker.read_text().strip()) > 0, "コピーより前に reaper を呼んでいる"

@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-HELPER_VERSION="5.5.0"
+HELPER_VERSION="5.6.0"
 LOG_MAX_BYTES=5242880       # 5 MiB。超えたら .1 へ退避する（§10.1 手順 2）
 LOCK_STALE_SECONDS=21600    # 6 時間。PID の再利用とハングへの歯止め（§10.1 手順 1）
 META_SCHEMA=1
@@ -844,7 +844,30 @@ main() {
     write_inventory
     write_heartbeat
     rm -f "$INVENTORY_WORK"
+    run_reaper
     info "ingest_finished devices=${#DEVICES[@]}"
+}
+
+# 削除要求の処理（§10.1 手順 7 / §14.3。v5.40→v5.41 の変更 BC-2）。
+#
+# **reaper を起動するのはここだけである。**LaunchAgent を 2 つにしない。
+#
+#   1. **TCC。**launchd から起動したプロセスがリムーバブルボリュームを読むには
+#      ad-hoc 署名したラッパが要る（§3.4(7)）。**子プロセスなら ingest の TCC を継承する。**
+#      2 つ目の LaunchAgent には 2 つ目のラッパが要る
+#   2. **契機が同じ。**reaper が仕事をできるのはデバイスが挿さっているときだけであり、
+#      それは ingest が走る条件そのものである
+#
+# **配置されていなければ何もしない**（安全ロック 2-A はそのまま。§14.2）。
+# **失敗しても取り込みを落とさない** —— 取り込みは記録の保全、削除は容量の解放であり、
+# 優先順位が違う（§1.3）。ただし**黙って握りつぶさない。**
+run_reaper() {
+    local reaper="$VOICEDOCK_HOME/bin/voicedock-reaper" status=0
+    [ -x "$reaper" ] || return 0
+    # **終了コードを先に捕まえる。**`if ! "$reaper"; then warn "exit=$?"` は
+    # `!` の結果（常に 0）を見てしまう
+    "$reaper" || status=$?
+    [ "$status" -eq 0 ] || warn "reaper_failed exit=$status"
 }
 
 main "$@"

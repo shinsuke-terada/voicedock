@@ -14,7 +14,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, Final
 
@@ -41,6 +41,14 @@ def _helper_version() -> str:
 HELPER_VERSION: Final = _helper_version()
 META_SCHEMA: Final = 1
 DEFAULT_COPIED_AT: Final = datetime(2026, 9, 13, 9, 0, 0, tzinfo=UTC)
+
+DEVICE_MTIME_OFFSET: Final = timedelta(hours=4, minutes=34)
+"""墓標の `mtime`（デバイス上の原本）と inbox コピーの時刻の差（#151）。
+
+**0 にしてはならない。**同じ値だと「コンテナがどちらを読んでいるか」が区別できず、
+§14.1.1 の検証 10 が通るかどうかをテストが確かめられない。実機で見つかった
+ずれは 4 時間半だった。
+"""
 
 ORIG: Final = "orig"
 DENOISED: Final = "denoised"
@@ -131,8 +139,13 @@ def _sha256(path: Path) -> str:
 def _write_meta(wav: Path, recording: FakeRecording, variant: str, copied_at: datetime) -> Path:
     """`<name>.wav.meta.json` を書く（§10.2）。
 
-    **WAV を書いた直後に実ファイルから** size / mtime / sha256 を読む。ここがずれると
+    **WAV を書いた直後に実ファイルから** size / sha256 を読む。ここがずれると
     §10.5 のハッシュ照合テストが無意味になる。
+
+    **`mtime` だけは実ファイルから取らない**（#151）。墓標が記録するのは
+    **デバイス上の原本の更新時刻**であり、inbox のコピーの時刻ではない。実機では
+    録音時刻とコピー時刻が数時間離れる。**同じ値を書いていたせいで、コンテナが
+    どちらを読んでも違いが出ず、4 時間半のずれを 1 つのテストも捕まえなかった。**
     """
     stat = wav.stat()
     meta = {
@@ -140,7 +153,7 @@ def _write_meta(wav: Path, recording: FakeRecording, variant: str, copied_at: da
         "device_id": DEVICE_ID,
         "relpath": recording.relpath(variant),
         "size": stat.st_size,
-        "mtime": stat.st_mtime,
+        "mtime": (copied_at - DEVICE_MTIME_OFFSET).timestamp(),
         "sha256": _sha256(wav),
         "copied_at": copied_at.isoformat(),
         "helper_version": HELPER_VERSION,
