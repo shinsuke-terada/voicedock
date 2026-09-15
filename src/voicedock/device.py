@@ -372,7 +372,8 @@ def _scan_folder(
             if not wav_path.is_file():
                 # 墓標だけがある = 処理済み（§10.2）。**ログを出さない**
                 continue
-            stat = wav_path.stat()
+            # **値は使わない**（墓標から読む。BC-1）。inbox のコピーが読めることの確認である
+            wav_path.stat()
         except OSError:
             skipped.append(
                 SkippedEntry(relpath=relpath, event="part_skipped", reason="inbox_unreadable")
@@ -391,6 +392,20 @@ def _scan_folder(
         if not isinstance(device_relpath, str) or not device_relpath:
             skipped.append(
                 SkippedEntry(relpath=relpath, event="part_skipped", reason="meta_missing_relpath")
+            )
+            continue
+
+        # **デバイス上の事実は墓標から読む**（v5.40→v5.41 の変更 BC-1）。
+        # `wav_path.stat()` は **inbox のコピー**であり、`mtime` は**コピーした時刻**に
+        # なる。それを §14.1.1 の検証 10 が「デバイス上の実ファイル」と突き合わせるので、
+        # **削除が構造的に一度も成立しない**（#151。実機で 4 時間半ずれていた）。
+        # **コンテナはデバイスを見られない**（§5.6）ので、Helper の記録が唯一の出どころである
+        device_size = _meta_number(meta.get("size"))
+        device_mtime = _meta_number(meta.get("mtime"))
+        if device_size is None or device_mtime is None:
+            # **`stat` で埋め合わせない。**それが #151 の不具合そのものである
+            skipped.append(
+                SkippedEntry(relpath=relpath, event="part_skipped", reason="meta_missing_stat")
             )
             continue
 
@@ -414,12 +429,19 @@ def _scan_folder(
                 source=SourceFile(
                     relpath=DevicePath(PurePosixPath(device_relpath)),
                     inbox_path=InboxPath(wav_path),
-                    size=stat.st_size,
-                    mtime=stat.st_mtime,
+                    size=int(device_size),
+                    mtime=device_mtime,
                     sha256_helper=str(meta.get("sha256", "")),
                 ),
             )
         )
+
+
+def _meta_number(value: object) -> float | None:
+    """墓標の数値フィールド。**bool を弾く**（`True` は `int` の派生である）。"""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
 
 
 def _relpath_for(folder: Path, device_id: str, wav_name: str) -> str:
