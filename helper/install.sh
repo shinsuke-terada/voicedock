@@ -153,6 +153,69 @@ install_launcher() {           # 成功したら 0
     return 0
 }
 
+_set_conf() {   # $1=key $2=value。helper.conf の 1 行を差し替える
+    local conf="$VD_HOME/helper.conf" tmp
+    grep -q "^$1=" "$conf" || die "helper.conf に $1 がありません: $conf"
+    tmp="$(mktemp)"
+    awk -v key="$1" -v value="$2" '
+        index($0, key "=") == 1 { printf "%s=%s\n", key, value; next }
+        { print }
+    ' "$conf" > "$tmp"
+    cat "$tmp" > "$conf"      # **同じファイルへ書き戻す**（権限と所有者を保つ）
+    rm -f "$tmp"
+    info "helper.conf: $1=$2"
+}
+
+_confirm() {    # $1=確認文
+    [ "${ASSUME_YES:-0}" = "1" ] && return 0
+    printf '%s\n' "$1" >&2
+    printf '続けるには ENABLE と入力してください: ' >&2
+    local reply
+    read -r reply || reply=""
+    [ "$reply" = "ENABLE" ] || die "中止しました。何も変更していません"
+}
+
+# --- 削除の有効化 / 無効化（§14.2 / #39）---------------------------------
+#
+# **ホスト側の 3 つを 1 度に解除する。**1 つずつ手で直すと、**どれか 1 つ忘れた状態**
+# （ロック 1 だけ解除など）に落ちやすく、それは §14.3 のとおり「進まない」状態になる。
+#
+# **コンテナ側（config.yaml）はここでは触らない。**系統が違う（§7.4）。
+# `scripts/enable-deletion.sh` が両方をまとめる。
+
+enable_deletion() {
+    local conf="$VD_HOME/helper.conf"
+    [ -f "$conf" ] || die "helper.conf がありません。先に ./helper/install.sh を実行してください"
+    [ -f "$HELPER_DIR/voicedock-reaper" ] \
+        || die "voicedock-reaper が $HELPER_DIR にありません。安全ロック 2-A は解除できません（§14.2）"
+
+    _confirm "**デバイス上の元音声を削除できる状態にします**（§14.2 のホスト側 3 つ）。
+  ロック 1   : DELETE_SOURCE_AUDIO=false → true
+  ロック 2-A : voicedock-reaper を配置する
+  ロック 2-B : MOUNT_MODE=ro → rw（**デバイスが書き込み可能になります**）"
+
+    install_reaper
+    _set_conf DELETE_SOURCE_AUDIO true
+    _set_conf MOUNT_MODE rw
+    printf '\n'
+    warn "ホスト側の安全ロックを 3 つとも解除しました（§14.2）"
+    info "**コンテナ側はまだです。**config/config.yaml の cleanup.delete_source_audio を"
+    info "true にして make up してください（V-30 が片方だけの解除を止めます）"
+}
+
+disable_deletion() {
+    local conf="$VD_HOME/helper.conf"
+    [ -f "$conf" ] || die "helper.conf がありません: $conf"
+    _set_conf DELETE_SOURCE_AUDIO false
+    _set_conf MOUNT_MODE ro
+    rm -f "$VD_HOME/bin/voicedock-reaper"
+    info "voicedock-reaper を撤去しました（安全ロック 2-A）"
+    printf '\n'
+    info "ホスト側の安全ロックを 3 つとも掛け直しました（§14.2）"
+    info "**コンテナ側も戻してください。**config/config.yaml の cleanup.delete_source_audio を"
+    info "false にして make up（true のままだと V-30 / V-33 で起動しません）"
+}
+
 install_reaper() {
     # **黙って何もしてはならない。**「ロック 2-A を解除したつもり」の誤解を生む
     [ -f "$HELPER_DIR/voicedock-reaper" ] \
@@ -275,13 +338,20 @@ status() {
 
 usage() {
     cat <<'USAGE'
-usage: ./helper/install.sh [--with-reaper | --status | --uninstall]
+usage: ./helper/install.sh [--with-reaper | --enable-deletion | --disable-deletion
+                           | --status | --uninstall]
 
-  (no args)      Helper をインストールする（SPEC §3.4(6)）
-  --with-reaper  voicedock-reaper も配置する。**安全ロック 2-A を解除する**（§14.2。Phase 7）
-  --status       稼働確認
-  --uninstall    LaunchAgent を撤去する（<VOICEDOCK_HOME> は消さない）
-  --help         この表示
+  (no args)           Helper をインストールする（SPEC §3.4(6)）
+  --with-reaper       voicedock-reaper も配置する。**安全ロック 2-A だけを解除する**（§14.2）
+  --enable-deletion   **ホスト側の安全ロックを 3 つとも解除する**（§14.2。Phase 7）
+                      reaper の配置 + DELETE_SOURCE_AUDIO=true + MOUNT_MODE=rw
+                      **コンテナ側は別**。`make enable-deletion` が両方をまとめる
+  --disable-deletion  ホスト側の安全ロックを 3 つとも掛け直す
+  --status            稼働確認
+  --uninstall         LaunchAgent を撤去する（<VOICEDOCK_HOME> は消さない）
+  --help              この表示
+
+  --yes               --enable-deletion の確認入力を省く（スクリプトから呼ぶとき）
 USAGE
 }
 
@@ -294,6 +364,11 @@ main() {
             check_home; make_tree; write_conf; install_ingest
             install_launcher || true
             install_reaper; install_plist ;;
+        --enable-deletion)
+            [ "${2:-}" = "--yes" ] && ASSUME_YES=1
+            check_home; enable_deletion ;;
+        --disable-deletion)
+            check_home; disable_deletion ;;
         "")
             check_home; make_tree; write_conf; install_ingest
             # **失敗しても続ける**（install_launcher の註記）。plist 側が有無を見て決める

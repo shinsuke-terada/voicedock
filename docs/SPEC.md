@@ -3615,8 +3615,38 @@ v3.x の二重ロックのうち「マウント権限」は、コンテナが `/
 | ロック | 場所 | 既定値 | 強度 | 解除するタイミング |
 |---|---|---|---|---|
 | **ロック 1: 設定** | `config.yaml` の `cleanup.delete_source_audio` **と** `helper.conf` の `DELETE_SOURCE_AUDIO`（**両方**） | `false` | 設定 | Phase 7 |
-| **ロック 2-A: コードの不在** | `<VOICEDOCK_HOME>/bin/voicedock-reaper` が**存在しない** | 未配置 | **実行不能** | Phase 7 に `install.sh --with-reaper` |
-| **ロック 2-B: OS レベル** | `helper.conf` の `MOUNT_MODE=ro` → ingest が読み取り専用で再マウントし、**`mount(8)` で観測した値**を `mount_readonly` に書く | `ro` | **OS レベル** | Phase 7 に `MOUNT_MODE=rw` |
+| **ロック 2-A: コードの不在** | `<VOICEDOCK_HOME>/bin/voicedock-reaper` が**存在しない** | 未配置 | **実行不能** | Phase 7 に `make enable-deletion` |
+| **ロック 2-B: OS レベル** | `helper.conf` の `MOUNT_MODE=ro` → ingest が読み取り専用で再マウントし、**`mount(8)` で観測した値**を `mount_readonly` に書く | `ro` | **OS レベル** | Phase 7 に `make enable-deletion` |
+
+#### 解除は `make enable-deletion` で行う（v5.38→v5.39 の変更 BA-1）
+
+**三重ロックは 2 つの系統に分かれている**（§7.4）。
+
+| 系統 | 触るもの |
+|---|---|
+| ホスト側 | `helper.conf` の `DELETE_SOURCE_AUDIO` / `MOUNT_MODE`、`voicedock-reaper` の配置 |
+| コンテナ側 | `config.yaml` の `cleanup.delete_source_audio` |
+
+**1 つずつ手で直させない。**どれか 1 つ忘れた状態に落ちやすく、**ロック 1 だけの解除は
+削除もされずセッションも進まない**（§14.3 / #145）。V-30 / V-33 が起動時に止めるが、
+**そもそも半端な状態を作らせない**のが `make enable-deletion` の役目である。
+
+```bash
+make enable-deletion     # 確認入力（ENABLE）を求めたうえで 2 系統をまとめて解除する
+make disable-deletion    # 3 つとも掛け直す。**確認は求めない**（止めたいときに止められること）
+```
+
+| 性質 | 理由 |
+|---|---|
+| **確認は `ENABLE` の入力**（`y` では通らない） | 打ち間違いで有効化させない |
+| **中止したら 1 つも変えない** | 半端な状態を作らない |
+| **`config/config.yaml` が無ければホスト側も触らない** | 同上 |
+| **reaper の原本が無ければ 1 つも変えない** | 同上 |
+| **戻せる**（`make disable-deletion`） | **戻せない変更は怖くて実行できない** |
+| 先に確かめることを出す | E2E の PASS、**1 日を通しての運用**（#125）、`make doctor` |
+
+**`install.sh --enable-deletion` はホスト側だけを行う。**`--with-reaper` は
+**reaper の配置だけ**（ロック 2-A のみ）であり、名前どおりの意味を保つ。
 
 #### ロック 2-A: 削除できるコードがホスト上に存在しない
 

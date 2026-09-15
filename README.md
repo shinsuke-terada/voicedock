@@ -80,6 +80,10 @@ make down                    # 停止
 make logs                    # ログを追う
 make status                  # 処理状況サマリ（失敗・滞留を見る唯一の窓口）
 make doctor                  # ホスト 7 件 → コンテナ 13 件の診断（合計 20）
+
+# 削除の有効化（Phase 7。**既定では無効**）
+make enable-deletion         # 三重ロックを 2 系統まとめて解除する（確認入力あり）
+make disable-deletion        # 3 つとも掛け直す
 ```
 
 **異常は `docker ps` に出る。**healthcheck（§19.1）が落ちるとコンテナが `unhealthy` に
