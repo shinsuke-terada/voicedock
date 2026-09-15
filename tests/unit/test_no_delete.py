@@ -157,7 +157,7 @@ def scene(
     monkeypatch.setattr(paths, "ANALYSIS_ROOT", data / "analysis")
 
     vault = tmp_path / "obsidian"
-    vault.mkdir()
+    (vault / ".obsidian").mkdir(parents=True)  # §13.6 の目印
     queue = tmp_path / "queue"
     state = tmp_path / "state"
     state.mkdir()

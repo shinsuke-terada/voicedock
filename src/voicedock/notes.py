@@ -464,6 +464,35 @@ def failed_rules(results: Collection[CheckResult]) -> tuple[str, ...]:
 # --- §13.1 / §13.5 出力先と衝突 ----------------------------------------
 
 
+def vault_is_available(root: Path, marker: str) -> bool:
+    """`root` が**本物の Vault** かどうか（§13.6 / §19.1 H-4 / §19.2 D-13）。
+
+    **「書ける」を「Vault である」と読んではならない**（v5.33→v5.34 の変更 AV-1）。
+    Docker は bind mount の source が無ければ**空ディレクトリとして作る**ので、
+    Vault を退避してもコンテナからは書ける場所に見え続ける。2026-09-15 の実機では
+    その空ディレクトリへ Daily ノートを書き、`obsidian_saved` を報告していた（#134）。
+
+    **目印は `.obsidian/` である。**Obsidian が Vault として開いた場所には必ず在り、
+    Docker が作った空ディレクトリには無い。**人間が確かめるときに見るものと同じ**にする。
+
+    **`marker` が空なら検査を無効化する。**Obsidian は Vault ごとに設定フォルダ名を
+    変更できるため、逃げ道を必ず用意する — **誤検知でパイプラインが止まる方が害が大きい。**
+
+    **空白だけの場合も無効化する。**`Path(root) / "" == root` なので空文字は分岐が無くても
+    通ってしまうが、`vault_marker: " "` は通らない — **名前が半角空白 1 文字のディレクトリを
+    探しにいく。**YAML でうっかり書ける形なので、ここで吸収する。
+
+    外付けディスクが未マウント、iCloud / Dropbox が未同期、`OBSIDIAN_VAULT` の綴り間違い、
+    Docker Desktop のファイル共有から外れている —— **いずれも「空の新品 Vault」という
+    同じ姿になる。**
+    """
+    if not root.is_dir():
+        return False
+    if not marker.strip():
+        return True
+    return (root / marker).is_dir()
+
+
 def resolve_output_path(folder: VaultPath, basename: str, session_key: str) -> VaultPath:
     """出力先のパスを決める（§13.5 の「重複時」）。
 

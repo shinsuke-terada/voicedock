@@ -141,6 +141,7 @@ def _context(
     """全検査が通る状態を作る。個別のテストが 1 つだけ壊す。"""
     for name in ("data", "obsidian", "inbox", "queue", "state"):
         (tmp_path / name).mkdir(parents=True, exist_ok=True)
+    (tmp_path / "obsidian" / ".obsidian").mkdir(exist_ok=True)  # §13.6 の目印
     monkeypatch.setattr(paths, "DATA_ROOT", tmp_path / "data")
     monkeypatch.setattr(paths, "VAULT_ROOT", tmp_path / "obsidian")
     monkeypatch.setattr(paths, "INBOX_ROOT", tmp_path / "inbox")
@@ -247,6 +248,26 @@ def test_unwritable_root_is_unhealthy(
         assert "not writable" in result.detail
     finally:
         target.chmod(0o755)
+
+
+def test_a_writable_directory_without_the_marker_is_unhealthy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**H-4 は「書ける」だけでは真にしない**（§13.6 / #134）。
+
+    Docker は bind mount の source が無ければ空ディレクトリとして作るので、
+    Vault が消えても**書ける場所には見え続ける。**`docker ps` の STATUS 列で
+    気づけるようにするのがこの検査の狙いである（H-8 と同じ考え方）。
+    """
+    ctx = _context(tmp_path, monkeypatch)
+    assert results_by_check(ctx)["H-4"].ok, "目印が在るのに unhealthy になっている"
+
+    (tmp_path / "obsidian" / ".obsidian").rmdir()
+
+    result = results_by_check(ctx)["H-4"]
+    assert not result.ok, "目印が無いのに healthy のまま（幻の Vault へ書き続ける）"
+    assert "not a vault" in result.detail, result.detail
+    assert ".obsidian" in result.detail, "何が足りないのかが読めない"
 
 
 @pytest.mark.parametrize(

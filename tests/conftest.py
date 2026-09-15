@@ -115,9 +115,13 @@ def frozen_now() -> datetime:
 
 @pytest.fixture
 def vault(tmp_path: Path) -> Path:
-    """`/obsidian` 相当。"""
+    """`/obsidian` 相当。**本物の Vault を表す**ので目印も置く（§13.6）。
+
+    目印が無いディレクトリは「Docker が作った空の幻」であり、**Vault ではない**。
+    それを試したいテストは自分で目印の無い木を作る（`test_vault_available.py`）。
+    """
     path = tmp_path / "obsidian"
-    path.mkdir()
+    (path / ".obsidian").mkdir(parents=True)
     return path
 
 

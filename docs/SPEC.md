@@ -1134,6 +1134,11 @@ llm:
 # --- Obsidian -----------------------------------------------
 obsidian:
   root: /obsidian
+  # Vault の目印（§13.6）。**これが無い場所へは書かない。**
+  # Docker は bind mount の source が無ければ空ディレクトリとして作るので、
+  # 「書けること」だけでは Vault が消えたことに気づけない。
+  # **空文字にすると検査を無効化する**（設定フォルダ名を変えている場合の逃げ道）
+  vault_marker: ".obsidian"
   max_title_bytes: 180           # UTF-8 バイト数（§13.5）
   default_tags:
     - voice
@@ -3237,7 +3242,11 @@ VoiceDock の削除条件を整理し、午後の打ち合わせで MVP の範�
 
 ### 13.6 Atomic Write（Raw / Daily 共通）
 
+**前提**: 書き込みの前に **Vault が実在すること**を確かめる（`obsidian.vault_marker`）。
+偽なら `OBSIDIAN_NOT_FOUND` とし、**Raw / Daily のどちらの経路でも書かない。**
+
 ```text
+0. Vault の目印（obsidian.vault_marker）が在ることを確認  ← 偽なら OBSIDIAN_NOT_FOUND
 1. 出力内容を UTF-8 bytes にレンダリングし、SHA-256 を計算（expected_sha）
 2. 同一ディレクトリに一時ファイル .{basename}.tmp を作成
 3. write → flush → os.fsync(fd) → close
@@ -3250,6 +3259,24 @@ VoiceDock の削除条件を整理し、午後の打ち合わせで MVP の範�
 - 一時ファイルは**必ず最終ファイルと同じディレクトリ**に作る
 - 一時ファイル名を `.` で始めるのは、検証途中のファイルを Obsidian が拾わないようにするため
 - 途中で失敗した場合は一時ファイルを削除し、**最終ファイルは差し替えない**（再生成の失敗で既存ノートを壊さない）
+
+#### Vault の可用性（手順 0）
+
+**「書ける」を「Vault である」と読んではならない。**Docker は bind mount の source が
+無ければ**空ディレクトリとして作る**ため、Vault を退避してもコンテナからは書ける場所に
+見え続ける。**2026-09-15 の実機では、その空ディレクトリへ Daily ノートを書いて
+`obsidian_saved` を報告していた**（#134）。
+
+| 項目 | 内容 |
+|---|---|
+| 目印 | `obsidian.vault_marker`（既定 `".obsidian"`）が `obsidian.root` の直下に**ディレクトリとして**在ること |
+| 無効化 | `vault_marker: ""` で検査しない。Obsidian は Vault ごとに設定フォルダ名を変更できるため、**逃げ道を必ず用意する** |
+| 検査しないもの | 出力フォルダ（`Daily/Voice/...`）の存在。**あれは VoiceDock が作るものであり、無いのが正常**である |
+| 実装 | `notes.vault_is_available()` の 1 箇所。**H-4 / D-13 / Raw / Daily の 4 箇所が同じものを呼ぶ** |
+
+**同じ姿になる原因**: 外付けディスクが未マウント / iCloud・Dropbox が未同期 /
+`OBSIDIAN_VAULT` の綴り間違い / Docker Desktop のファイル共有から外れている。
+**いずれも「空の新品 Vault」に見える。**
 
 ### 13.7 保存検証
 
@@ -3315,6 +3342,12 @@ Part の元音声を削除してよいのは、以下の論理式が真のとき
 > **`device.writable` は「`helper.conf` の `MOUNT_MODE` が `rw`」を意味する**（§14.2 ロック 2-B）。
 > `target_is_identical()` はコンテナ側の**事前**確認であり、**同じ検証を reaper が独立にやり直す**
 > （§14.1.1）。二重に検証することが v4.0 の設計である。
+
+> **根拠は「テキストが Vault に残っていること」である。**したがって
+> **「その Vault が本物であること」が前提に含まれる**（§13.6 手順 0）。
+> 幻の Vault（Docker が作った空ディレクトリ）に書いたノートは、**同じ幻の中で
+> 読み直すので §13.7 の検証をすべて通る。**2026-09-15 の実機ではこの状態になっており、
+> Phase 7 が有効なら本物の Vault にノートが無いまま元音声を消していた（#134）。
 
 ```python
 # ★2 つの集合を使い分ける（§9.1 の「終端状態」と混同しないこと）
@@ -4472,7 +4505,7 @@ VAD モデルは whisper.cpp `v1.9.4` の `models/download-vad-model.sh` が参�
 | H-1 | Python プロセスが生存している | — |
 | H-2 | SQLite へ接続でき、`schema_version` を読める | unhealthy |
 | H-3 | `/data` が書き込み可能 | unhealthy |
-| H-4 | `/obsidian` が読み書き可能 | unhealthy |
+| H-4 | `/obsidian` が読み書き可能で、**`obsidian.vault_marker` が在る**（§13.6） | unhealthy |
 | H-5 | `transcription.executable` が存在し実行可能 | unhealthy |
 | H-6 | `transcription.model` が存在する | unhealthy |
 | H-7 | `VOICEDOCK_LLM_URL` / `VOICEDOCK_LLM_MODEL` が設定されている | unhealthy |
@@ -4538,7 +4571,7 @@ VoiceDock doctor
 | D-10 | `ffmpeg` / `ffprobe` が存在しバージョンを取得できる | 致命的 |
 | D-11 | `VOICEDOCK_LLM_URL` / `VOICEDOCK_LLM_MODEL` が設定済み | 致命的 |
 | D-12 | **LLM へ実際に短いリクエストを投げて応答を得る**（所要時間を表示） | 致命的 |
-| D-13 | `/obsidian` が読み書き可能（一時ファイルの作成・削除で検証）。**Raw / Daily の出力フォルダが存在するか作成できることも同じ行で検証する**（v5.0 で D-14 を統合） | 致命的 |
+| D-13 | `/obsidian` が読み書き可能（一時ファイルの作成・削除で検証）。**Raw / Daily の出力フォルダが存在するか作成できることも同じ行で検証する**（v5.0 で D-14 を統合）。**`obsidian.vault_marker` が在ることも見る**（§13.6）。**「書けない」と「Vault でない」を別の文言にする** | 致命的 |
 | D-17 | **削除モードの状態を必ず表示する。三重ロックの 3 つすべてを個別に表示する**（§14.2） | 有効なら警告表示 |
 | **D-18** | **Helper が稼働している**（`heartbeat.json` が `helper_heartbeat_max_age_seconds` 以内）。`mount_readonly`・Helper のバージョン・`config_error` の有無を表示する | 致命的 |
 | **D-20** | **inbox に取り残しが無い。**partkey が終端状態（`FAILED` を除く）の原本が残っていると、**二度と処理されないのにディスクを使い続ける** — `inbox_retain` の削除は変換の後に行われるので、**変換しない Part の原本は誰も消さない**。**`FAIL` にしない**（記録は失われていない）。**自動で消しもしない** — inbox は Helper が書く領域であり、コンテナが消してよいのは §10.5 の経路だけである。**見えるようにして、消す判断は利用者に委ねる** | 注意 |
