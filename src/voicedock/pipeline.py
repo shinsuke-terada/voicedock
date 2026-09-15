@@ -1170,6 +1170,25 @@ class Pipeline:
             now=self.now,
         )
 
+    def _reopen_after_exclusion(self, partkey: str) -> None:
+        """**統合から除外される終端へ落ちた Part も、セッションを作り直させる**（§9.2 / #131）。
+
+        `FAILED` / `SKIPPED` は §10.8 の `EXCLUDED_FROM_MERGE` であり統合には含まれないが、
+        **セッションの記述は変える**（`failed_part_count` / `voicedock_failed_parts` /
+        §13.4 の警告行）。契機が `RAW_SAVED` だけだと、**完成後に失敗した Part が
+        ノートに現れない** — 2026-09-15 の実機で、`parts: 3` /
+        `voicedock_failed_parts: []` のノートの裏で 4 本目が失敗していた。
+
+        **`REOPENABLE` が `{SAVED, COMPLETED}` なので、未確定のセッションでは no-op である。**
+        ここで状態を判定しない（判定の場所を 2 つに分けない）。
+
+        **ループしない。**`FAILED` / `SKIPPED` は終端であり、作り直しても再び遷移しない。
+        """
+        record = self.database.get_recording(partkey)
+        if record is None or record.session_key is None:
+            return
+        self.reopen_session(SessionKey(record.session_key))
+
     def _skip(
         self,
         record: Recording,
@@ -1194,6 +1213,7 @@ class Pipeline:
         self.log.info(
             "part_skipped", recording_key=record.partkey, reason=SKIP_REASONS.get(code, str(code))
         )
+        self._reopen_after_exclusion(record.partkey)
 
     def _fail(
         self,
@@ -1218,6 +1238,7 @@ class Pipeline:
         if reason is not None:
             fields["reason"] = reason
         self.log.error(event, **fields)
+        self._reopen_after_exclusion(partkey)
 
     def _discard_staging(self, path: StagingPath) -> None:
         try:
