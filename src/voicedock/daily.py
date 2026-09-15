@@ -4,10 +4,13 @@
 （§7.2 / §13.4）。#25 の「真実の出所を config に一本化する」がここまで貫かれる —
 **切ったセクションはプロンプトにも載らず、スキーマにも入らず、ノートにも出ない。**
 
-**欠落を隠さない**（§13.4）。処理できなかった Part は frontmatter の
-`voicedock_failed_parts` に列挙し、本文の見出し直下に警告行を出す。**除外された Part の
-音声は削除されない** — §14.1 が `voicedock_recording_keys` への収録を要求するため
-自動的に保証される。
+**欠落を隠さない**（§13.4）。統合から外れた Part は frontmatter の
+`voicedock_failed_parts`（`FAILED`）と `voicedock_skipped_parts`（`SKIPPED`）に**分けて**
+列挙し、本文の見出し直下に警告行を出す。**2 つを混ぜてはならない** — `FAILED` は自動で
+戻るが `SKIPPED` は戻らないので、**同じ欄に入れると読み手が区別できない**（#140）。
+
+**除外された Part の音声は削除されない** — §14.1 が `voicedock_recording_keys` への
+収録を要求するため自動的に保証される。
 
 書き込みと検証は `notes.py` を再利用する（§13.6 / §13.7）。**検証ロジックを 2 本に
 分けない** — #36 の `cleaner.py` も同じ `verify_note()` を呼ぶ。
@@ -24,14 +27,17 @@ from typing import Any, Final
 
 from voicedock import notes, raw, wiki
 from voicedock.config import Config
+from voicedock.errors import ErrorCode
 from voicedock.llm import Chunk
 from voicedock.notes import CheckResult, NoteKind
 from voicedock.paths import PartKey, SessionKey, VaultPath
 from voicedock.session import SessionTranscript
+from voicedock.states import PartStatus
 
 NOTE_TYPE: Final = "voice-daily"
 STATUS_PROCESSED: Final = "processed"
 FAILED_PARTS_FIELD: Final = "voicedock_failed_parts"
+SKIPPED_PARTS_FIELD: Final = "voicedock_skipped_parts"
 TIMELINE_KEY: Final = "timeline"
 SUMMARY_KEY: Final = "summary"
 TASKS_KEY: Final = "tasks"
@@ -39,6 +45,43 @@ DUE_MARK: Final = "📅"
 
 HEADING_BLOCK: Final = "###"
 """Timeline の Block 見出し（§13.4 の例が `### 07:12–11:30`）。"""
+
+
+BENIGN_SKIP_REASONS: Final[frozenset[str]] = frozenset(
+    {ErrorCode.NO_SPEECH_DETECTED, ErrorCode.DUPLICATE_CONTENT}
+)
+"""**利用者がすることが無い**除外理由（§13.4 / #140）。
+
+§10.6 は `NO_SPEECH_DETECTED` を「**失敗ではない**」と明記しており、
+`DUPLICATE_CONTENT` も同じく正常な動作である。この 2 つだけなら警告記号を付けない。
+
+**許可リストである。**ここに無い理由は「利用者の操作が要る」側に倒す — 知らない理由を
+正常扱いすると、**本当に欠けている記録が静かに見過ごされる**（#133 の設計判断 4 と同じ）。
+"""
+
+SKIP_REASON_LABELS: Final[dict[str, str]] = {
+    str(ErrorCode.DUPLICATE_CONTENT): "重複",
+    str(ErrorCode.SOURCE_MISSING): "元ファイルが見つかりません",
+    str(ErrorCode.NORMALIZED_MISSING): "元ファイルが見つかりません",
+    str(ErrorCode.NO_SPEECH_DETECTED): "無音",
+}
+"""除外理由の日本語。**知らないコードはコードのまま出す**（隠すより読めるほうがよい）。"""
+
+RETRY_ACTION: Final = "デバイスから採り直してください。"
+"""**次に何をすればよいかを書く**（§16.4 の方針）。`⚠` だけでは伝わらない。"""
+
+
+@dataclass(frozen=True)
+class ExcludedPart:
+    """統合から外れた Part（§10.8 `EXCLUDED_FROM_MERGE`）。
+
+    **`status` と `error_code` の両方を持つ。**`FAILED` か `SKIPPED` かで
+    「自動で戻るか」が決まり、`error_code` で「利用者の操作が要るか」が決まる。
+    """
+
+    partkey: PartKey
+    status: str
+    error_code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -149,7 +192,7 @@ def render_daily_note(
     day: date,
     session_key: SessionKey,
     recording_keys: Sequence[PartKey],
-    failed_keys: Sequence[PartKey],
+    excluded: Sequence[ExcludedPart],
     recorded_seconds: float | None,
     block_count: int,
     timeline: Sequence[TimelineBlock],
@@ -163,13 +206,17 @@ def render_daily_note(
     """
     sections = cfg.llm.analysis
     tags = _tags(analysis, cfg)
+    # **`FAILED` と `SKIPPED` を分ける**（#140）。前者は自動で戻り、後者は戻らない
+    failed = [part for part in excluded if part.status == PartStatus.FAILED]
+    skipped = [part for part in excluded if part.status != PartStatus.FAILED]
 
     frontmatter = notes.render_frontmatter(
         {
             "type": NOTE_TYPE,
             notes.SESSION_KEY_FIELD: session_key,
             notes.RECORDING_KEYS_FIELD: list(recording_keys),
-            FAILED_PARTS_FIELD: list(failed_keys),
+            FAILED_PARTS_FIELD: [part.partkey for part in failed],
+            SKIPPED_PARTS_FIELD: [part.partkey for part in skipped],
             "date": day.isoformat(),
             "recorded": _duration(recorded_seconds),
             "parts": len(recording_keys),
@@ -181,8 +228,8 @@ def render_daily_note(
 
     title = str(getattr(analysis, "title", "") or day.isoformat())
     lines: list[str] = ["", f"# {title}", ""]
-    if failed_keys:
-        lines += [_warning(failed_keys), ""]
+    for line in _warnings(failed, skipped):
+        lines += [line, ""]
 
     for name in sections.order:
         section = sections.sections.get(name)
@@ -249,16 +296,47 @@ def _links(links: wiki.LinkPlan) -> list[str]:
     return ["## Links", "", *[f"- {value}" for value in values], ""]
 
 
-def _warning(failed_keys: Sequence[PartKey]) -> str:
-    """**欠落を隠さない**（§13.4）。見出し直後に 1 行入れる。
+def _warnings(failed: Sequence[ExcludedPart], skipped: Sequence[ExcludedPart]) -> list[str]:
+    """**欠落を隠さない**（§13.4）。見出し直後に最大 2 行入れる。
+
+    **`FAILED` と `SKIPPED` で別の行にする**（#140）。1 行に混ぜて条件分岐した文言を
+    作ると、読みにくいうえにテストで落としにくい。
+
+    **`SKIPPED` に「自動で再試行されます」と書いてはならない。**`SKIPPED` は終端であり、
+    §10.2 の墓標があるのでデバイスからの再コピーも起きない。**ノートが、起きないことを
+    約束することになる。**
 
     **除外された Part の音声は削除されない** — §14.1 が `voicedock_recording_keys` への
     収録を要求するため自動的に保証される。
     """
-    return (
-        f"> ⚠ この日の録音のうち {len(failed_keys)} 本が処理できませんでした。"
-        "次にデバイスを接続したときに自動で再試行されます。"
-    )
+    lines: list[str] = []
+    if failed:
+        lines.append(
+            f"> ⚠ この日の録音のうち {len(failed)} 本が処理できませんでした。"
+            "次にデバイスを接続したときに自動で再試行されます。"
+        )
+    if skipped:
+        # **許可リストで判定する。**知らない理由は「操作が要る」側へ倒す
+        actionable = any(part.error_code not in BENIGN_SKIP_REASONS for part in skipped)
+        mark = "⚠ " if actionable else ""
+        action = RETRY_ACTION if actionable else ""
+        lines.append(
+            f"> {mark}この日の録音のうち {len(skipped)} 本を除外しました"
+            f"（{_skip_reasons(skipped)}）。自動では再試行されません。{action}"
+        )
+    return lines
+
+
+def _skip_reasons(skipped: Sequence[ExcludedPart]) -> str:
+    """除外理由を重複なく並べる。**並びは §15.1 の表の順**（`ErrorCode` の宣言順）。
+
+    **並びを出現順にしない。**同じ組み合わせのノートが日によって違う文面になり、
+    再生成の冪等性（§9.4 の `output_sha256` 一致）が Part の処理順に左右される。
+    """
+    order = {str(code): index for index, code in enumerate(ErrorCode)}
+    seen = {part.error_code or "" for part in skipped}
+    ordered = sorted(seen, key=lambda code: order.get(code, len(order)))
+    return "・".join(SKIP_REASON_LABELS.get(code) or code or "理由不明" for code in ordered)
 
 
 def _tags(analysis: object, cfg: Config) -> list[str]:
