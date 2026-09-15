@@ -32,7 +32,12 @@ from voicedock.db import Recording, Session
 from voicedock.device import DeviceInventory
 from voicedock.log import Logger
 from voicedock.paths import DevicePath, PartKey, QueuePath, SessionKey, StagingPath
-from voicedock.states import PART_DELETABLE, PART_TERMINAL, SESSION_DELETABLE
+from voicedock.states import (
+    PART_DELETABLE,
+    PART_TERMINAL,
+    SESSION_DELETABLE,
+    STAGING_DISPOSABLE,
+)
 
 QUEUE_SCHEMA: Final = 1
 """`queue/delete/<request_id>.json` の `schema`（§14.1.1）。"""
@@ -326,7 +331,21 @@ def _request_id(partkey: str, now: datetime) -> str:
 
 
 def cleanup_staging(part: Recording) -> None:
-    """staging の残骸を消す（§14.3）。**`paths.safe_unlink_staging()` を通す**（N-10）。"""
+    """staging の残骸を消す（§14.3）。**`paths.safe_unlink_staging()` を通す**（N-10）。
+
+    **`FAILED` の Part には触れない**（v5.32→v5.33 の変更 AU-1）。その 16 kHz 音声は
+    残骸ではなく**再試行の入力**であり、`inbox_retain: normalized`（既定）では
+    inbox の原本が既に無いので、**消すと二度と復旧できない。**§10.2 の墓標により
+    デバイスを挿し直しても再コピーされないため、手で墓標を外す以外に方法が無くなる。
+
+    **絞りをここに置く。**呼び出し側（`Pipeline._complete_without_deleting()` と
+    §14.3 の削除経路）でループ条件を足すと、**片方だけ直る。**
+
+    **許可リストで判定する。**`STAGING_DISPOSABLE` に無い状態は、それが `PART_TERMINAL`
+    ですらない異常な入力であっても**消さない**のが安全側である。
+    """
+    if part.status not in STAGING_DISPOSABLE:
+        return
     for column in (part.normalized_path,):
         if column:
             paths.safe_unlink_staging(StagingPath(Path(column)), missing_ok=True)

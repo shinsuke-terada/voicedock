@@ -101,6 +101,22 @@ PART_DELETABLE: Final[frozenset[PartStatus]] = frozenset(
 ND-01〜28 のどれも検出しない削除事故になる。
 """
 
+STAGING_DISPOSABLE: Final[frozenset[PartStatus]] = frozenset(PART_TERMINAL) - {PartStatus.FAILED}
+"""staging の 16 kHz 音声を捨ててよい Part の状態（5 件。§14.3）。
+
+**`PART_TERMINAL` から `FAILED` だけを除いたもの。**`FAILED` の 16 kHz 音声は
+**残骸ではなく再試行の入力**である（§15.2 はデバイス再接続とサービス起動で
+`FAILED` を無条件に再評価すると定めている）。`inbox_retain: normalized`（既定）では
+inbox の原本が正規化直後に消えているため、**ここで消すと復旧手段が無くなる。**
+
+**`SKIPPED` は含む。**`NO_SPEECH_DETECTED` も `DUPLICATE_CONTENT` も再評価の対象ではない
+（§10.2 は重複時に 16 kHz 音声を消すと明記している）。
+
+**手で並べない。**`PART_TERMINAL` から引く — 終端が増えたときに
+「捨ててよいか」を明示的に考える場所を 1 つにする。`PART_DELETABLE` とは**別物**である
+（あちらは元音声、こちらは変換後の作業ファイル）。
+"""
+
 SESSION_DELETABLE: Final[frozenset[SessionStatus]] = frozenset(
     {
         SessionStatus.SAVED,
