@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import IO, Final
 
-from voicedock import __version__, db, paths
+from voicedock import __version__, db, device, paths
 from voicedock.config import Config, ConfigError, load_config
 from voicedock.device import read_inventory
 from voicedock.errors import EXIT_CONFIG, EXIT_OK
@@ -213,12 +213,12 @@ def collect(
     beat = read_heartbeat(state_root)
     inventory = _inventory(state_root, cfg)
 
-    parts, sessions, backlog, failed, failed_total = _from_database(cfg)
+    parts, sessions, backlog, failed, failed_total, orphaned = _from_database(cfg)
     return Snapshot(
         helper=_helper_text(beat, cfg, moment),
         devices=inventory,
         device_free=_free_space_text(state_root),
-        inbox=_inbox_text(cfg),
+        inbox=_inbox_text(cfg, orphaned),
         delete_queue=_queue_text(),
         locks=Locks(
             config_delete=cfg.cleanup.delete_source_audio,
@@ -239,7 +239,7 @@ def collect(
 
 def _from_database(
     cfg: Config,
-) -> tuple[dict[str, int], dict[str, int], Backlog, tuple[FailedPart, ...], int]:
+) -> tuple[dict[str, int], dict[str, int], Backlog, tuple[FailedPart, ...], int, frozenset[str]]:
     """DB から件数・Backlog・失敗一覧を取る。
 
     **`migrate=False` で開く。**doctor D-2 と同じ理由で、**`status` が DB を作ってしまうと
@@ -248,7 +248,7 @@ def _from_database(
     empty_parts = {status.value: 0 for status in PART_ORDER}
     empty_sessions = {status.value: 0 for status in SESSION_ORDER}
     if not Path(cfg.database.path).is_file():
-        return empty_parts, empty_sessions, Backlog(0, 0.0, 0), (), 0
+        return empty_parts, empty_sessions, Backlog(0, 0.0, 0), (), 0, frozenset()
 
     try:
         with db.connect(
@@ -259,9 +259,40 @@ def _from_database(
         ) as opened:
             parts = empty_parts | _counts(opened, "recordings")
             sessions = empty_sessions | _counts(opened, "sessions")
-            return parts, sessions, _backlog(opened), *_failed(opened)
+            return parts, sessions, _backlog(opened), *_failed(opened), _orphaned(opened)
     except sqlite3.Error:
-        return empty_parts, empty_sessions, Backlog(0, 0.0, 0), (), 0
+        return empty_parts, empty_sessions, Backlog(0, 0.0, 0), (), 0, frozenset()
+
+
+def orphaned_partkeys(cfg: Config) -> frozenset[str] | None:
+    """取り残しになりうる Part の `partkey`。**DB を読めなければ `None`**（#120）。
+
+    `doctor` の D-19 と `status` の `Inbox` 行が**同じ集合を使う** — 判定が 2 本に
+    分かれると、片方だけ直したときに**一方が「取り残しなし」と言いながらもう一方が
+    数える。**
+    """
+    if not Path(cfg.database.path).is_file():
+        return None
+    try:
+        with db.connect(
+            cfg.database.path,
+            busy_timeout_ms=cfg.database.busy_timeout_ms,
+            tz=cfg.tz,
+            migrate=False,
+        ) as opened:
+            return _orphaned(opened)
+    except sqlite3.Error:
+        return None
+
+
+def _orphaned(opened: db.Database) -> frozenset[str]:
+    """inbox に原本が残っていたら取り残しになる Part の `partkey`（#120）。"""
+    placeholders = ", ".join("?" for _ in ORPHANED_STATES)
+    rows = opened.conn.execute(
+        f"SELECT partkey FROM recordings WHERE status IN ({placeholders})",  # noqa: S608
+        sorted(ORPHANED_STATES),
+    ).fetchall()
+    return frozenset(row["partkey"] for row in rows)
 
 
 def _counts(opened: db.Database, table: str) -> dict[str, int]:
@@ -356,23 +387,61 @@ def _inventory(state_root: Path, cfg: Config) -> str:
     return f"{len(found.devices)}  ({names}, {mode})"
 
 
-def _inbox_text(cfg: Config) -> str:
-    """inbox に残っている `.wav` の件数と合計サイズ。
+ORPHANED_STATES: Final[frozenset[str]] = frozenset(PART_TERMINAL) - {PartStatus.FAILED}
+"""inbox に原本が残っていたら**取り残し**である Part の状態。
+
+**`FAILED` を除く。**§15.2 でデバイス再接続とサービス起動のたびに再投入されるので、
+**処理待ちである。**残りの終端状態（`COMPLETED` / `SKIPPED` / `RAW_SAVED` /
+`SOURCE_DELETING` / `SOURCE_DELETE_PENDING`）は二度と変換されない。
+
+**手で並べない。**`PART_TERMINAL` から引く — 終端が増えたときに追随させる場所を 1 つにする。
+"""
+
+
+def _inbox_text(cfg: Config, orphaned_keys: frozenset[str]) -> str:
+    """inbox の `.wav` を「処理待ち」と「取り残し」に分ける。
 
     **`.meta.json` だけのもの（墓標）は数えない**（§10.2）。処理済みの印である。
+
+    **`pending` は「これから処理される」という意味である。**partkey が終端状態の
+    ファイルは二度と処理されないので、**同じ数に混ぜてはならない**（#120）。
+    2026-09-15 に実機で、処理されない 259 MB を `1 parts pending` と報告し続けた
+    （`Backlog : 未処理なし` と同時に出るので、どちらを信じればよいか分からない）。
+
+    **候補の列挙は `device.list_inbox_parts()` に任せる。**partkey の作り方を
+    ここで書き直すと出所が 2 つになる（§8.5 の唯一の禁則）。
     """
     root = Path(cfg.import_.inbox_root)
     if not root.is_dir():
         return f"{UNKNOWN}  ({root} がありません)"
+
+    # **取り残しの原本を先に特定する。**`list_inbox_parts()` は `.wav` と `.meta.json` が
+    # 揃った候補だけを返すので、partkey を作れるのはここだけである
+    orphan_paths: set[Path] = set()
+    orphan_bytes = 0
+    for candidate in device.list_inbox_parts(root, tz=cfg.tz).parts:
+        if candidate.partkey in orphaned_keys and candidate.source.inbox_path is not None:
+            orphan_paths.add(Path(candidate.source.inbox_path))
+            orphan_bytes += candidate.source.size
+
+    # **`.wav` の総数は従来どおり数える。**候補にならないファイル（名前が §5.1 に
+    # 合わない、墓標が無い）も**ディスクは使っている** — 見えなくしない
     count = 0
     total = 0
     for path in root.rglob("*.wav"):
+        if path in orphan_paths:
+            continue
         try:
             total += path.stat().st_size
         except OSError:
             continue
         count += 1
-    return f"{count} parts pending, {total / GIB:.1f} GiB"
+
+    text = f"{count} parts pending, {total / GIB:.1f} GiB"
+    if orphan_paths:
+        # **0 件なら括弧ごと出さない。**正常な状態に注意を引かない
+        text += f"  (+ 取り残し {len(orphan_paths)} 件 {orphan_bytes / GIB:.1f} GiB)"
+    return text
 
 
 def _queue_text() -> str:
