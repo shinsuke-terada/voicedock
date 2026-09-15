@@ -5,7 +5,8 @@ UV_IMAGE ?= ghcr.io/astral-sh/uv:0.12.13-python3.12-trixie-slim
 UV_RUN = docker run --rm -v "$(CURDIR)":/w -w /w \
            -e UV_PROJECT_ENVIRONMENT=/tmp/.venv $(UV_IMAGE) sh -c
 
-.PHONY: models up down logs status doctor test lint fmt lock helper-install helper-status
+.PHONY: models up down logs status doctor test lint fmt lock helper-install helper-status \
+        enable-deletion disable-deletion
 
 # bind mount 先を用意する。本来は helper/install.sh の仕事だが、それまでは make up が面倒を見る
 VOICEDOCK_HOME_DIRS = inbox queue state
@@ -59,6 +60,12 @@ test:
 	  -v "$(CURDIR)/requirements.lock:/app/requirements.lock:ro" \
 	  -v "$(CURDIR)/requirements-dev.lock:/app/requirements-dev.lock:ro" \
 	  voicedock:dev pytest -q
+
+# 削除の有効化 / 無効化（§14.2 / §21.2）。**三重ロックを 2 系統まとめて動かす**。
+# 1 つずつ手で直すと半端な状態（ロック 1 だけ解除など）に落ち、**削除もされず
+# セッションも進まない**（#145）。`enable` は確認入力を求める
+enable-deletion:  ; ./scripts/enable-deletion.sh
+disable-deletion: ; ./scripts/enable-deletion.sh --disable
 
 # モデルの取得（§18.6）。**image へ埋め込まない**（18.6 GB ある）。
 # named volume は root 所有で作られるので、スクリプトが root で取得して uid 1000 へ移す
