@@ -486,6 +486,26 @@ class Database:
         ).fetchall()
         return [(row["key"], row["retry_count"], row["error_code"]) for row in rows]
 
+    def sessions_for_delete_evaluation(self) -> list[tuple[str, str, int, datetime]]:
+        """`(session_key, status, delete_attempts, updated_at)`（§14.3 の再評価が使う）。
+
+        **状態で絞らない。**どの状態を評価するかは `pipeline.DELETE_EVALUATED` が決める
+        —— **集合の定義を SQL と Python の 2 箇所に持たない。**
+        """
+        rows = self.conn.execute(
+            "SELECT session_key, status, delete_attempts, updated_at FROM sessions "
+            "ORDER BY updated_at, session_key"
+        ).fetchall()
+        return [
+            (
+                row["session_key"],
+                row["status"],
+                row["delete_attempts"],
+                self._parse(row["updated_at"]),
+            )
+            for row in rows
+        ]
+
     def events_for(self, entity: EntityType, entity_key: str) -> list[Event]:
         rows = self.conn.execute(
             "SELECT * FROM events WHERE entity_type = ? AND entity_key = ? ORDER BY id",
@@ -586,6 +606,13 @@ class Database:
     def _now(self, now: datetime | None) -> str:
         moment = now if now is not None else datetime.now(self.tz)
         return moment.isoformat(timespec="seconds")
+
+    def _parse(self, stamp: str) -> datetime:
+        """`updated_at` を `datetime` へ。**壊れていれば「はるか昔」**（評価を妨げない）。"""
+        try:
+            return datetime.fromisoformat(stamp)
+        except (TypeError, ValueError):
+            return datetime.min.replace(tzinfo=self.tz)
 
 
 def file_size(path: Path) -> int:
