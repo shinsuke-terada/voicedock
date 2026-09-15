@@ -22,6 +22,7 @@ from tests.spec_sync import spec_section_text
 from voicedock import paths, pipeline, session
 from voicedock.config import Config
 from voicedock.db import Database, EntityType, Recording, Session
+from voicedock.errors import ErrorCode
 from voicedock.log import Logger
 from voicedock.paths import DevicePath, SessionKey
 from voicedock.states import SESSION_INITIAL, PartStatus, SessionStatus
@@ -66,16 +67,20 @@ def runner(database: Database, cfg: Config, log: Logger) -> pipeline.Pipeline:
 # --- SPEC の規定そのもの（§10.4 / T-1 / T-2） ---------------------------
 
 
-def test_the_spec_says_the_trigger_is_raw_saved() -> None:
-    """§10.4 が「分組では状態を変えない」「契機は `RAW_SAVED`」と書いていること（T-1）。
+def test_the_spec_says_the_trigger_is_not_grouping() -> None:
+    """§10.4 が「分組では状態を変えない」「契機は Part の行き先が決まった時点」と
+    書いていること（T-1 / #131）。
 
     v5.7 までは「`OPEN` でないセッションへ Part を追加する場合は `MERGING` へ戻す」と
     書いてあった。**分組は `DISCOVERED` の時点で走る**ので、そのとおりに実装すると
     **まだ文字起こししていない Part を含んだまま統合する。**
+
+    **v5.32 で `FAILED` / `SKIPPED` も契機に加えた**（#131）。統合には含まれないが、
+    **セッションの記述は変える。**
     """
     text = spec_section_text("10.4")
     assert "セッションの状態はここでは変えない" in text
-    assert "`RAW_SAVED` に達した時点" in text
+    assert "`RAW_SAVED` / `FAILED` / `SKIPPED` に達した時点" in text
 
 
 def test_the_spec_defines_where_the_overflow_goes() -> None:
@@ -426,3 +431,105 @@ def test_reaching_raw_saved_reopens_the_session(
     assert row is not None
     assert row.status == SessionStatus.MERGING, "RAW_SAVED に達しても再オープンしていない"
     assert "session_reopened" in logger[1].getvalue()
+
+
+# --- 除外される終端も契機になる（#131） ---------------------------------
+# **完成済みのセッションに入った Part が失敗しても、ノートが作り直されなかった。**
+# 2026-09-15 の実機で、`parts: 3` / `voicedock_failed_parts: []` のノートの裏で
+# 4 本目が `WHISPER_FAILED` になっていた。契機が `RAW_SAVED` だけだったためである。
+
+
+def attach(database: Database, row: Recording, *, status: str = PartStatus.DISCOVERED) -> str:
+    """Part をセッションへ結び付け、状態を置く。"""
+    database.conn.execute(
+        "UPDATE recordings SET session_key = ?, status = ? WHERE partkey = ?",
+        (KEY, status, row.partkey),
+    )
+    database.conn.commit()
+    return row.partkey
+
+
+@pytest.mark.parametrize("status", [SessionStatus.SAVED, SessionStatus.COMPLETED])
+def test_a_failed_part_reopens_a_finished_session(
+    database: Database, cfg: Config, logger: tuple[Logger, io.StringIO], status: str
+) -> None:
+    """**`FAILED` も再オープンの契機である**（#131）。
+
+    統合には含まれないが、**セッションの記述は変える**（`voicedock_failed_parts` と
+    §13.4 の警告行）。
+    """
+    add_session(database, status=status)
+    key = attach(database, add_part(database, index=0), status=PartStatus.TRANSCRIBING)
+
+    runner(database, cfg, logger[0])._fail(
+        key, PartStatus.TRANSCRIBING, ErrorCode.WHISPER_FAILED, "boom", event="transcription_failed"
+    )
+
+    row = database.get_session(KEY)
+    assert row is not None
+    assert row.status == SessionStatus.MERGING, "失敗で再オープンしていない（#131 の形）"
+
+
+@pytest.mark.parametrize("status", [SessionStatus.SAVED, SessionStatus.COMPLETED])
+def test_a_skipped_part_reopens_a_finished_session(
+    database: Database, cfg: Config, logger: tuple[Logger, io.StringIO], status: str
+) -> None:
+    """**`SKIPPED`（無音）も同じ。**完成後に来た無音 Part も記録されるべきである。"""
+    add_session(database, status=status)
+    row = add_part(database, index=0)
+    attach(database, row, status=PartStatus.TRANSCRIBING)
+    reloaded = database.get_recording(row.partkey)
+    assert reloaded is not None
+
+    runner(database, cfg, logger[0])._skip(
+        reloaded, ErrorCode.NO_SPEECH_DETECTED, None, from_status=PartStatus.TRANSCRIBING
+    )
+
+    session_row = database.get_session(KEY)
+    assert session_row is not None
+    assert session_row.status == SessionStatus.MERGING
+
+
+@pytest.mark.parametrize("status", [SessionStatus.READY, SessionStatus.MERGING])
+def test_an_unfinished_session_is_untouched_by_a_failure(
+    database: Database, cfg: Config, logger: tuple[Logger, io.StringIO], status: str
+) -> None:
+    """**未確定のセッションでは no-op。**
+
+    `REOPENABLE` が `{SAVED, COMPLETED}` なので、**呼び出し側で状態を判定しない**
+    （判定の場所を 2 つに分けない）。
+    """
+    add_session(database, status=status)
+    key = attach(database, add_part(database, index=0), status=PartStatus.TRANSCRIBING)
+
+    runner(database, cfg, logger[0])._fail(
+        key, PartStatus.TRANSCRIBING, ErrorCode.WHISPER_FAILED, "boom", event="transcription_failed"
+    )
+
+    row = database.get_session(KEY)
+    assert row is not None
+    assert row.status == status, "未確定のセッションを動かしてはならない"
+
+
+def test_a_part_without_a_session_does_not_crash(
+    database: Database, cfg: Config, logger: tuple[Logger, io.StringIO]
+) -> None:
+    """**`session_key` が無い Part でも落ちない。**分組の前に失敗しうる。"""
+    row = add_part(database, index=0)
+    database.conn.execute(
+        "UPDATE recordings SET status = ? WHERE partkey = ?",
+        (PartStatus.NORMALIZING, row.partkey),
+    )
+    database.conn.commit()
+
+    runner(database, cfg, logger[0])._fail(
+        row.partkey,
+        PartStatus.NORMALIZING,
+        ErrorCode.WHISPER_FAILED,
+        None,
+        event="normalize_failed",
+    )
+
+    reloaded = database.get_recording(row.partkey)
+    assert reloaded is not None
+    assert reloaded.status == PartStatus.FAILED
