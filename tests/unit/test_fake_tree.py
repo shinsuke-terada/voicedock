@@ -31,6 +31,7 @@ from tests.fixtures.fake_tree import (
 )
 from tests.helpers import REPO_ROOT
 from voicedock import paths
+from voicedock.cleaner import MTIME_TOLERANCE_SECONDS
 from voicedock.paths import DevicePath, is_safe_relpath, partkey_for
 
 # §5.2 の正規表現（#14 が device.py へ実装する。ここでは fixture の検証に使う）
@@ -89,9 +90,13 @@ def test_real_device_recording_is_reproduced() -> None:
 
 
 def test_meta_matches_the_file(fake_inbox: Path) -> None:
-    """`size` / `sha256` が実ファイルと一致すること。
+    """`size` / `sha256` が実ファイルと一致し、**`mtime` は一致しない**こと。
 
     **ここがずれると §10.5 のコピー検証テストが無意味になる。**
+
+    **`mtime` だけは違う**（#151）。墓標はデバイス上の原本を記録するもので、
+    inbox のコピーとは数時間離れる。**§14.1.1 の検証 10 が許容する 2 秒より
+    十分大きく離れていること**まで確かめる —— 近すぎると偶然通ってしまう。
     """
     for path in sorted((fake_inbox / DEVICE_ID).rglob("*.wav.meta.json")):
         meta = json.loads(path.read_text(encoding="utf-8"))
@@ -99,7 +104,11 @@ def test_meta_matches_the_file(fake_inbox: Path) -> None:
         assert wav.is_file(), wav
         assert meta["size"] == wav.stat().st_size
         assert meta["sha256"] == sha256(wav)
-        assert meta["mtime"] == pytest.approx(wav.stat().st_mtime)
+        # **`mtime` は実ファイルと一致しない**（#151）。墓標が記録するのは
+        # **デバイス上の原本**の更新時刻であり、inbox のコピーの時刻ではない。
+        # 同じ値にしていたせいで、4 時間半のずれを 1 つのテストも捕まえなかった
+        assert meta["mtime"] < wav.stat().st_mtime
+        assert wav.stat().st_mtime - meta["mtime"] > MTIME_TOLERANCE_SECONDS
 
 
 def test_meta_relpath_has_no_device_id(fake_inbox: Path) -> None:
