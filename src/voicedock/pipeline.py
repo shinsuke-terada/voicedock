@@ -250,6 +250,11 @@ class Pipeline:
             return PartOutcome.STOPPED
         if not self.ensure_raw_note(self._reload(partkey)):
             return PartOutcome.STOPPED
+        # **削除の契機は Raw ノート検証が通った時点である**（§14.1 / AY-1）。
+        # Daily ノート（要約）を待たない —— 要約は元音声を使わない
+        record = self._reload(partkey)
+        if record is not None and record.session_key is not None:
+            self.request_deletions(SessionKey(record.session_key))
         return PartOutcome.READY_FOR_SESSION
 
     # --- §10.5 変換 ------------------------------------------------------
@@ -617,21 +622,21 @@ class Pipeline:
 
     # --- §14.3 削除 ---------------------------------------------------------
 
-    def delete_sources_if_safe(self, session_key: SessionKey) -> bool:
-        """§14.1 を評価し、真なら削除要求を書く（§10.12 / §14.3）。
+    def request_deletions(self, session_key: SessionKey) -> int:
+        """§14.1 を Part ごとに評価し、真なら削除要求を書く（§10.12 / §14.3）。
 
-        戻り値は「このセッションの後始末まで進めたか」である。**保留を返したときは
-        `cleanup_staging()` も `COMPLETED` も行わない**（§11.3 / §14.3）。
+        **セッションの状態で門前払いしない**（v5.36→v5.37 の変更 AY-1）。削除の契機は
+        **その Part の Raw ノート検証が通った時点**であり、`SAVED`（Daily ノートの保存）を
+        待たない。`process_part()` が `ensure_raw_note()` の直後に呼ぶ。
 
-        **削除が無効なときもここを通る。**§9.3 の `SAVED → CLEANUP`（`delete_source_audio
-        == false`）と `RAW_SAVED → COMPLETED`（同）がこの経路であり、**Phase 7 前の
-        通常運用はすべてこちら**である。
+        **結果の回収もここで行う。**`SAVED` 以降に縛ったままだと、**`SOURCE_DELETING` の
+        まま日が暮れるまで決着しない。**
 
-        **このメソッドはデバイスに触れない。**触れられない（§14.4 N-16）。
+        戻り値は要求を書いた件数。**このメソッドはデバイスに触れない**（§14.4 N-16）。
         """
         row = self.database.get_session(session_key)
-        if row is None or row.status not in DELETE_EVALUATED:
-            return False
+        if row is None:
+            return 0
         parts = self.database.recordings_for_session(session_key)
 
         # **先に結果を回収する。**`SOURCE_DELETING` のまま残った行を片付けてから
@@ -641,8 +646,8 @@ class Pipeline:
         parts = self.database.recordings_for_session(session_key)
 
         if not self.cfg.cleanup.delete_source_audio:
-            # **安全ロック 1 が掛かっている。**元音声を残したまま完了する（§9.3）
-            return self._complete_without_deleting(row, parts)
+            # **安全ロック 1 が掛かっている**（§14.2）。要求を 1 件も書かない
+            return 0
 
         requested = 0
         for part in parts:
@@ -664,8 +669,35 @@ class Pipeline:
                 PartKey(part.partkey), PartStatus.RAW_SAVED, PartStatus.SOURCE_DELETING
             )
             requested += 1
+        return requested
 
-        if requested == 0:
+    def delete_sources_if_safe(self, session_key: SessionKey) -> bool:
+        """セッションの後始末まで進める（§9.3 / §14.3）。
+
+        戻り値は「このセッションの後始末まで進めたか」である。**保留を返したときは
+        `cleanup_staging()` も `COMPLETED` も行わない**（§11.3 / §14.3）。
+
+        **削除が無効なときもここを通る。**§9.3 の `SAVED → CLEANUP`（`delete_source_audio
+        == false`）と `RAW_SAVED → COMPLETED`（同）がこの経路であり、**Phase 7 前の
+        通常運用はすべてこちら**である。
+
+        **要求そのものは `request_deletions()` が書く。**あちらは Part の契機で走り、
+        こちらはセッションの契機で走る —— **門前払いの条件が違う**（AY-1）。
+        """
+        row = self.database.get_session(session_key)
+        if row is None or row.status not in DELETE_EVALUATED:
+            return False
+        requested = self.request_deletions(session_key)
+        row = self.database.get_session(session_key)
+        if row is None:
+            return False
+        parts = self.database.recordings_for_session(session_key)
+
+        if not self.cfg.cleanup.delete_source_audio:
+            # **安全ロック 1 が掛かっている。**元音声を残したまま完了する（§9.3）
+            return self._complete_without_deleting(row, parts)
+
+        if requested == 0 and not any(part.status == PartStatus.SOURCE_DELETING for part in parts):
             # §9.3 の「`SAVED` のまま」。**`delete_attempts += 1` で backoff を進める**
             # （ビジーループ防止。§15.2）。**遷移ではないので `events` を書かない**
             self.database.update_session(
@@ -673,7 +705,8 @@ class Pipeline:
             )
             return False
 
-        self._session_transition(session_key, row.status, SessionStatus.SOURCE_DELETING)
+        if row.status != SessionStatus.SOURCE_DELETING:
+            self._session_transition(session_key, row.status, SessionStatus.SOURCE_DELETING)
         return False
 
     def collect_delete_results(

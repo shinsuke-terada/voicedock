@@ -117,17 +117,6 @@ inbox の原本が正規化直後に消えているため、**ここで消すと
 （あちらは元音声、こちらは変換後の作業ファイル）。
 """
 
-SESSION_DELETABLE: Final[frozenset[SessionStatus]] = frozenset(
-    {
-        SessionStatus.SAVED,
-        SessionStatus.SOURCE_DELETING,
-        SessionStatus.SOURCE_DELETE_PENDING,
-        SessionStatus.CLEANUP,
-        SessionStatus.COMPLETED,
-    }
-)
-"""§14.1 で元音声を削除してよい Session の状態（5 件）。"""
-
 SESSION_TERMINAL: Final[frozenset[SessionStatus]] = frozenset(
     {SessionStatus.COMPLETED, SessionStatus.FAILED}
 )

@@ -28,6 +28,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
+from typing import Final
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -436,90 +437,125 @@ def _rewrite_keys(scene: Scene, path: Path, replacement: str, *, column: str) ->
     scene.set_session(**{column: digest})
 
 
-def test_nd09b_a_daily_note_without_this_key_blocks_the_request(scene: Scene) -> None:
-    """ND-09（Daily 側）: Daily ノートの鍵に当該 Part が無い。
+# --- ND-32: Part transcript ---------------------------------------------
 
-    **Raw と Daily で条件が別々に書かれている**ので、両方に個別のテストが要る。
+
+@pytest.mark.parametrize("label", ["path が NULL", "ファイルが無い", "JSON が壊れている"])
+def test_nd32_a_broken_part_transcript_blocks_the_request(scene: Scene, label: str) -> None:
+    """ND-32: **テキストの 2 つ目のコピーが無い状態では消さない**（§14.1 / AY-1）。
+
+    §14.1 の根拠は「テキストが 2 か所に独立して存在すること」である。
+
+    - Vault の Raw ノート（`verify_raw_note` + 鍵の包含）
+    - `/data/transcripts/parts/`（**これ**。`retain_transcript_days: 0` で無期限保持）
+
+    Raw ノートは日ごとの 1 ファイルで Part が増えるたびに書き直されるので、
+    **書き直しで落ちたときに拾い直す元がこちらである。**片方しか無い状態で
+    元音声を消すと、**その 1 か所が壊れた時点でテキストが失われる。**
+
+    > **この条件は v5.36 まで ND 番号もテストも持っていなかった。**
+    > `part_transcript_is_valid()` を消してもどのテストも落ちなかった（AY-1 の実装中に判明）。
     """
     scene.rearm()
-    _rewrite_keys(scene, scene.daily_path(), f"{DEVICE_ID}/other/other.wav", column="output_sha256")
+    row = scene.part()
+    assert row.transcript_path is not None
+    if label == "path が NULL":
+        scene.set_part(transcript_path=None)
+    elif label == "ファイルが無い":
+        Path(row.transcript_path).unlink()
+    else:
+        Path(row.transcript_path).write_text("{こわれた", encoding="utf-8")
+
     scene.evaluate()
-    assert scene.requests() == []
+
+    assert scene.requests() == [], f"{label} なのに要求が書かれた"
 
 
-# --- ND-10〜ND-11: 解析 -------------------------------------------------
+# --- ND-09b / ND-10〜ND-17 は v5.37 で廃止（AY-1）---------------------------
+#
+# **番号は詰め直さず欠番にする。**詰めると過去の PR とログの参照がずれる。
+#
+# | 廃止した ND | いまの扱い |
+# |---|---|
+# | ND-09（Daily 側） | Raw 側の ND-09 が残る。Daily ノートは条件でない |
+# | ND-10 / ND-11 | 解析結果は条件でない |
+# | ND-12〜ND-16 | Daily ノートは条件でない |
+# | ND-17 | Part ごとに評価する。兄弟の進行は関係ない |
+#
+# **削除ではなく反転させる。**「これらが偽でも要求が書かれる」ことを積極的に固定する
+# —— 穴を開けたまま放置すると、あとで条件が戻っても誰も気づかない。
 
 
-def test_nd10_an_unreachable_llm_blocks_the_request(scene: Scene) -> None:
-    """ND-10: LLM 到達不可 → `session.analysis_path is None`。"""
-    scene.rearm()
-    scene.set_session(analysis_path=None)
-    scene.evaluate()
-    assert scene.requests() == []
+def test_a_missing_daily_note_no_longer_blocks_the_request(scene: Scene) -> None:
+    """**要約は元音声を使わない**（§14.1 / AY-1）。
 
-
-def test_nd11_an_invalid_analysis_blocks_the_request(scene: Scene) -> None:
-    """ND-11: LLM が不正 JSON を返す（repair も失敗） → スキーマ検証が偽。"""
-    scene.rearm()
-    row = scene.session()
-    assert row.analysis_path is not None
-    Path(row.analysis_path).write_text('{"title": 42}', encoding="utf-8")
-    scene.evaluate()
-    assert scene.requests() == []
-
-
-# --- ND-12〜ND-16: Daily ノート -----------------------------------------
-
-
-@pytest.mark.parametrize("nd", ["ND-12", "ND-13"])
-def test_nd12_and_nd13_a_missing_daily_note_path_blocks_the_request(scene: Scene, nd: str) -> None:
-    """ND-12 / ND-13: Vault が無い / 書き込み権限が無い → `output_path is None`。
-
-    **一時ファイルも残らない**ことは `test_atomic_write.py` が見ている（§13.6）。
+    LLM が落ちているあいだ、**本文は Vault に在るのにデバイスの容量が永久に
+    解放されない**のが v5.36 までの姿だった。旧 ND-12 / ND-13 の反転である。
     """
     scene.rearm()
-    scene.set_session(output_path=None)
+    scene.set_session(output_path=None, output_sha256=None)
     scene.evaluate()
-    assert scene.requests() == [], nd
+    assert scene.requests() != [], "Daily ノートが無いだけで削除が止まっている"
 
 
-def test_nd14_a_daily_note_missing_frontmatter_blocks_the_request(scene: Scene) -> None:
-    """ND-14: 保存検証失敗（frontmatter 欠落を注入） → `verify_daily_note` が偽。"""
-    scene.rearm()
-    path = scene.daily_path()
-    body = path.read_text(encoding="utf-8")
-    path.write_text(body.split("---\n", 2)[-1], encoding="utf-8")
-    scene.evaluate()
-    assert scene.requests() == []
+@pytest.mark.parametrize(
+    ("label", "break_it"),
+    [
+        (
+            "鍵が無い",
+            lambda s: _rewrite_keys(
+                s, s.daily_path(), f"{DEVICE_ID}/other/other.wav", column="output_sha256"
+            ),
+        ),
+        (
+            "frontmatter 欠落",
+            lambda s: s.daily_path().write_text(
+                s.daily_path().read_text(encoding="utf-8").split("---\n", 2)[-1], encoding="utf-8"
+            ),
+        ),
+        ("外部から削除", lambda s: s.daily_path().unlink()),
+        (
+            "改竄",
+            lambda s: s.daily_path().write_text(
+                s.daily_path().read_text(encoding="utf-8") + "\n編集した行\n", encoding="utf-8"
+            ),
+        ),
+    ],
+)
+def test_a_broken_daily_note_no_longer_blocks_the_request(
+    scene: Scene, label: str, break_it: object
+) -> None:
+    """旧 ND-09（Daily 側）/ ND-14 / ND-15 / ND-16 の反転。
 
-
-def test_nd15_a_daily_note_deleted_afterwards_blocks_the_request(scene: Scene) -> None:
-    """ND-15: 保存後に外部から削除された。"""
-    scene.rearm()
-    scene.daily_path().unlink()
-    scene.evaluate()
-    assert scene.requests() == []
-
-
-def test_nd16_a_tampered_daily_note_blocks_the_request(scene: Scene) -> None:
-    """ND-16: 保存後に改竄された → `output_sha256` 不一致。
-
-    **利用者がノートを編集した場合もここで止まる**（§22 R-18）。削除が止まるだけで害はない。
+    **利用者がノートを編集しても削除は止まらなくなった。**§22 R-18 が心配したのは
+    「編集で削除が止まる」ことではなく「編集で**消えてはいけないものが消える**」ことだが、
+    **根拠は Raw ノートへ移っている**ので Daily ノートの改竄は削除の可否に関わらない。
     """
     scene.rearm()
-    path = scene.daily_path()
-    path.write_text(path.read_text(encoding="utf-8") + "\n編集した行\n", encoding="utf-8")
+    break_it(scene)  # type: ignore[operator]
     scene.evaluate()
-    assert scene.requests() == []
+    assert scene.requests() != [], f"Daily ノートの {label} で削除が止まっている"
 
 
-# --- ND-17: セッション内に進行中の Part --------------------------------
+@pytest.mark.parametrize("label", ["解析が無い", "解析が壊れている"])
+def test_a_broken_analysis_no_longer_blocks_the_request(scene: Scene, label: str) -> None:
+    """旧 ND-10 / ND-11 の反転。"""
+    scene.rearm()
+    if label == "解析が無い":
+        scene.set_session(analysis_path=None)
+    else:
+        row = scene.session()
+        assert row.analysis_path is not None
+        Path(row.analysis_path).write_text('{"title": 42}', encoding="utf-8")
+    scene.evaluate()
+    assert scene.requests() != [], f"{label} だけで削除が止まっている"
 
 
-def test_nd17_an_unfinished_sibling_blocks_every_part(scene: Scene) -> None:
-    """ND-17: セッション内に進行中の Part が残っている
+def test_an_unfinished_sibling_no_longer_blocks_a_finished_part(scene: Scene) -> None:
+    """旧 ND-17 の反転。**Part ごとに評価する**（§14.1 / AY-1）。
 
-    → **セッション内のどの Part も削除されない**（§14.1 の全 Part 終端条件）。
+    1 本詰まるとその日ぶん丸ごと解放されないのは、#131 / #133 で消してきた
+    「1 件の失敗が全体を止める」形そのものである。
     """
     scene.rearm()
     other = partkey_for(
@@ -540,7 +576,11 @@ def test_nd17_an_unfinished_sibling_blocks_every_part(scene: Scene) -> None:
         )
     )
     scene.evaluate()
-    assert scene.requests() == []
+
+    requests = scene.requests()
+    assert len(requests) == 1, "終わった Part の要求が書かれていない"
+    document = json.loads(requests[0].read_text(encoding="utf-8"))
+    assert document["partkey"] == PARTKEY, "進行中の Part の要求が書かれた"
 
 
 # --- ND-21: 空集合・空文字を真にしない（§14.1 の番犬） ------------------
@@ -711,24 +751,113 @@ def test_the_watchdog_terms_are_present_in_the_formula() -> None:
 
     | 項 | なぜ振る舞いで落とせないか |
     |---|---|
-    | `len(parts) >= 1` | 空集合だと保存検証（W-7 の完全一致）が先に偽になる |
+    | `len(parts) >= 1` | 空集合だと保存検証（R-6 の包含）が先に偽になる |
     | `part.source_path != ""` | 空文字は `target_is_identical()` が先に偽にする |
-    | Raw / Daily の鍵の包含 | `verify_note()` の R-6 / W-7 が**同じ鍵の集合**を見ている |
+    | Raw ノートの鍵の包含 | `verify_note()` の R-6 が**同じ鍵の集合**を見ている |
 
-    **鍵の包含を残す理由。**R-6 / W-7 が見るのは `expected_keys`（この Session の
+    **鍵の包含を残す理由。**R-6 が見るのは `expected_keys`（この Session の
     全 Part から導く集合）であり、**この Part 1 件の話ではない。**導き方が変われば
     重なりは消える。§14.1 が両方を並べているのはそのためである。
 
-    **空集合の `all()` は真になり、`os.path.join(volume, "")` はボリュームのルートを
-    指す**（v3.0 の欠陥 A-14 と同型）。
+    **`os.path.join(volume, "")` はボリュームのルートを指す**（v3.0 の欠陥 A-14 と同型）。
+
+    **v5.37 で Daily 側の番犬は消えた**（AY-1）。論理式が Daily ノートを見なくなった
+    ためであり、**`_note_contains()` は Raw 側の 1 回だけになる。**
     """
-    source = inspect.getsource(cleaner.can_delete_source)
+    # **docstring を除く。**説明文に関数名が出てくるので、素の `getsource` を
+    # 数えると本文と説明の区別がつかない
+    source = inspect.getsource(cleaner.can_delete_source).split('"""', 2)[-1]
     assert "len(parts) >= 1" in source
     assert 'part.source_path != ""' in source
-    assert "all(" in source, "全 Part 終端条件が消えている"
-    assert source.count("_note_contains(") == 2, "Raw と Daily の両方で鍵の包含を見ること"
+    assert source.count("_note_contains(") == 1, "Raw ノートの鍵の包含が消えている"
     assert "session.raw_output_path, part.partkey" in source
-    assert "session.output_path, part.partkey" in source
+    assert "session.output_path" not in source, "Daily ノートを条件に戻している（AY-1）"
+    assert "analysis" not in source, "解析結果を条件に戻している（AY-1）"
+
+
+# --- 契機の配線（AY-1）--------------------------------------------------
+
+
+def test_process_part_requests_deletion_after_the_raw_note(
+    scene: Scene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**`process_part()` が `ensure_raw_note()` の後に `request_deletions()` を呼ぶ。**
+
+    呼ばないと**削除は永久に起きない**（`delete_sources_if_safe()` は Daily ノートの
+    保存後にしか走らない）。**配線そのものを固定する** —— 条件式をいくら直しても、
+    呼ばれなければ意味が無い。
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(scene.runner, "ensure_normalized_audio", lambda *_a, **_k: True)
+    monkeypatch.setattr(scene.runner, "ensure_part_transcript", lambda *_a, **_k: True)
+    monkeypatch.setattr(scene.runner, "ensure_raw_note", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        scene.runner,
+        "request_deletions",
+        lambda key: calls.append(str(key)) or 0,  # type: ignore[func-returns-value]
+    )
+
+    scene.runner.process_part(PartKey(PARTKEY))
+
+    assert calls == [SESSION_KEY], "Raw ノートの後に request_deletions を呼んでいない"
+
+
+def test_request_deletions_does_not_gate_on_the_session_status(scene: Scene) -> None:
+    """**セッションが `SAVED` 以前でも評価する**（§14.1 / AY-1）。
+
+    v5.36 までは `session.status not in DELETE_EVALUATED` で門前払いしていたので、
+    **その日の Daily ノートが出るまで 1 件も要求が書かれなかった。**
+    """
+    scene.rearm()
+    scene.database.conn.execute(
+        "UPDATE sessions SET status = ? WHERE session_key = ?",
+        (SessionStatus.OPEN, SESSION_KEY),
+    )
+    scene.database.conn.commit()
+
+    assert scene.runner.request_deletions(SessionKey(SESSION_KEY)) == 1
+    assert scene.requests() != [], "OPEN のセッションで要求が書かれない"
+
+
+def test_collect_delete_results_runs_before_the_session_is_saved(scene: Scene) -> None:
+    """**結果の回収もセッションの状態に依存しない。**
+
+    `SAVED` 以降に縛ったままだと、**`SOURCE_DELETING` のまま日が暮れるまで
+    決着しない**（Part 単位で要求を出すので、結果は `OPEN` のうちに返ってくる）。
+    """
+    scene.rearm()
+    scene.database.conn.execute(
+        "UPDATE sessions SET status = ? WHERE session_key = ?",
+        (SessionStatus.OPEN, SESSION_KEY),
+    )
+    scene.database.conn.commit()
+    scene.runner.request_deletions(SessionKey(SESSION_KEY))
+    assert scene.part().status == PartStatus.SOURCE_DELETING
+
+    # reaper が結果を返した体にする
+    request = json.loads(scene.requests()[0].read_text(encoding="utf-8"))
+    result_dir = scene.queue / cleaner.RESULT_DIRNAME
+    result_dir.mkdir(parents=True, exist_ok=True)
+    (result_dir / f"{request['request_id']}.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "request_id": request["request_id"],
+                "completed_at": NOW.isoformat(),
+                "reaper_version": "5.9.0",
+                "device_id": DEVICE_ID,
+                "partkey": PARTKEY,
+                "status": cleaner.DELETED_STATUS,
+                "detail": RELPATH,
+            }
+        ),
+        encoding="utf-8",
+    )
+    scene.inventory.devices[DEVICE_ID] = frozenset()
+
+    scene.runner.request_deletions(SessionKey(SESSION_KEY))
+
+    assert scene.part().status != PartStatus.SOURCE_DELETING, "結果が回収されていない"
 
 
 # --- §20.4 の層の表との突き合わせ ---------------------------------------
@@ -768,8 +897,21 @@ def implemented_nd() -> set[str]:
     return {f"ND-{int(number):02d}" for number in found}
 
 
+RETIRED_ND: Final[frozenset[str]] = frozenset(f"ND-{n:02d}" for n in range(10, 18))
+"""v5.37 で廃止した ND（変更 AY-1）。**欠番にする。**
+
+Daily ノート・解析結果・全 Part 終端を §14.1 の条件から外したので、
+「それが偽なら削除しない」という規則自体が無くなった。**番号を詰め直すと
+過去の PR とログの参照がずれる**ので、範囲ごと欠番にしてここに残す。
+
+**穴を開けたままにしない。**`test_a_*_no_longer_blocks_the_request` が
+「これらが偽でも要求が書かれる」ことを積極的に固定している。
+"""
+
+
 def test_every_nd_number_is_assigned_to_a_layer() -> None:
-    """**ND-01〜ND-31 がすべてどれかの層に属すること**（§20.4 / v5.8→v5.9 の変更 U-2）。
+    """**廃止したものを除き、ND-01〜ND-31 がすべてどれかの層に属すること**
+    （§20.4 / v5.8→v5.9 の変更 U-2）。
 
     v5.8 まで表は ND-28 で止まっており、**ND-29 / 30 / 31 がどの層にも
     属していなかった。**割り当てが無い ND は誰も書かない。
@@ -778,8 +920,16 @@ def test_every_nd_number_is_assigned_to_a_layer() -> None:
     assigned: set[str] = set()
     for numbers in layers.values():
         assigned |= numbers
-    expected = {f"ND-{n:02d}" for n in range(1, 32)}
+    expected = {f"ND-{n:02d}" for n in range(1, 33)} - RETIRED_ND
     assert assigned == expected, sorted(expected - assigned)
+    assert not (assigned & RETIRED_ND), "廃止した ND が層の表に残っている"
+
+
+def test_the_retired_numbers_are_not_reused() -> None:
+    """**欠番を埋め直さないこと。**`test_nd10_*` のような名前が復活していない。"""
+    body = Path(__file__).read_text(encoding="utf-8")
+    revived = {f"ND-{int(n):02d}" for n in re.findall(r"^def test_nd(\d+)", body, re.M)}
+    assert not (revived & RETIRED_ND), sorted(revived & RETIRED_ND)
 
 
 def test_the_container_layer_is_implemented_here() -> None:
