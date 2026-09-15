@@ -52,7 +52,7 @@ FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "config"
 
 # 専用のテスト関数で扱う規則（fixture を置かないもの）
 FILE_RULES = frozenset({"V-20", "V-23", "V-24", "V-25"})
-LOCK_RULES = frozenset({"V-26", "V-30"})
+LOCK_RULES = frozenset({"V-26", "V-30", "V-33"})
 
 NOW = datetime(2026, 8, 30, 7, 0, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
 
@@ -240,7 +240,8 @@ def test_v26_notice_when_enabled(tmp_path: Path) -> None:
     state = tmp_path / "state"
     write_heartbeat(state, updated_at=NOW.isoformat(), delete_source_audio=True)
     notices = startup_notices(enabled(tmp_path), state_root=state, now=NOW)
-    assert [n.rule for n in notices] == ["V-26"]
+    # V-33 も出る（MOUNT_MODE を報告していないため不明。§7.3）
+    assert [n.rule for n in notices] == ["V-26", "V-33"]
 
 
 def test_v30_confirmed_mismatch_is_a_violation(tmp_path: Path) -> None:
@@ -273,7 +274,48 @@ def test_v30_unknown_warns_but_does_not_block(tmp_path: Path, case: str) -> None
 
     cfg = enabled(tmp_path)
     assert check_locks(cfg, state_root=state, now=NOW) == []
-    assert [n.rule for n in startup_notices(cfg, state_root=state, now=NOW)] == ["V-26", "V-30"]
+    assert [n.rule for n in startup_notices(cfg, state_root=state, now=NOW)] == [
+        "V-26",
+        "V-30",
+        "V-33",
+    ]
+
+
+def test_v33_a_read_only_mount_mode_is_a_violation(tmp_path: Path) -> None:
+    """V-33: **ロック 2-B が掛かったまま解除すると、何も進まない**（#145）。
+
+    削除は 1 件も行われず、**セッションも `SAVED` のまま止まる**（`cleanup_staging()` が
+    呼ばれないので staging が溜まり続ける）。**安全側ではあるが進まない。**
+    """
+    state = tmp_path / "state"
+    write_heartbeat(state, updated_at=NOW.isoformat(), delete_source_audio=True, mount_mode="ro")
+    violations = check_locks(enabled(tmp_path), state_root=state, now=NOW)
+    assert [(v.rule, v.code, v.key) for v in violations] == [
+        ("V-33", ErrorCode.CONFIG_LOCK_MISMATCH, "cleanup.delete_source_audio")
+    ]
+
+
+def test_v33_accepts_rw(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    write_heartbeat(state, updated_at=NOW.isoformat(), delete_source_audio=True, mount_mode="rw")
+    assert check_locks(enabled(tmp_path), state_root=state, now=NOW) == []
+
+
+def test_v33_unknown_warns_but_does_not_block(tmp_path: Path) -> None:
+    """**不明は止めない**（§7.3。V-30 と同じ規則）。"""
+    state = tmp_path / "state"
+    write_heartbeat(state, updated_at=NOW.isoformat(), delete_source_audio=True)
+    cfg = enabled(tmp_path)
+    assert check_locks(cfg, state_root=state, now=NOW) == []
+    assert "V-33" in {n.rule for n in startup_notices(cfg, state_root=state, now=NOW)}
+
+
+def test_v30_and_v33_are_reported_together(tmp_path: Path) -> None:
+    """**両方落ちているなら両方出す。**1 つ直して再起動、を繰り返させない。"""
+    state = tmp_path / "state"
+    write_heartbeat(state, updated_at=NOW.isoformat(), delete_source_audio=False, mount_mode="ro")
+    violations = check_locks(enabled(tmp_path), state_root=state, now=NOW)
+    assert [v.rule for v in violations] == ["V-30", "V-33"]
 
 
 # --- 読み込み API --------------------------------------------------------

@@ -116,7 +116,7 @@ def can_delete_source(
     return (
         # --- 安全ロック（§14.2） ---
         cfg.cleanup.delete_source_audio is True
-        and _device_is_writable(inventory) is True
+        and device_is_writable(inventory) is True
         # --- Raw ノート（文字起こし本文）が保存検証済みで、この Part を含む ---
         and session.raw_output_path is not None
         and verify_raw_note(session, parts, vault_root=vault_root) is True
@@ -135,7 +135,7 @@ def can_delete_source(
     )
 
 
-def _device_is_writable(inventory: DeviceInventory | None) -> bool:
+def device_is_writable(inventory: DeviceInventory | None) -> bool:
     """安全ロック 2-B（§14.2）。**`mount_readonly` が偽であること。**
 
     **不明（`None`）は安全側へ倒す**（§7.5）。`inventory` が読めないときも同じである。

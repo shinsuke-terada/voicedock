@@ -128,6 +128,7 @@ RULES: Final[tuple[Rule, ...]] = (
     Rule("V-30", "cleanup.delete_source_audio", ErrorCode.CONFIG_LOCK_MISMATCH),
     Rule("V-31", "import.helper_heartbeat_max_age_seconds", _IV),
     Rule("V-32", "timezone", _IV),
+    Rule("V-33", "cleanup.delete_source_audio", ErrorCode.CONFIG_LOCK_MISMATCH),
 )
 
 RULE_BY_ID: Final[Mapping[str, Rule]] = {r.id: r for r in RULES}
@@ -596,23 +597,36 @@ def check_locks(
     """
     if not cfg.cleanup.delete_source_audio:
         return []
+    violations: list[Violation] = []
     state = _helper_delete_flag(cfg, state_root=state_root, now=now)
     if state is False:
-        return [
+        violations.append(
             _make(
                 "V-30",
                 "cleanup.delete_source_audio",
                 "helper.conf 側（heartbeat.json の delete_source_audio）が false。"
                 "片方だけの解除は事故のため起動しない",
             )
-        ]
-    return []
+        )
+    # V-33: ロック 2-B が掛かったままの解除（#145）。**設定の食い違いだけを見る** —
+    # 「意図は rw だが再マウントに失敗した」は設定として正しいので、ここでは拾わない
+    # （`pipeline` が観測で拾って `source_delete_skipped` へ倒す）
+    if _helper_mount_mode(cfg, state_root=state_root, now=now) == "ro":
+        violations.append(
+            _make(
+                "V-33",
+                "cleanup.delete_source_audio",
+                "helper.conf 側の MOUNT_MODE が ro。安全ロック 2-B が掛かったままでは"
+                "削除は 1 件も行われず、セッションも進まない（#145）",
+            )
+        )
+    return violations
 
 
 def startup_notices(
     cfg: Config, *, state_root: Path = DEFAULT_STATE_ROOT, now: datetime | None = None
 ) -> list[Notice]:
-    """起動を止めない警告（V-26 と、V-30 の不明ケース）。"""
+    """起動を止めない警告（V-26 と、V-30 / V-33 の不明ケース）。"""
     if not cfg.cleanup.delete_source_audio:
         return []
     notices = [
@@ -630,6 +644,14 @@ def startup_notices(
                 "delete_source_audio を報告していない）。削除は要求しない",
             )
         )
+    if _helper_mount_mode(cfg, state_root=state_root, now=now) is None:
+        notices.append(
+            Notice(
+                "V-33",
+                "helper.conf 側の MOUNT_MODE を確認できない。**ro のままなら削除は"
+                "1 件も行われない**（§14.2 のロック 2-B）",
+            )
+        )
     return notices
 
 
@@ -642,6 +664,17 @@ def _helper_delete_flag(cfg: Config, *, state_root: Path, now: datetime | None) 
     if beat.is_stale(moment, cfg.import_.helper_heartbeat_max_age_seconds):
         return None
     return beat.delete_source_audio
+
+
+def _helper_mount_mode(cfg: Config, *, state_root: Path, now: datetime | None) -> str | None:
+    """Helper が報告する `MOUNT_MODE`（**意図**）。不明なら `None`（§7.5）。"""
+    beat: Heartbeat | None = read_heartbeat(state_root)
+    if beat is None:
+        return None
+    moment = now if now is not None else datetime.now(cfg.tz)
+    if beat.is_stale(moment, cfg.import_.helper_heartbeat_max_age_seconds):
+        return None
+    return beat.mount_mode
 
 
 def _make(rule: str, key: str, message: str) -> Violation:
