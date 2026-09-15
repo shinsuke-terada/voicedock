@@ -695,6 +695,21 @@ class Pipeline:
 
         if not self.cfg.cleanup.delete_source_audio:
             # **安全ロック 1 が掛かっている。**元音声を残したまま完了する（§9.3）
+            self.log.info(
+                "source_delete_skipped",
+                session_key=session_key,
+                reason="delete_source_audio_disabled",
+            )
+            return self._complete_without_deleting(row, parts)
+
+        if not cleaner.device_is_writable(device.read_inventory(self.state_root)):
+            # **安全ロック 2-B が掛かっている**（§14.2）。**止めない**（#145）。
+            # `MOUNT_MODE` は設定なので待っても変わらず、待つと `cleanup_staging()` が
+            # 呼ばれないまま staging が溜まり続ける。**観測で判定する** — 意図が `rw` でも
+            # 再マウントに失敗して `ro` のままのことが実機で起きる（§7.5 / #118）
+            self.log.info(
+                "source_delete_skipped", session_key=session_key, reason="device_readonly"
+            )
             return self._complete_without_deleting(row, parts)
 
         if requested == 0 and not any(part.status == PartStatus.SOURCE_DELETING for part in parts):
