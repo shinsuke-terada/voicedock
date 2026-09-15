@@ -1049,7 +1049,12 @@ class Pipeline:
             day=day,
             session_key=session_key,
             recording_keys=[PartKey(p.partkey) for p in included],
-            failed_keys=[PartKey(p.partkey) for p in excluded],
+            excluded=[
+                daily.ExcludedPart(
+                    partkey=PartKey(p.partkey), status=p.status, error_code=p.error_code
+                )
+                for p in excluded
+            ],
             recorded_seconds=recorded_seconds,
             block_count=len(transcript.blocks),
             timeline=timeline,

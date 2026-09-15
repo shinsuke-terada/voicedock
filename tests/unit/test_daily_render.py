@@ -21,9 +21,11 @@ import pytest
 from voicedock import daily, notes, wiki
 from voicedock.config import Config
 from voicedock.daily import TimelineBlock, build_timeline, render_daily_note
+from voicedock.errors import ErrorCode
 from voicedock.llm import Chunk, build_schema
 from voicedock.paths import PartKey, SessionKey
 from voicedock.session import AbsoluteSegment, SessionTranscript
+from voicedock.states import PartStatus
 
 FINGERPRINT = "FP"
 JST = ZoneInfo("Asia/Tokyo")
@@ -70,7 +72,7 @@ def render(cfg: Config, **overrides: object) -> str:
         "day": DAY,
         "session_key": SESSION_KEY,
         "recording_keys": KEYS,
-        "failed_keys": [],
+        "excluded": [],
         "recorded_seconds": 34880.0,
         "block_count": 2,
         "timeline": [],
@@ -284,21 +286,29 @@ def _transcript() -> SessionTranscript:
 # --- 欠落を隠さない（§13.4。最重要） ------------------------------------
 
 
+def _failed(key: str) -> daily.ExcludedPart:
+    return daily.ExcludedPart(PartKey(key), PartStatus.FAILED, ErrorCode.WHISPER_FAILED)
+
+
+def _skipped(key: str, code: str) -> daily.ExcludedPart:
+    return daily.ExcludedPart(PartKey(key), PartStatus.SKIPPED, code)
+
+
 def test_failed_parts_are_listed_in_the_frontmatter(cfg: Config) -> None:
     """**欠落を隠さない**（§13.4）。
 
     除外された Part の音声は削除されない — §14.1 が `voicedock_recording_keys` への
     収録を要求するため自動的に保証される。**`voicedock_failed_parts` は別の欄である。**
     """
-    failed = [PartKey("DJIMIC3/TX_MIC001_20260829_090000/x_orig.wav")]
-    parsed = frontmatter(render(cfg, failed_keys=failed))
-    assert parsed[daily.FAILED_PARTS_FIELD] == failed
+    part = _failed("DJIMIC3/TX_MIC001_20260829_090000/x_orig.wav")
+    parsed = frontmatter(render(cfg, excluded=[part]))
+    assert parsed[daily.FAILED_PARTS_FIELD] == [part.partkey]
     assert parsed[notes.RECORDING_KEYS_FIELD] == KEYS, "失敗した Part を含めてはならない"
 
 
 def test_a_warning_line_follows_the_title(cfg: Config) -> None:
-    failed = [PartKey("DJIMIC3/a/x_orig.wav"), PartKey("DJIMIC3/b/y_orig.wav")]
-    lines = render(cfg, failed_keys=failed).splitlines()
+    excluded = [_failed("DJIMIC3/a/x_orig.wav"), _failed("DJIMIC3/b/y_orig.wav")]
+    lines = render(cfg, excluded=excluded).splitlines()
     title_index = lines.index("# 開発と打ち合わせの一日")
     warning = lines[title_index + 2]
     assert warning.startswith("> ⚠")
@@ -314,7 +324,113 @@ def test_an_empty_failed_list_is_rendered_as_brackets(cfg: Config) -> None:
     """**`[]` を明示する。**`key:` だと YAML で `null` に読まれ、「0 件」と「欄が無い」が
     区別できなくなる（#24 で見つけた同じ性質）。
     """
-    assert f"{daily.FAILED_PARTS_FIELD}: []" in render(cfg)
+    text = render(cfg)
+    assert f"{daily.FAILED_PARTS_FIELD}: []" in text
+    assert f"{daily.SKIPPED_PARTS_FIELD}: []" in text
+
+
+# --- FAILED と SKIPPED を分ける（#140） ---------------------------------
+
+
+def test_skipped_parts_are_not_listed_as_failed(cfg: Config) -> None:
+    """**これが #140 の本体である。**`SKIPPED` を `voicedock_failed_parts` へ入れない。
+
+    2 つは「自動で戻るか」が違う。同じ欄に入れると読み手が区別できない。
+    """
+    part = _skipped("DJIMIC3/a/x_orig.wav", ErrorCode.NO_SPEECH_DETECTED)
+    parsed = frontmatter(render(cfg, excluded=[part]))
+
+    assert parsed[daily.FAILED_PARTS_FIELD] == [], "SKIPPED が failed 欄に入った"
+    assert parsed[daily.SKIPPED_PARTS_FIELD] == [part.partkey]
+
+
+def test_silence_alone_does_not_warn(cfg: Config) -> None:
+    """**無音は失敗ではない**（§10.6 が明記）。`⚠` を付けず、再試行を約束しない。
+
+    E2E-07（無音だけの Part を混ぜる）が踏む経路そのものである。
+    """
+    text = render(cfg, excluded=[_skipped("DJIMIC3/a/x_orig.wav", ErrorCode.NO_SPEECH_DETECTED)])
+    line = next(line for line in text.splitlines() if "除外しました" in line)
+
+    assert "⚠" not in line, "無音を警告として報告した"
+    assert "無音" in line
+    assert "自動では再試行されません" in line
+    assert daily.RETRY_ACTION not in line, "することが無いのに操作を求めた"
+
+
+def test_a_missing_source_warns_and_says_what_to_do(cfg: Config) -> None:
+    """**`SOURCE_MISSING` は記録が欠けている。**利用者の操作が要る。"""
+    text = render(cfg, excluded=[_skipped("DJIMIC3/a/x_orig.wav", ErrorCode.SOURCE_MISSING)])
+    line = next(line for line in text.splitlines() if "除外しました" in line)
+
+    assert line.startswith("> ⚠"), "操作が要るのに警告記号が無い"
+    assert "元ファイルが見つかりません" in line
+    assert "自動では再試行されません" in line
+    assert daily.RETRY_ACTION in line, "次に何をすればよいかが書かれていない"
+
+
+def test_one_actionable_reason_marks_the_whole_line(cfg: Config) -> None:
+    """無音に 1 本でも `SOURCE_MISSING` が混ざれば `⚠` を付ける。"""
+    text = render(
+        cfg,
+        excluded=[
+            _skipped("DJIMIC3/a/x_orig.wav", ErrorCode.NO_SPEECH_DETECTED),
+            _skipped("DJIMIC3/b/y_orig.wav", ErrorCode.SOURCE_MISSING),
+        ],
+    )
+    line = next(line for line in text.splitlines() if "除外しました" in line)
+
+    assert line.startswith("> ⚠")
+    assert "2 本" in line
+    assert "無音" in line and "元ファイルが見つかりません" in line
+
+
+def test_an_unknown_skip_reason_is_treated_as_actionable(cfg: Config) -> None:
+    """**許可リストの既定側。**知らない理由を正常扱いすると、欠けた記録が見過ごされる。"""
+    text = render(cfg, excluded=[_skipped("DJIMIC3/a/x_orig.wav", ErrorCode.LLM_FAILED)])
+    line = next(line for line in text.splitlines() if "除外しました" in line)
+
+    assert line.startswith("> ⚠"), "知らない理由を正常扱いした"
+    assert ErrorCode.LLM_FAILED in line, "コードをそのまま出していない"
+
+
+def test_benign_reasons_is_exactly_the_two_normal_ones(cfg: Config) -> None:
+    """**集合そのものを固定する。**空にすると上のテストが素通りしうる。"""
+    assert (
+        frozenset({ErrorCode.NO_SPEECH_DETECTED, ErrorCode.DUPLICATE_CONTENT})
+        == daily.BENIGN_SKIP_REASONS
+    )
+
+
+def test_both_kinds_get_their_own_line(cfg: Config) -> None:
+    """**1 行に混ぜない。**`FAILED` と `SKIPPED` で別の行にする。"""
+    text = render(
+        cfg,
+        excluded=[
+            _failed("DJIMIC3/a/x_orig.wav"),
+            _skipped("DJIMIC3/b/y_orig.wav", ErrorCode.NO_SPEECH_DETECTED),
+        ],
+    )
+    lines = [line for line in text.splitlines() if line.startswith(">")]
+
+    assert len(lines) == 2, lines
+    assert "自動で再試行されます" in lines[0] and "1 本が処理できませんでした" in lines[0]
+    assert "自動では再試行されません" in lines[1] and "除外しました" in lines[1]
+
+
+def test_the_reason_order_does_not_depend_on_part_order(cfg: Config) -> None:
+    """**並びは §15.1 の順に固定する。**出現順にすると、同じ日のノートが Part の
+    処理順で違う文面になり、§9.4 の `output_sha256` 一致が壊れる。
+    """
+    a = _skipped("DJIMIC3/a/x_orig.wav", ErrorCode.NO_SPEECH_DETECTED)
+    b = _skipped("DJIMIC3/b/y_orig.wav", ErrorCode.DUPLICATE_CONTENT)
+
+    forward = render(cfg, excluded=[a, b])
+    backward = render(cfg, excluded=[b, a])
+
+    line = next(line for line in forward.splitlines() if "除外しました" in line)
+    assert line == next(line for line in backward.splitlines() if "除外しました" in line)
+    assert line.index("重複") < line.index("無音"), "§15.1 の並びと違う"
 
 
 # --- Sources / Links（§13.4 / §13.8） -----------------------------------
