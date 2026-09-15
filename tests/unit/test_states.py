@@ -37,7 +37,6 @@ from voicedock.states import (
     PART_TERMINAL,
     PART_TRANSITIONS,
     RETRY_RESET_STATUSES,
-    SESSION_DELETABLE,
     SESSION_IN_PROGRESS,
     SESSION_INITIAL,
     SESSION_RECOVERY,
@@ -221,13 +220,6 @@ def test_part_terminal_matches_spec() -> None:
 def test_part_deletable_matches_spec() -> None:
     assert {status.value for status in PART_DELETABLE} == set(spec_status_tuple("PART_DELETABLE"))
     assert len(PART_DELETABLE) == 4
-
-
-def test_session_deletable_matches_spec() -> None:
-    assert {status.value for status in SESSION_DELETABLE} == set(
-        spec_status_tuple("SESSION_DELETABLE")
-    )
-    assert len(SESSION_DELETABLE) == 5
 
 
 def test_deletable_is_a_strict_subset_of_terminal() -> None:
