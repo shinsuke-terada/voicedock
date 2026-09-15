@@ -775,6 +775,60 @@ def test_the_watchdog_terms_are_present_in_the_formula() -> None:
     assert "analysis" not in source, "解析結果を条件に戻している（AY-1）"
 
 
+# --- ロック 2-B で止まらない（#145）------------------------------------
+
+
+@pytest.mark.parametrize("observed", [True, None], ids=["読み取り専用", "不明"])
+def test_a_read_only_device_completes_instead_of_stalling(
+    scene: Scene, observed: bool | None
+) -> None:
+    """**安全ロック 1 だけを解除しても止まらない**（§14.3 / #145）。
+
+    v5.37 まではセッションが**永久に `SAVED` のまま**で、Part も `RAW_SAVED` のまま、
+    **`cleanup_staging()` が呼ばれないので 16 kHz 音声が溜まり続けた。**
+    `delete_attempts` だけが際限なく増えていた。
+
+    **`MOUNT_MODE` は設定なので、待っても変わらない。**「いずれ真になる」前提の
+    backoff が成立しない唯一の条件である。
+
+    **不明（`None`）も同じ扱いにする**（§7.5 の「不明は安全側」）。
+    """
+    scene.rearm()
+    object.__setattr__(scene.inventory, "mount_readonly", observed)
+
+    scene.evaluate()
+
+    assert scene.session().status == SessionStatus.COMPLETED, "セッションが止まっている"
+    assert scene.part().status == PartStatus.COMPLETED
+    assert scene.requests() == [], "書き込み不能なのに要求を書いた"
+    assert "source_delete_skipped" in scene.log.getvalue()
+    assert "reason=device_readonly" in scene.log.getvalue(), "理由が読めない"
+
+
+def test_a_read_only_device_still_frees_the_staging(scene: Scene) -> None:
+    """**staging が解放されること。**止まっていた間はここが溜まり続けた。"""
+    scene.rearm()
+    object.__setattr__(scene.inventory, "mount_readonly", True)
+    normalized = paths.DATA_ROOT / "staging" / "slug" / "audio16k.wav"
+    normalized.parent.mkdir(parents=True, exist_ok=True)
+    normalized.write_bytes(b"RIFF....WAVE")
+    scene.set_part(normalized_path=str(normalized))
+
+    scene.evaluate()
+
+    assert not normalized.exists(), "staging が解放されていない"
+
+
+def test_the_disabled_lock_still_says_why(scene: Scene) -> None:
+    """ロック 1 の場合も理由を出す（§16.4 の `reason` で区別する）。"""
+    scene.rearm()
+    object.__setattr__(scene.cfg.cleanup, "delete_source_audio", False)
+
+    scene.evaluate()
+
+    assert "reason=delete_source_audio_disabled" in scene.log.getvalue()
+
+
 # --- 契機の配線（AY-1）--------------------------------------------------
 
 
