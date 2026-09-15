@@ -168,15 +168,36 @@ def _reaper_text(installed: bool | None) -> str:
     return "reaper present" if installed else "reaper absent"
 
 
-def mount_text(readonly: bool | None) -> str:
+NO_DEVICE: Final = "no device"
+"""デバイスが 1 台も接続されていないときの表示語（#148）。"""
+
+
+def mount_text(readonly: bool | None, *, connected: bool | None = None) -> str:
     """観測されたマウント状態の表示語。**`status` と `doctor` で同じ語を使う**（#107）。
 
     **`None` を `writable` に丸めない。**Helper が値を書けなかったことと、デバイスが
     書き込み可能であることは別の事実であり、後者は §14.2 のロック 2-B を開ける。
+
+    **デバイスが 0 台のときの `mount_readonly` は観測ではない**（#148）。
+    Helper は 0 台のとき**初期値の `false` のまま**書く（`voicedock-ingest` の注記）ので、
+    そのまま出すと「書き込み可能」＝**ロック 2-B が外れている**と読めてしまう。
+    ロック 2-B の状態は移行判断に使うので、**本物の異常と見分けがつかなくなる。**
+
+    `connected` は `inventory.json` から取る（`status` の `Devices connected` と
+    **同じ出どころ**にする）。**`None`（inventory が読めない）は今までどおり** ——
+    「無い」と「0 台」は別である。
     """
+    if connected is False:
+        return NO_DEVICE
     if readonly is None:
         return UNKNOWN
     return "readOnly" if readonly else "writable"
+
+
+def devices_connected(state_root: Path) -> bool | None:
+    """デバイスが 1 台以上つながっているか。**読めなければ `None`**（§7.5）。"""
+    found = read_inventory(state_root)
+    return None if found is None else not found.is_empty
 
 
 @dataclass(frozen=True)
@@ -215,7 +236,7 @@ def collect(
 
     parts, sessions, backlog, failed, failed_total, orphaned = _from_database(cfg)
     return Snapshot(
-        helper=_helper_text(beat, cfg, moment),
+        helper=_helper_text(beat, cfg, moment, connected=devices_connected(state_root)),
         devices=inventory,
         device_free=_free_space_text(state_root),
         inbox=_inbox_text(cfg, orphaned),
@@ -350,7 +371,9 @@ def _failed(opened: db.Database) -> tuple[tuple[FailedPart, ...], int]:
     )
 
 
-def _helper_text(beat: Heartbeat | None, cfg: Config, now: datetime) -> str:
+def _helper_text(
+    beat: Heartbeat | None, cfg: Config, now: datetime, *, connected: bool | None = None
+) -> str:
     """§17.2 の `Helper` 行。
 
     **Helper が居なくても表示を続ける**（§22 R-23）。`status` が落ちると、
@@ -365,7 +388,7 @@ def _helper_text(beat: Heartbeat | None, cfg: Config, now: datetime) -> str:
     # **実測を出す。設定値ではない**（#107）。`doctor` の DH-12 と同じ語を使う。
     # `mount_mode` は「そうしたい」であり、`mount_readonly` は「そうなっている」である。
     # **両方を出す** — 食い違い自体が異常の徴候だからである
-    observed = mount_text(beat.mount_readonly)
+    observed = mount_text(beat.mount_readonly, connected=connected)
     detail = (
         f"{state}   (last seen {seen}, {beat.helper_version or UNKNOWN}, "
         f"mount={observed} (MOUNT_MODE={beat.mount_mode or UNKNOWN}))"

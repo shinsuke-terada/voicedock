@@ -663,3 +663,61 @@ def test_no_orphans_prints_no_parenthesis(
     inbox_pair(cfg)
 
     assert "(" not in row_value(text(cfg, state_root), "Inbox")
+
+
+# --- デバイス未接続のときの観測値（#148）--------------------------------
+
+
+def test_mount_text_does_not_claim_writable_without_a_device() -> None:
+    """**`mount_readonly: false` は 0 台のときの初期値であって観測ではない**（#148）。
+
+    `helper/voicedock-ingest` が「デバイスが 0 個なら初期値の `false` のままである」と
+    書いているとおりで、**そのまま `writable` と出すと §14.2 のロック 2-B が
+    外れているように読める。**ロック 2-B の状態は Phase 7 の移行判断に使うので、
+    **本物の異常と見分けがつかなくなる。**
+    """
+    assert status.mount_text(False, connected=False) == status.NO_DEVICE
+    assert status.mount_text(True, connected=False) == status.NO_DEVICE
+
+
+def test_mount_text_still_reports_a_connected_device() -> None:
+    """**塞ぎすぎない。**繋がっているときは観測値をそのまま出す。"""
+    assert status.mount_text(False, connected=True) == "writable"
+    assert status.mount_text(True, connected=True) == "readOnly"
+
+
+def test_mount_text_keeps_unknown_when_the_inventory_is_unreadable() -> None:
+    """**「無い」と「0 台」は別である**（§7.5）。inventory が読めなければ今までどおり。"""
+    assert status.mount_text(None, connected=None) == status.UNKNOWN
+    assert status.mount_text(False, connected=None) == "writable"
+    assert status.mount_text(None, connected=False) == status.NO_DEVICE
+
+
+def test_devices_connected_reads_the_inventory(state_root: Path) -> None:
+    assert status.devices_connected(state_root) is None, "inventory が無ければ不明"
+
+    write_inventory(state_root, devices={})
+    assert status.devices_connected(state_root) is False
+
+    write_inventory(state_root, devices={"DJIMIC3": ["a/b_orig.wav"]})
+    assert status.devices_connected(state_root) is True
+
+
+def test_the_helper_row_says_no_device_instead_of_writable(cfg: Config, state_root: Path) -> None:
+    """`status` の Helper 行。**`Devices connected` は 0 と正しく出していた** ——
+    同じ事実を片方は正しく、片方は誤って表示していた（#148）。
+    """
+    write_heartbeat(
+        state_root,
+        updated_at=NOW.isoformat(),
+        helper_version="5.5.0",
+        mount_readonly=False,
+        mount_mode="ro",
+    )
+    write_inventory(state_root, devices={})
+
+    out = text(cfg, state_root)
+
+    assert f"mount={status.NO_DEVICE}" in out
+    assert "mount=writable" not in out, "未接続なのに書き込み可能と表示した"
+    assert "MOUNT_MODE=ro" in out, "意図は出し続ける"
