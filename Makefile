@@ -53,6 +53,7 @@ test:
 	  -v "$(CURDIR)/compose.yaml:/app/compose.yaml:ro" \
 	  -v "$(CURDIR)/Dockerfile:/app/Dockerfile:ro" \
 	  -v "$(CURDIR)/Makefile:/app/Makefile:ro" \
+	  -v "$(CURDIR)/README.md:/app/README.md:ro" \
 	  -v "$(CURDIR)/.github:/app/.github:ro" \
 	  -v "$(CURDIR)/uv.lock:/app/uv.lock:ro" \
 	  -v "$(CURDIR)/requirements.lock:/app/requirements.lock:ro" \
