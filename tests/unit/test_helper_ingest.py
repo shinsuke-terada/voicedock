@@ -1057,6 +1057,16 @@ def test_the_inventory_is_not_written_mid_run(tmp_path: Path, volumes: Path) -> 
     """**`inventory.json` は途中で書かない**（#117 の判断 4）。
 
     あれは「デバイスに何があるか」の一覧であり、**途中経過に意味が無い。**
+
+    **「実行中に両方あるか」を見てはならない。**helper は実行の最後に
+    `write_inventory` → `write_heartbeat` の順で書くので、**その窓に poll が当たると
+    必ず両方存在する**（最初にそう書いて CI で落ちた）。
+
+    **「最初の heartbeat の時点で無いこと」も足りない。**コピー途中の書き込みは
+    最初の heartbeat より後に起きるので、**壊しても通ってしまう**（§20.5 の 6 番目）。
+
+    **1 回しか書かれないことを直接見る。**偽の `shasum` で 1 ファイル 1 秒かけるので、
+    途中でも書いていれば `generated_at` が複数現れる。
     """
     conf = write_conf(tmp_path)
     home = tmp_path / "home"
@@ -1066,18 +1076,27 @@ def test_the_inventory_is_not_written_mid_run(tmp_path: Path, volumes: Path) -> 
     env["PATH"] = f"{prefix}{os.pathsep}{env['PATH']}"
 
     inventory = home / "state" / "inventory.json"
-    existed_early = False
+    seen: set[str] = set()
+
+    def snapshot() -> None:
+        try:
+            document = json.loads(inventory.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        value = document.get("generated_at")
+        if isinstance(value, str):
+            seen.add(value)
+
     process = subprocess.Popen(  # noqa: S603
         [BASH, str(INGEST)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
     )
     try:
         while process.poll() is None:
-            if heartbeat_updated_at(home) is not None and inventory.exists():
-                existed_early = True
-                break
-            time.sleep(0.1)
+            snapshot()
+            time.sleep(0.02)
     finally:
         process.wait(timeout=120)
+    snapshot()
 
-    assert not existed_early, "heartbeat より先に inventory.json が書かれている"
     assert inventory.exists(), "実行後には inventory.json がある"
+    assert len(seen) == 1, f"inventory.json が複数回書かれている: {sorted(seen)}"
