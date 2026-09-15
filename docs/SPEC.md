@@ -1730,6 +1730,8 @@ stateDiagram-v2
     [*] --> DISCOVERED
     DISCOVERED --> NORMALIZING
     NORMALIZING --> NORMALIZED
+    NORMALIZED --> NORMALIZING
+    TRANSCRIBING --> NORMALIZING
     NORMALIZING --> SKIPPED
     NORMALIZED --> TRANSCRIBING
     TRANSCRIBING --> TRANSCRIBED
@@ -1841,7 +1843,8 @@ stateDiagram-v2
 | `NORMALIZING` | **ハッシュ不一致** | 再計算値 ≠ `sha256_helper` | `FAILED` | `SOURCE_HASH_MISMATCH`。出力削除。**inbox の原本も残す**（再コピーの判断材料） |
 | `NORMALIZING` | SHA-256 衝突 | 同一 sha256 の別行が存在 | `SKIPPED` | 出力削除、`DUPLICATE_CONTENT` 記録 |
 | `NORMALIZING` | 失敗 / USB 切断 | — | `FAILED` | **部分出力を削除**。元ファイルは触らない |
-| `NORMALIZED` | 文字起こし | — | `TRANSCRIBING` | — |
+| `NORMALIZED` | 文字起こし | **`normalized_path` が実在し `size > 0`** | `TRANSCRIBING` | — |
+| `NORMALIZED` / `TRANSCRIBING` | 16 kHz 音声が消えていた | — | `NORMALIZING` | **必ずここを経由する**（§10.6）。whisper は起動しない。inbox に原本があれば次の周回で作り直し、無ければ `NORMALIZED_MISSING` で `FAILED` へ落ちる |
 | `TRANSCRIBING` | whisper 成功 | JSON パース成功 ∧ 文字数 >= `min_chars` | `TRANSCRIBED` | `transcript_path` 更新、`delete_normalized_after_transcribe` なら 16 kHz 音声を削除 |
 | `TRANSCRIBING` | 発話なし | 文字数 < `min_chars` | `SKIPPED` | `NO_SPEECH_DETECTED`。**失敗ではない**（§10.6） |
 | `TRANSCRIBING` | タイムアウト | — | `FAILED` | `WHISPER_TIMEOUT`、プロセスグループごと kill |
@@ -2285,6 +2288,21 @@ if du(staging_root) + expected > import.staging_max_bytes:  -> DISK_SPACE_LOW
 **二重処理防止**: 算出した SHA-256 が既存行と衝突した場合、それは内容が同一の既処理ファイルを意味するため `SKIPPED`（`DUPLICATE_CONTENT`）とし、生成した 16 kHz 音声を削除する。
 
 ### 10.6 文字起こし
+
+**前提: `normalized_path` が実在し `size > 0` であることを、起動の前に確かめる。**
+
+whisper-cli は **`-f` のファイルを開けないと usage を吐いて終了コード 2 で落ちる。**
+そのまま `WHISPER_FAILED` として記録すると、**`error_message` の先頭 200 文字が
+whisper のヘルプになり、原因を隠す**（#135。2026-09-15 実機）。
+
+| 入力が無い | 扱い |
+|---|---|
+| inbox に原本がある | **`NORMALIZING` へ戻して作り直す。**whisper は起動しない |
+| inbox にも原本が無い | `NORMALIZED_MISSING` で `FAILED`。**デバイスから採り直す必要がある**（§10.2 の墓標を手で外す） |
+
+> **`inbox_retain: normalized`（既定）では原本が正規化直後に消えている**ので、
+> 実際には後者になることが多い。**それでも「音声が無い」と言えることに意味がある** —
+> whisper のヘルプ全文からは何も分からない。
 
 ```bash
 /usr/local/bin/whisper-cli \
@@ -3749,6 +3767,7 @@ VoiceDock Container ──HTTP──> Docker Model Runner（ローカル）
 | `AUDIO_PROBE_FAILED` | 音声 | ffprobe | 可（3 回） | **続行**（`duration_seconds = NULL`、警告のみ） |
 | `IMPORT_FAILED` | 音声 | 読み込み / 変換 / USB 切断 | 可（3 回） | Part `FAILED`。部分出力削除 |
 | `NORMALIZE_VERIFY_FAILED` | 音声 | 変換結果の検証 | 可（3 回） | Part `FAILED`。出力削除 |
+| `NORMALIZED_MISSING` | 音声 | 文字起こし直前の入力確認 | 可（次回接続時） | inbox に原本があれば `NORMALIZING` へ戻す。無ければ Part `FAILED`（**デバイスから採り直す必要がある**） |
 | `WHISPER_EXEC_MISSING` | 文字起こし | 起動 / doctor | 不可 | 起動中止（終了コード 2） |
 | `WHISPER_MODEL_MISSING` | 文字起こし | 起動 / doctor | 不可 | 起動中止（終了コード 2） |
 | `WHISPER_FAILED` | 文字起こし | whisper-cli | 可（3 回） | Part `FAILED` |
