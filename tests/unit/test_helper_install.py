@@ -29,6 +29,7 @@ INSTALL = HELPER_DIR / "install.sh"
 pytestmark = pytest.mark.skipif(not INSTALL.is_file(), reason="helper/ がマウントされていない")
 
 NEEDED = ("install.sh", "voicedock-ingest", "voicedock-ingest-launcher.c", "helper.example.conf")
+REAPER = "voicedock-reaper"
 
 
 def write_stub(directory: Path, name: str, body: str) -> Path:
@@ -89,6 +90,9 @@ def run(sandbox: dict[str, Path], *args: str, **env: str) -> subprocess.Complete
         env=environment,
         timeout=60,
         check=False,
+        # **stdin を空のパイプにする。**確認入力を求める経路（--enable-deletion）が
+        # 端末を掴んで固まらないようにする
+        input="",
     )
 
 
@@ -208,3 +212,97 @@ def test_the_launcher_spawns_instead_of_exec(sandbox: dict[str, Path]) -> None:
     assert "posix_spawn" in source
     assert not re.search(r"\bexecv?[lp]?\s*\(", source), "execv を使っている"
     assert "waitpid" in source, "子の終了を待たないと launchd が先に終わったと見なす"
+
+
+# --- 削除の有効化 / 無効化（§14.2 / #39）--------------------------------
+
+
+def conf_of(sandbox: dict[str, Path]) -> dict[str, str]:
+    body = (sandbox["home"] / "VoiceDock" / "helper.conf").read_text(encoding="utf-8")
+    values: dict[str, str] = {}
+    for line in body.splitlines():
+        if "=" in line and not line.startswith("#"):
+            key, value = line.split("=", 1)
+            values[key] = value
+    return values
+
+
+@pytest.fixture
+def installed(sandbox: dict[str, Path]) -> dict[str, Path]:
+    """Helper を入れ、reaper の原本も置いた状態。"""
+    shutil.copy(HELPER_DIR / REAPER, sandbox["repo"] / "helper" / REAPER)
+    assert run(sandbox).returncode == 0
+    return sandbox
+
+
+def test_enable_deletion_releases_all_three_host_locks(installed: dict[str, Path]) -> None:
+    """**ホスト側の 3 つを 1 度に解除する**（§14.2）。
+
+    1 つずつ手で直すと**どれか 1 つ忘れた状態**に落ちやすく、ロック 1 だけの解除は
+    **削除もされずセッションも進まない**（#145）。
+    """
+    result = run(installed, "--enable-deletion", "--yes")
+    assert result.returncode == 0, result.stderr
+
+    conf = conf_of(installed)
+    assert conf["DELETE_SOURCE_AUDIO"] == "true"
+    assert conf["MOUNT_MODE"] == "rw"
+    assert (installed["home"] / "VoiceDock" / "bin" / REAPER).is_file()
+
+
+def test_enable_deletion_says_the_container_side_is_left(installed: dict[str, Path]) -> None:
+    """**コンテナ側は別の系統である**（§7.4）。黙って終わらない。"""
+    result = run(installed, "--enable-deletion", "--yes")
+    output = result.stdout + result.stderr
+    assert "config/config.yaml" in output
+    assert "V-30" in output, "片方だけの解除が止まることを伝えていない"
+
+
+def test_enable_deletion_needs_confirmation_without_yes(installed: dict[str, Path]) -> None:
+    """**`--yes` が無ければ確認入力を求める。**空の stdin では中止する。"""
+    result = run(installed, "--enable-deletion")
+    assert result.returncode != 0
+    assert "中止しました" in result.stderr
+
+    conf = conf_of(installed)
+    assert conf["DELETE_SOURCE_AUDIO"] == "false", "中止したのに書き換えた"
+    assert conf["MOUNT_MODE"] == "ro"
+    assert not (installed["home"] / "VoiceDock" / "bin" / REAPER).exists()
+
+
+def test_enable_deletion_refuses_without_the_reaper(sandbox: dict[str, Path]) -> None:
+    """**黙って半分だけ解除しない。**reaper の原本が無ければ 1 つも変えない。"""
+    assert run(sandbox).returncode == 0
+    result = run(sandbox, "--enable-deletion", "--yes")
+
+    assert result.returncode != 0
+    assert "voicedock-reaper" in result.stderr
+    conf = conf_of(sandbox)
+    assert conf["DELETE_SOURCE_AUDIO"] == "false", "reaper が無いのにロック 1 を外した"
+    assert conf["MOUNT_MODE"] == "ro"
+
+
+def test_disable_deletion_puts_every_lock_back(installed: dict[str, Path]) -> None:
+    """**戻せること。**戻せない変更は怖くて実行できない。"""
+    assert run(installed, "--enable-deletion", "--yes").returncode == 0
+    result = run(installed, "--disable-deletion")
+    assert result.returncode == 0, result.stderr
+
+    conf = conf_of(installed)
+    assert conf["DELETE_SOURCE_AUDIO"] == "false"
+    assert conf["MOUNT_MODE"] == "ro"
+    assert not (installed["home"] / "VoiceDock" / "bin" / REAPER).exists()
+
+
+def test_enable_deletion_keeps_the_other_settings(installed: dict[str, Path]) -> None:
+    """**2 行だけ差し替える。**利用者が編集した他の値を壊さない。"""
+    conf_path = installed["home"] / "VoiceDock" / "helper.conf"
+    before = conf_path.read_text(encoding="utf-8")
+    assert run(installed, "--enable-deletion", "--yes").returncode == 0
+    after = conf_path.read_text(encoding="utf-8")
+
+    changed = [
+        (a, b) for a, b in zip(before.splitlines(), after.splitlines(), strict=True) if a != b
+    ]
+    assert len(changed) == 2, changed
+    assert {b for _a, b in changed} == {"MOUNT_MODE=rw", "DELETE_SOURCE_AUDIO=true"}
