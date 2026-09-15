@@ -459,7 +459,9 @@ def check_helper(ctx: Context) -> list[Row]:
     seen = "不明" if age is None else f"{age:.0f}s ago"
     # **`None` を `writable` に丸めない**（#107）。Helper が値を書けなかったことと、
     # デバイスが書き込み可能であることは別の事実である
-    mount = status.mount_text(beat.mount_readonly)
+    mount = status.mount_text(
+        beat.mount_readonly, connected=status.devices_connected(ctx.state_root)
+    )
     detail = f"(last seen {seen}, v{beat.helper_version or '?'}, mount={mount})"
 
     extra = [
@@ -540,11 +542,12 @@ def check_source_deletion(ctx: Context) -> list[Row]:
         mount_readonly=beat.mount_readonly if beat else None,
     )
     mount_mode = (beat.mount_mode if beat else None) or "?"
+    connected = status.devices_connected(ctx.state_root)
     lines = [
         f"  lock 1  : config.yaml={_flag(locks.config_delete)}, "
         f"helper.conf={_flag(locks.helper_delete)}",
         f"  lock 2-A: {_reaper_line(locks.reaper_installed)}",
-        f"  lock 2-B: MOUNT_MODE={mount_mode} ({_mount_line(locks.mount_readonly)})",
+        f"  lock 2-B: MOUNT_MODE={mount_mode} ({_mount_line(locks.mount_readonly, connected)})",
     ]
     if locks.enabled:
         lines += [
@@ -570,7 +573,14 @@ def _reaper_line(installed: bool | None) -> str:
     return "voicedock-reaper is NOT installed  <- deletion is impossible"
 
 
-def _mount_line(readonly: bool | None) -> str:
+def _mount_line(readonly: bool | None, connected: bool | None = None) -> str:
+    """**デバイスが 0 台なら観測値を出さない**（#148）。
+
+    `mount_readonly: false` は 0 台のときの**初期値**であり、そのまま出すと
+    「ロック 2-B が外れている」と読めてしまう。
+    """
+    if connected is False:
+        return "no device connected"
     if readonly is None:
         return "unknown"
     return "device mounted read-only" if readonly else "device mounted read-write"

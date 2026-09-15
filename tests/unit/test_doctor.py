@@ -22,7 +22,7 @@ import pytest
 import yaml
 
 from tests.helpers import complete_tree, example_document, merge, write_heartbeat
-from voicedock import db, doctor, llm, paths
+from voicedock import db, doctor, llm, paths, status
 from voicedock.config import load_config
 from voicedock.db import Recording
 from voicedock.doctor import DETAIL_INDENT, LABEL_WIDTH, SEPARATOR, Status
@@ -773,6 +773,72 @@ def test_d17_matches_the_spec_enabled_example(
     for line in _spec_deletion_example("ENABLED").splitlines():
         assert line.strip() in out, f"§19.2 の行が出ていない: {line.strip()!r}"
     assert code == EXIT_OK, "有効なのは設定であって失敗ではない"
+
+
+def _write_inventory(state_root: Path, *, devices: dict[str, list[str]]) -> None:
+    state_root.mkdir(parents=True, exist_ok=True)
+    (state_root / "inventory.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "generated_at": NOW.isoformat(),
+                "mount_readonly": False,
+                "device_free_bytes": {},
+                "devices": devices,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_d17_does_not_claim_read_write_without_a_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**ロック 2-B が外れているように読ませない**（#148）。
+
+    `mount_readonly: false` は**デバイスが 0 台のときの初期値**であり観測ではない。
+    ロック 2-B の状態は Phase 7 の移行判断に使うので、**本物の異常と見分けが
+    つかなくなる。**
+    """
+    path = healthy(tmp_path, monkeypatch)
+    write_heartbeat(
+        tmp_path / "state",
+        updated_at=NOW.isoformat(),
+        helper_version="5.5.0",
+        mount_readonly=False,
+        mount_mode="ro",
+        delete_source_audio=False,
+        reaper_installed=False,
+    )
+    _write_inventory(tmp_path / "state", devices={})
+
+    out, _ = run(path, tmp_path / "state")
+
+    assert "no device connected" in out
+    assert "read-write" not in out, "未接続なのに書き込み可能と表示した"
+    assert "MOUNT_MODE=ro" in out, "意図は出し続ける"
+    assert f"mount={status.NO_DEVICE}" in out, "D-18 の行も直っていること"
+
+
+def test_d17_still_reports_a_connected_writable_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**塞ぎすぎない。**繋がっていて書き込み可能なら、そう言う（本物の異常）。"""
+    path = healthy(tmp_path, monkeypatch)
+    write_heartbeat(
+        tmp_path / "state",
+        updated_at=NOW.isoformat(),
+        helper_version="5.5.0",
+        mount_readonly=False,
+        mount_mode="ro",
+        delete_source_audio=False,
+        reaper_installed=False,
+    )
+    _write_inventory(tmp_path / "state", devices={"DJIMIC3": ["a/b_orig.wav"]})
+
+    out, _ = run(path, tmp_path / "state")
+
+    assert "device mounted read-write" in out, "本物の食い違いを隠した"
 
 
 def test_d17_unknown_locks_fall_to_the_safe_side(
