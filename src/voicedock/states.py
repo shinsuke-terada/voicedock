@@ -149,6 +149,9 @@ PART_TRANSITIONS: Final[frozenset[tuple[PartStatus, PartStatus]]] = frozenset(
         (PartStatus.NORMALIZING, PartStatus.SKIPPED),
         (PartStatus.NORMALIZING, PartStatus.FAILED),
         (PartStatus.NORMALIZED, PartStatus.TRANSCRIBING),
+        # 16 kHz 音声が消えていた。**作り直しへ戻す**（v5.34→v5.35 の変更 AW-1）
+        (PartStatus.NORMALIZED, PartStatus.NORMALIZING),
+        (PartStatus.TRANSCRIBING, PartStatus.NORMALIZING),
         (PartStatus.TRANSCRIBING, PartStatus.TRANSCRIBED),
         (PartStatus.TRANSCRIBING, PartStatus.SKIPPED),
         (PartStatus.TRANSCRIBING, PartStatus.FAILED),
