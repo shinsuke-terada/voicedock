@@ -46,11 +46,11 @@ docker compose exec voicedock voicedock doctor   # コンテナ側（§19.2 の 
 | E2E-01 | 1 分程度の録音を 1 本。削除 OFF | ✅ **PASS** | §3.1 |
 | E2E-02 | **コピー中に** USB を抜く | ✅ **PASS** | §3.2。**変換中ではない** — 変換は inbox から読むので USB と無関係 |
 | E2E-03 | Whisper 実行中に USB を抜く | ⬜ 未実施 | §3.3 |
-| E2E-04 | Obsidian Vault を一時的に利用不可にする | ⬜ 未実施 | §3.4 |
+| E2E-04 | Obsidian Vault を一時的に利用不可にする | ✅ **PASS** | §3.4。**v5.33 まで手順が空振りしていた**（#134） |
 | E2E-05 | 同じ Mic を再接続 | ✅ **PASS** | §3.5 |
 | E2E-06 | **1 日分（16 時間・32 Part 相当）を投入** | ⬜ **運用の中で確認する** | **#125**。P0-14 / P0-15b と Docker Desktop の再起動を兼ねる。**リリースはこれを待たない** |
 | E2E-07 | **無音だけの Part を混ぜる** | ⬜ 未実施 | §3.7 |
-| E2E-08 | **1 本だけ Whisper を失敗させる** | ⬜ 未実施 | §3.8 |
+| E2E-08 | **1 本だけ Whisper を失敗させる** | ✅ **PASS** | §3.8。**この試験で #131 / #133 / #135 が見つかった** |
 | E2E-09 | Daily ノート保存後に同じ日の Part を追加投入 | ✅ **PASS** | §3.9 |
 | E2E-10 | 十分な試験後に削除を ON | ⬜ Phase 7 | §3.10 |
 | E2E-11 | Phase 7 移行時に後追いの一括削除 | ⬜ Phase 7 | §3.11 |
@@ -266,7 +266,47 @@ H-4 も D-13 も「読み書きできるか」しか見ておらず、空ディ�
 v5.34 で `obsidian.vault_marker`（既定 `.obsidian`）を追加し、**目印の無い場所へは
 書かない**ようにした（§13.6 手順 0）。**上の手順はそのままで検査として成立する。**
 
-判定: ⬜ 未実施（#134 の修正後に再実施する）
+#### 実測（2026-09-15。v5.34 で再実施）
+
+**前半 — Vault を退避して再起動**
+
+```text
+13:32:07  service_started version=0.1.0 schema_version=1
+13:32:20  ERROR obsidian_failed session_key=DJIMIC3:20260915 error_code=OBSIDIAN_NOT_FOUND
+          reason=vault detail="/obsidian に .obsidian/ がありません（Vault が未マウントか、別の場所を指しています）"
+```
+
+| 判定条件 | 結果 |
+|---|---|
+| `OBSIDIAN_NOT_FOUND` が出る | ✅ 何が足りないかを文言で言う |
+| **幻の Vault へ書かない** | ✅ Docker が作った空ディレクトリは**0 バイトのまま**（v5.33 まではノート 1 枚が書かれていた） |
+| Session が `FAILED` として残る | ✅ `WRITING → FAILED` を 3 回。`retry_count=2` を経て `FAILED` |
+| **元音声が残る** | ✅ デバイス側 5022376 bytes 健在 |
+| 削除要求が書かれない | ✅ `queue/delete/` は空 |
+| `doctor` が原因を言う | ✅ D-13 が `✗`。**権限エラーとは別の文言**（`.obsidian/ がありません。…新しい Vault なら Obsidian で 1 度開いてください`） |
+| `healthcheck` が落ちる | ✅ `unhealthy: H-4` |
+
+**後半 — Vault を戻して再起動**
+
+```text
+13:44:06  service_started version=0.1.0 schema_version=1
+13:44:06  recovery_completed requeued=2
+13:44:19  obsidian_saved session_key=DJIMIC3:20260915 path="…/2026-09-15 Voice.md" bytes=2320
+13:44:37  session_merged session_key=DJIMIC3:20260915 parts=3 excluded=1 chars=300
+13:44:37  obsidian_saved session_key=DJIMIC3:20260915 path="…/2026-09-15 Voice.md" bytes=2320
+```
+
+Session は `COMPLETED` / `error_code=None` / `retry_count=0` へ戻り、D-13 も `[✓]` に戻った。
+**人が打ったコマンドは `mv` と `docker compose restart` だけである**（`retry` は存在しない）。
+
+> **`docker ps` の `STATUS` 列には最大 6 分遅れて出る**（`interval: 120s` × `retries: 3`）。
+> healthcheck のログ（`docker inspect` / `make logs`）には即座に出るので、
+> **気づく手段としてはログのほうが速い。**
+
+> **空ディレクトリは手で消す必要がある。**Docker が作ったものなので、
+> `mv` で戻す前に `rmdir` する（**`rm -rf` にしない** — 空でなければ失敗してほしい）。
+
+判定: ✅ **PASS**
 
 ### 3.5 E2E-05 — 同じ Mic を再接続
 
@@ -333,7 +373,46 @@ grep -A3 voicedock_failed_parts "$OBSIDIAN_VAULT/Daily/Voice/Wiki/<日付>/"*.md
 ls -la "/Volumes/<VOL>/TX_.../"                       # ★失敗 Part の音声が残っていること
 ```
 
-判定: ⬜ 未実施
+#### 実測（2026-09-15）
+
+**失敗のさせ方**: `transcription.model` を **VAD モデルのパス**へ向ける。
+**whisper のモデルファイルを消したり改名したりしてはならない** —— V-23（起動時のファイル
+実在検査）が起動を中止し、`restart: unless-stopped` と合わさって**再起動ループ**になる。
+実在する別のファイルを指せば V-23 は通り、**whisper だけが失敗する。**
+
+```text
+12:14:06  session_merged session_key=DJIMIC3:20260915 parts=3 excluded=1 chars=300
+12:14:06  obsidian_saved bytes=2320
+```
+
+ノートの frontmatter:
+
+```yaml
+voicedock_failed_parts:
+  - "DJIMIC3/TX_MIC001_20260912_163444/TX00_MIC018_20260915_110509_orig.wav"
+parts: 3
+```
+
+§13.4 の警告行も本文に出た。
+
+```text
+> ⚠ この日の録音のうち 1 本が処理できませんでした。次にデバイスを接続したときに自動で再試行されます。
+```
+
+| 判定条件 | 結果 |
+|---|---|
+| 他の Part で Daily が生成される | ✅ `parts=3 excluded=1` |
+| `voicedock_failed_parts` に載る | ✅ |
+| §13.4 の警告行が出る | ✅ |
+| **失敗 Part の音声が残る** | ✅ デバイス側 5022376 bytes（取り込み時と同一） |
+
+> **この試験の途中で #131 / #133 / #135 の 3 件が見つかった。**
+> 完成済みセッションに入った失敗 Part がノートに現れない（#131）、
+> 失敗 Part の 16 kHz 音声まで消していた（#133）、
+> `WHISPER_FAILED` の `error_message` が whisper のヘルプ全文だった（#135）。
+> **1 本失敗させるだけの試験で 3 件出たことが、この試験の価値である。**
+
+判定: ✅ **PASS**
 
 ### 3.9 E2E-09 — 保存後に同じ日の Part を追加投入
 
