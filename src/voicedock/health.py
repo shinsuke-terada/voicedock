@@ -35,7 +35,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import IO, Final
 
-from voicedock import db, paths
+from voicedock import db, notes, paths
 from voicedock.config import Config, ConfigError, ConfigUnreadable, load_config
 from voicedock.errors import EXIT_OK, EXIT_UNHEALTHY
 from voicedock.heartbeat import DEFAULT_STATE_ROOT, read_heartbeat
@@ -106,13 +106,23 @@ def check_data_volume(_ctx: Context) -> Result:
     return _access("H-3", paths.DATA_ROOT, write=True)
 
 
-def check_vault(_ctx: Context) -> Result:
-    """H-4: `/obsidian` が読み書き可能。
+def check_vault(ctx: Context) -> Result:
+    """H-4: `/obsidian` が読み書き可能で、**Vault の目印が在る**。
 
     **`os.access` に留める。**120 秒ごとに走るので、実書き込みで検証すると
     **Vault に一時ファイルを撒き続ける。**実書き込みの検証は `doctor` D-13 が担う。
+
+    **「書ける」だけでは足りない**（v5.33→v5.34 の変更 AV-1）。Docker は bind mount の
+    source が無ければ空ディレクトリとして作るので、Vault が消えても書けてしまう。
+    判定は `notes.vault_is_available()` に置き、D-13 と書き込み経路が同じものを使う。
     """
-    return _access("H-4", paths.VAULT_ROOT, write=True)
+    result = _access("H-4", paths.VAULT_ROOT, write=True)
+    if not result.ok:
+        return result
+    marker = ctx.cfg.obsidian.vault_marker
+    if not notes.vault_is_available(paths.VAULT_ROOT, marker):
+        return Result("H-4", False, f"not a vault: {paths.VAULT_ROOT} (no {marker}/)")
+    return result
 
 
 def check_whisper_executable(ctx: Context) -> Result:

@@ -65,7 +65,7 @@ def cfg(make_config: Callable[..., Config], tmp_path: Path) -> Config:
     ここで見たいのは統合と解析なので、書ける Vault を与えて最後まで通す。
     """
     vault = tmp_path / "obsidian"
-    vault.mkdir(exist_ok=True)
+    (vault / ".obsidian").mkdir(parents=True, exist_ok=True)  # §13.6 の目印
     return make_config({"obsidian": {"root": str(vault)}})
 
 

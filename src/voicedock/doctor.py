@@ -27,7 +27,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import IO, Any, Final
 
-from voicedock import db, device, llm, paths, raw, status, transcribe
+from voicedock import db, device, llm, notes, paths, raw, status, transcribe
 from voicedock.config import (
     ConfigError,
     ConfigUnreadable,
@@ -381,6 +381,19 @@ def check_vault(ctx: Context) -> list[Row]:
     writable = _probe_write(root)
     if writable is not None:
         return [Row(Status.FAIL, "Obsidian vault", f"{root}  （書き込めません: {writable}）")]
+
+    # **「書ける」と「Vault である」は別である**（#134）。文言も分ける —
+    # 何が違うのかが分からない診断は無いのと同じ
+    marker = ctx.config.obsidian.vault_marker
+    if not notes.vault_is_available(root, marker):
+        return [
+            Row(
+                Status.FAIL,
+                "Obsidian vault",
+                f"{root}  （{marker}/ がありません。Vault が未マウントか、"
+                "別の場所を指しています。新しい Vault なら Obsidian で 1 度開いてください）",
+            )
+        ]
 
     day = (ctx.now or datetime.now(ctx.config.tz)).date()
     for label, template in (

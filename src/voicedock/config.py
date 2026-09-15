@@ -349,6 +349,8 @@ class WikiConfig(_Section):
 
 class ObsidianConfig(_Section):
     root: Path
+    # **空文字は検査の無効化**である（§13.6）。ここを `Field(min_length=1)` にしてはならない
+    vault_marker: str
     max_title_bytes: int = Field(ge=1, le=255)  # V-16
     default_tags: tuple[str, ...]
     raw: RawConfig

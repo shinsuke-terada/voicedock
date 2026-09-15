@@ -23,7 +23,19 @@ from typing import Final
 
 from pydantic import BaseModel, ValidationError
 
-from voicedock import audio, cleaner, daily, device, llm, paths, raw, session, transcribe, wiki
+from voicedock import (
+    audio,
+    cleaner,
+    daily,
+    device,
+    llm,
+    notes,
+    paths,
+    raw,
+    session,
+    transcribe,
+    wiki,
+)
 from voicedock.config import Config
 from voicedock.db import Database, EntityType, Recording, Session, TransitionConflict
 from voicedock.device import DeviceInventory
@@ -418,6 +430,19 @@ class Pipeline:
         # **既に `RAW_WRITING` なら遷移を記録しない**（`NORMALIZABLE` と同じ）
         if record.status == PartStatus.TRANSCRIBED:
             self._transition(record.partkey, PartStatus.TRANSCRIBED, PartStatus.RAW_WRITING)
+
+        # **Raw 側でも確かめる**（§13.6）。Daily だけに置くと、Raw を幻の Vault へ
+        # 書いたあとに Daily で気づくことになる（#134）
+        if not self._vault_available():
+            self._fail(
+                record.partkey,
+                PartStatus.RAW_WRITING,
+                ErrorCode.OBSIDIAN_NOT_FOUND,
+                self._vault_detail(),
+                event="raw_note_failed",
+                reason="vault",
+            )
+            return False
         try:
             result = raw.write_raw_note(
                 parts,
@@ -926,6 +951,16 @@ class Pipeline:
             excluded=excluded,
             recorded_seconds=row.recorded_seconds,
         )
+        if not self._vault_available():
+            self._fail_session(
+                session_key,
+                SessionStatus.WRITING,
+                ErrorCode.OBSIDIAN_NOT_FOUND,
+                self._vault_detail(),
+                event="obsidian_failed",
+                reason="vault",
+            )
+            return False
         try:
             result = daily.write_daily_note(
                 content,
@@ -1239,6 +1274,22 @@ class Pipeline:
             fields["reason"] = reason
         self.log.error(event, **fields)
         self._reopen_after_exclusion(partkey)
+
+    def _vault_available(self) -> bool:
+        """Vault が実在するか（§13.6）。**判定は `notes.vault_is_available()` 1 箇所。**"""
+        return notes.vault_is_available(
+            Path(self.cfg.obsidian.root), self.cfg.obsidian.vault_marker
+        )
+
+    def _vault_detail(self) -> str:
+        """**何が違うのかを書く。**「書けない」と「Vault でない」を区別する（#134）。"""
+        root = Path(self.cfg.obsidian.root)
+        if not root.is_dir():
+            return f"{root} がありません"
+        return (
+            f"{root} に {self.cfg.obsidian.vault_marker}/ がありません"
+            "（Vault が未マウントか、別の場所を指しています）"
+        )
 
     def _discard_staging(self, path: StagingPath) -> None:
         try:
