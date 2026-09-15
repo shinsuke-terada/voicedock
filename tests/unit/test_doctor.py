@@ -69,7 +69,7 @@ def healthy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **patch: Any) -> Pa
     data_root = tmp_path / "data"
     data_root.mkdir(exist_ok=True)
     vault = tmp_path / "obsidian"
-    vault.mkdir(exist_ok=True)
+    (vault / ".obsidian").mkdir(parents=True, exist_ok=True)  # §13.6 の目印
     inbox = tmp_path / "inbox"
     inbox.mkdir(exist_ok=True)
     monkeypatch.setattr(paths, "DATA_ROOT", data_root)
@@ -128,7 +128,7 @@ def test_all_ok_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert lines[0] == "VoiceDock doctor"
     assert lines[1] == SEPARATOR
     assert lines[2] == f"[✓] {'Config file':<21}{path}"
-    assert lines[3] == f"[✓] {'Config validation':<21}107 keys, 0 errors"
+    assert lines[3] == f"[✓] {'Config validation':<21}108 keys, 0 errors"
     assert lines[4].startswith(f"[✓] {'Database':<21}")
     assert lines[5].startswith(f"[✓] {'Data volume':<21}")
     assert lines[6].startswith(f"[✓] {'Whisper executable':<21}")
@@ -167,7 +167,7 @@ def test_violations_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     lines = out.splitlines()
 
     assert lines[2] == f"[✓] {'Config file':<21}{path}"
-    assert lines[3] == f"[✗] {'Config validation':<21}107 keys, 2 errors"
+    assert lines[3] == f"[✗] {'Config validation':<21}108 keys, 2 errors"
     assert lines[4].startswith(" " * DETAIL_INDENT)
     assert "V-3  CONFIG_INVALID_VALUE  audio.target_sample_rate" in lines[4]
     assert "V-7  CONFIG_INVALID_VALUE  session.group_by" in lines[5]
@@ -373,7 +373,7 @@ def test_run_defaults_to_the_env_config(
     # `now` を渡す。**渡さないと D-18 が実時刻で heartbeat の鮮度を見る**ので、
     # fixture の時刻との差で stale になり、このテストが日によって落ちる
     assert doctor.run(state_root=tmp_path / "state", now=NOW) == EXIT_OK
-    assert "107 keys, 0 errors" in capsys.readouterr().out
+    assert "108 keys, 0 errors" in capsys.readouterr().out
 
 
 # --- D-10 ffmpeg / ffprobe -----------------------------------------------
@@ -553,7 +553,9 @@ def test_d13_does_not_create_dated_folders(tmp_path: Path, monkeypatch: pytest.M
     path = healthy(tmp_path, monkeypatch)
     vault = tmp_path / "obsidian"
     run(path, tmp_path / "state")
-    assert sorted(p.name for p in vault.iterdir()) == [], "doctor が Vault にフォルダを作った"
+    assert sorted(p.name for p in vault.iterdir()) == [".obsidian"], (
+        "doctor が Vault にフォルダを作った"
+    )
 
 
 def test_d13_leaves_no_probe_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -587,6 +589,39 @@ def test_d13_fails_when_the_vault_is_read_only(
     assert "[✗] Obsidian vault" in out
     assert "書き込めません" in out
     assert code == EXIT_DOCTOR_FATAL
+
+
+def test_d13_fails_when_the_vault_has_no_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**「書けない」と「Vault でない」を別の文言にする**（§19.2 / #134）。
+
+    何が違うのかが分からない診断は無いのと同じである。実機では
+    `mv` で退避した Vault の代わりに Docker が空ディレクトリを作り、
+    doctor は OK を出し続けていた。
+    """
+    path = healthy(tmp_path, monkeypatch)
+    (tmp_path / "obsidian" / ".obsidian").rmdir()
+
+    out, code = run(path, tmp_path / "state")
+
+    assert "[✗] Obsidian vault" in out
+    assert ".obsidian/ がありません" in out
+    assert "Obsidian で 1 度開いてください" in out, "次に何をすればよいかが書かれていない"
+    assert "書き込めません" not in out, "権限エラーと同じ文言になっている"
+    assert code == EXIT_DOCTOR_FATAL
+
+
+def test_d13_can_be_disabled_by_an_empty_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**逃げ道**（§13.6）。設定フォルダ名を変えている Vault のために残す。"""
+    path = healthy(tmp_path, monkeypatch, **{"obsidian": {"vault_marker": ""}})
+    (tmp_path / "obsidian" / ".obsidian").rmdir()
+
+    out, _ = run(path, tmp_path / "state")
+
+    assert "[✓] Obsidian vault" in out, out
 
 
 def test_d13_checks_an_existing_output_folder(

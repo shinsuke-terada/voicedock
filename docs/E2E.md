@@ -231,16 +231,42 @@ docker compose exec voicedock voicedock status        # ★SOURCE_DELETE_PENDING
 
 ```bash
 mv "$OBSIDIAN_VAULT" "$OBSIDIAN_VAULT.bak"
+docker compose restart voicedock                      # ★Docker が空ディレクトリを作る
 docker compose logs voicedock | grep -E 'obsidian_not_found|OBSIDIAN_NOT_FOUND'
 docker compose exec voicedock voicedock status        # FAILED として残る
+docker compose exec voicedock voicedock doctor        # ★D-13 が「.obsidian/ がありません」
 
-mv "$OBSIDIAN_VAULT.bak" "$OBSIDIAN_VAULT"
+mv "$OBSIDIAN_VAULT.bak" "$OBSIDIAN_VAULT"            # ★空ディレクトリを先に消すこと
 docker compose restart voicedock                      # ★サービス起動 = 再評価の契機
 docker compose logs voicedock | grep -E 'recovery_completed|obsidian_saved'
 ls -la "/Volumes/<VOL>/TX_.../"                       # ★元音声が残っていること
 ```
 
-判定: ⬜ 未実施
+#### この手順は 2026-09-15 まで空振りしていた（#134）
+
+**`mv` で退避しても `obsidian_saved` が成功し続けた。**
+
+```text
+12:15:39  service_started version=0.1.0 schema_version=1
+12:15:52  obsidian_saved session_key=DJIMIC3:20260915 path="…/2026-09-15 Voice.md" bytes=2320
+12:16:10  obsidian_saved session_key=DJIMIC3:20260915 path="…/2026-09-15 Voice.md" bytes=2320
+```
+
+**Docker は bind mount の source が無ければ空ディレクトリとして作る。**再起動で
+マウントが貼り直され、VoiceDock は**中身の無い「幻の Vault」**へ書いていた。
+
+```text
+$ find "$OBSIDIAN_VAULT"
+…/Obsidian Vault/Daily/Voice/Wiki/20260915/2026-09-15 Voice.md   ← これ 1 枚だけ
+```
+
+H-4 も D-13 も「読み書きできるか」しか見ておらず、空ディレクトリは両方とも通っていた。
+**§14.1 の削除条件（テキストが Vault に残っていること）が、幻の Vault でも成立していた。**
+
+v5.34 で `obsidian.vault_marker`（既定 `.obsidian`）を追加し、**目印の無い場所へは
+書かない**ようにした（§13.6 手順 0）。**上の手順はそのままで検査として成立する。**
+
+判定: ⬜ 未実施（#134 の修正後に再実施する）
 
 ### 3.5 E2E-05 — 同じ Mic を再接続
 

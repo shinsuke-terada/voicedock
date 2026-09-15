@@ -125,6 +125,11 @@ llm:
 # --- Obsidian -----------------------------------------------
 obsidian:
   root: /obsidian
+  # Vault の目印（§13.6）。**これが無い場所へは書かない。**
+  # Docker は bind mount の source が無ければ空ディレクトリとして作るので、
+  # 「書けること」だけでは Vault が消えたことに気づけない。
+  # **空文字にすると検査を無効化する**（設定フォルダ名を変えている場合の逃げ道）
+  vault_marker: ".obsidian"
   max_title_bytes: 180           # UTF-8 バイト数（§13.5）
   default_tags:
     - voice

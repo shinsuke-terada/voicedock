@@ -95,7 +95,7 @@ def flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wav_format: WavFormat)
     for sub in ("staging", "transcripts/parts", "analysis"):
         (data / sub).mkdir(parents=True)
     vault = tmp_path / "obsidian"
-    vault.mkdir()
+    (vault / ".obsidian").mkdir(parents=True)  # §13.6 の目印
     # WikiLink の相手として実在させる（§13.8 は Vault に在るノートだけをリンクする）
     (vault / "VoiceDock.md").write_text("# VoiceDock\n", encoding="utf-8")
     inbox = build_fake_inbox(tmp_path / "inbox", fmt=wav_format)
