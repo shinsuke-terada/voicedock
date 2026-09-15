@@ -1297,6 +1297,7 @@ class Pipeline:
             f"{root} に {self.cfg.obsidian.vault_marker}/ がありません"
             "（Vault が未マウントか、別の場所を指しています）"
         )
+
     def _renormalize_or_fail(self, record: Recording) -> bool:
         """16 kHz 音声が消えていたときの行き先（§9.3 / §10.6 / #135）。
 
