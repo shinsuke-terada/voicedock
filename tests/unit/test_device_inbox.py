@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from typing import Final
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -34,6 +35,14 @@ from voicedock.device import (
 from voicedock.paths import DevicePath
 
 JST = ZoneInfo("Asia/Tokyo")
+
+
+DEVICE_STAT: Final[dict[str, float]] = {"size": 1024, "mtime": 1789273560.0}
+"""墓標が記録する**デバイス上の原本**の値（#151）。
+
+**inbox のコピーを `stat` した値と違うものにする。**同じにすると、コンテナが
+どちらを読んでいるか区別できない。
+"""
 
 
 def scan(inbox: Path) -> tuple[list[str], list[tuple[str, str]]]:
@@ -201,7 +210,8 @@ def test_unsafe_relpath_in_meta_is_rejected(tmp_path: Path) -> None:
     name = "TX00_MIC001_20260912_120950_orig.wav"
     (folder / name).write_bytes(b"x")
     (folder / (name + ".meta.json")).write_text(
-        json.dumps({"relpath": "../escape.wav", "sha256": "x"}), encoding="utf-8"
+        json.dumps({"relpath": "../escape.wav", "sha256": "x", **DEVICE_STAT}),
+        encoding="utf-8",
     )
     _keys, skipped = scan(tmp_path / "inbox")
     assert ("part_skipped", "meta_unsafe_relpath") in skipped
@@ -221,7 +231,7 @@ def test_broken_meta_is_skipped_not_raised(tmp_path: Path) -> None:
     good = "TX00_MIC009_20260912_120950_orig.wav"
     (folder / good).write_bytes(b"x")
     (folder / (good + ".meta.json")).write_text(
-        json.dumps({"relpath": f"TX_MIC001_20260912_120950/{good}", "sha256": "x"}),
+        json.dumps({"relpath": f"TX_MIC001_20260912_120950/{good}", "sha256": "x", **DEVICE_STAT}),
         encoding="utf-8",
     )
     keys, skipped = scan(tmp_path / "inbox")
@@ -257,7 +267,7 @@ def test_recording_directly_under_the_device_is_found(tmp_path: Path) -> None:
     name = "TX00_MIC001_20260912_120950_orig.wav"
     (device_dir / name).write_bytes(b"x")
     (device_dir / (name + ".meta.json")).write_text(
-        json.dumps({"relpath": name, "sha256": "x"}), encoding="utf-8"
+        json.dumps({"relpath": name, "sha256": "x", **DEVICE_STAT}), encoding="utf-8"
     )
     result = list_inbox_parts(tmp_path / "inbox", tz=JST)
     assert len(result.parts) == 1
@@ -423,3 +433,65 @@ def test_build_fake_inbox_is_the_helper_contract(tmp_path: Path) -> None:
     inbox = build_fake_inbox(tmp_path / "inbox", with_noise=False)
     result = list_inbox_parts(inbox, tz=JST)
     assert len(result.parts) == sum(1 for r in DEFAULT_RECORDINGS if ORIG in r.variants)
+
+
+# --- 墓標が語る「デバイス上の事実」（#151）------------------------------
+
+
+def _place(tmp_path: Path, meta: dict[str, object]) -> Path:
+    """録音 1 本と、与えた内容の墓標を置く。**inbox コピーの `stat` とは別の値**にする。"""
+    device_dir = tmp_path / "inbox" / DEVICE_ID
+    device_dir.mkdir(parents=True, exist_ok=True)
+    name = "TX00_MIC001_20260912_120950_orig.wav"
+    (device_dir / name).write_bytes(b"x" * 4096)
+    (device_dir / (name + ".meta.json")).write_text(json.dumps(meta), encoding="utf-8")
+    return tmp_path / "inbox"
+
+
+def test_size_and_mtime_come_from_the_meta_not_the_inbox_copy(tmp_path: Path) -> None:
+    """**デバイス上の事実は墓標から読む**（#151）。
+
+    `wav_path.stat()` は **inbox のコピー**であり、`mtime` は**コピーした時刻**になる。
+    それを §14.1.1 の検証 10 が「デバイス上の実ファイル」と突き合わせるので、
+    **削除が構造的に一度も成立しない。**実機では 4 時間半ずれていた。
+
+    **コンテナはデバイスを見られない**（§5.6）。Helper の記録が唯一の出どころである。
+    """
+    name = "TX00_MIC001_20260912_120950_orig.wav"
+    inbox = _place(
+        tmp_path,
+        {"relpath": name, "sha256": "x", "size": 999, "mtime": 1789273560.0},
+    )
+
+    part = list_inbox_parts(inbox, tz=JST).parts[0]
+
+    assert part.source.size == 999, "inbox コピーの size を読んでいる"
+    assert part.source.mtime == 1789273560.0, "inbox コピーの mtime を読んでいる"
+
+    copy = inbox / DEVICE_ID / name
+    assert copy.stat().st_size != 999, "この試験は出どころの違いを見ていない"
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        pytest.param({"sha256": "x", "mtime": 1.0}, id="size なし"),
+        pytest.param({"sha256": "x", "size": 10}, id="mtime なし"),
+        pytest.param({"sha256": "x", "size": "10", "mtime": 1.0}, id="size が文字列"),
+        pytest.param({"sha256": "x", "size": 10, "mtime": None}, id="mtime が null"),
+        pytest.param({"sha256": "x", "size": True, "mtime": 1.0}, id="size が bool"),
+    ],
+)
+def test_a_meta_without_device_stat_is_skipped(tmp_path: Path, meta: dict[str, object]) -> None:
+    """**`stat` で埋め合わせない**（#151）。それが不具合そのものだった。
+
+    墓標が壊れているときに inbox のコピーで代用すると、**削除できない値が
+    そのまま DB へ入る。**候補にしないほうが安全である。
+    """
+    name = "TX00_MIC001_20260912_120950_orig.wav"
+    inbox = _place(tmp_path, {"relpath": name, **meta})
+
+    result = list_inbox_parts(inbox, tz=JST)
+
+    assert result.parts == (), "壊れた墓標から候補を作った"
+    assert [s.reason for s in result.skipped] == ["meta_missing_stat"]
