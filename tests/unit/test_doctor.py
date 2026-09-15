@@ -9,11 +9,12 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import stat
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -22,8 +23,12 @@ import yaml
 
 from tests.helpers import complete_tree, example_document, merge, write_heartbeat
 from voicedock import db, doctor, llm, paths
+from voicedock.config import load_config
+from voicedock.db import Recording
 from voicedock.doctor import DETAIL_INDENT, LABEL_WIDTH, SEPARATOR, Status
 from voicedock.errors import EXIT_DOCTOR_FATAL, EXIT_OK
+from voicedock.paths import DevicePath, partkey_for
+from voicedock.states import PartStatus
 
 
 def write_config(tmp_path: Path, document: dict[str, Any]) -> Path:
@@ -52,15 +57,21 @@ def fake_tool(path: Path, version: str = "7.1") -> Path:
 
 
 def healthy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **patch: Any) -> Path:
-    """**D-1〜D-18 がすべて通る**環境を作り、設定ファイルのパスを返す。
+    """**D-1〜D-20 がすべて通る**環境を作り、設定ファイルのパスを返す。
 
-    `/data` と `/obsidian` 相当を `tmp_path` 配下へ向け、スキーマを適用した DB と
+    `/data` と `/obsidian` と `/inbox` 相当を `tmp_path` 配下へ向け、スキーマを適用した DB と
     偽 ffmpeg / ffprobe と `heartbeat.json` を置く。LLM は `llm.probe` を差し替える。
+
+    **`inbox_root` を必ず `tmp_path` 配下にする。**既定のままだと `/inbox` を見るので、
+    **開発イメージでは通り、CI の runner では SKIP になる**（2026-09-15 に踏んだ）。
+    **環境に依存する検査結果を fixture の外に残さない。**
     """
     data_root = tmp_path / "data"
     data_root.mkdir(exist_ok=True)
     vault = tmp_path / "obsidian"
     vault.mkdir(exist_ok=True)
+    inbox = tmp_path / "inbox"
+    inbox.mkdir(exist_ok=True)
     monkeypatch.setattr(paths, "DATA_ROOT", data_root)
     monkeypatch.setattr(paths, "VAULT_ROOT", vault)
     with db.connect(data_root / "voicedock.db"):
@@ -72,6 +83,7 @@ def healthy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **patch: Any) -> Pa
         {
             "database": {"path": str(data_root / "voicedock.db")},
             "obsidian": {"root": str(vault)},
+            "import": {"inbox_root": str(inbox)},
             "audio": {
                 "ffmpeg": str(fake_tool(tools / "ffmpeg")),
                 "ffprobe": str(fake_tool(tools / "ffprobe")),
@@ -133,13 +145,15 @@ def test_all_ok_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # D-18 の続き行（実効値の表示）
     assert lines[14].strip().startswith("INCLUDE_VOLUMES:")
     assert lines[15].strip().startswith("EXCLUDE_VOLUMES:")
+    # D-20: inbox に取り残しが無い（#120）
+    assert lines[16] == f"[✓] {'Inbox orphans':<21}none"
     # **D-17 は必ず出る**（§19.2）。notice なので `[!]`
-    assert lines[16] == f"[!] {'Source deletion':<21}DISABLED"
-    assert "lock 1  :" in lines[17]
-    assert "lock 2-A:" in lines[18]
-    assert "lock 2-B:" in lines[19]
-    assert lines[20] == SEPARATOR
-    assert lines[21] == "12 checks passed, 0 failed, 1 notices"
+    assert lines[17] == f"[!] {'Source deletion':<21}DISABLED"
+    assert "lock 1  :" in lines[18]
+    assert "lock 2-A:" in lines[19]
+    assert "lock 2-B:" in lines[20]
+    assert lines[21] == SEPARATOR
+    assert lines[22] == "13 checks passed, 0 failed, 1 notices"
     assert run(path, tmp_path / "state")[1] == EXIT_OK
 
 
@@ -232,6 +246,9 @@ def test_row_render_indents_extra_lines() -> None:
 def test_registry_matches_the_implemented_checks() -> None:
     """**番号は詰めない**（§19.2）。D-4〜D-6 / D-14〜D-16 / D-19 は v5.0 の削減で欠番。
 
+    **D-19 は欠番のままにする。**v5.0 で消した「inbox / queue の滞留」と
+    同じ題目の検査を v5.28 で戻したが、**番号は再利用せず D-20 にした**（#120）。
+
     実行順は「前提が積み上がる順」である。**D-17（削除モードの表示）を最後に置く**のは、
     それが検査ではなく**必ず見せる表示**であり、手前が落ちても出したいからではなく、
     逆に**手前の情報（heartbeat）が揃ってから判断する**ためである。
@@ -248,18 +265,19 @@ def test_registry_matches_the_implemented_checks() -> None:
         "D-12",
         "D-13",
         "D-18",
+        "D-20",
         "D-17",
     ]
 
 
 def test_the_container_checks_match_the_spec_count() -> None:
-    """§19.2 の D 表が 12 件で、実装と集合として一致すること。
+    """§19.2 の D 表が 13 件で、実装と集合として一致すること。
 
-    **件数のずれが最も危ない**（#55 の振り返り）。SPEC に D-20 を足して実装を忘れると、
+    **件数のずれが最も危ない**（#55 の振り返り）。SPEC に検査を足して実装を忘れると、
     **検査が足りないまま「総仕上げ完了」になる。**
     """
     listed = set(re.findall(r"^\| \*?\*?(D-\d+)\*?\*? \| ", _section_19_2(), re.M))
-    assert len(listed) == 12, sorted(listed)
+    assert len(listed) == 13, sorted(listed)
     assert {c.id for c in doctor.CHECKS} == listed
 
 
@@ -753,3 +771,75 @@ def _spec_deletion_example(label: str) -> str:
     assert found, f"§19.2 に {label} の例がありません"
     example: str = found[-1]
     return example
+
+
+# --- D-20 inbox の取り残し（#120） --------------------------------------
+
+
+def inbox_pair_for(path: Path, *, device: str = "DJIMIC3") -> None:
+    """Helper が置いた形（`.wav` + `.meta.json`）を作る（§10.2）。"""
+    stem = "TX00_MIC001_20260912_120950"
+    folder = "TX_MIC001_20260912_120950"
+    root = path / device / folder
+    root.mkdir(parents=True, exist_ok=True)
+    (root / f"{stem}_orig.wav").write_bytes(b"x" * 2048)
+    (root / f"{stem}_orig.wav.meta.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "device_id": device,
+                "relpath": f"{folder}/{stem}_orig.wav",
+                "size": 2048,
+                "mtime": 1789000000.0,
+                "sha256": "0" * 64,
+                "copied_at": "2026-09-12T12:09:50+09:00",
+                "helper_version": "5.5.0",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_d20_notices_an_orphan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """**取り残しは `NOTICE`。`FAIL` にしない**（記録は失われていない。#120）。"""
+    path = healthy(tmp_path, monkeypatch)
+    cfg = load_config(path)
+    inbox_pair_for(Path(cfg.import_.inbox_root))
+    with db.connect(cfg.database.path, busy_timeout_ms=1000, tz=cfg.tz) as opened:
+        opened.insert_recording(_orphan_row())
+
+    out, code = run(path, tmp_path / "state")
+    assert "[!] Inbox orphans" in out
+    assert "1 files" in out
+    assert code == EXIT_OK, "**FAIL にしてはならない**"
+
+
+def test_d20_is_ok_when_the_part_is_not_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """処理待ちの原本は取り残しではない。"""
+    path = healthy(tmp_path, monkeypatch)
+    cfg = load_config(path)
+    inbox_pair_for(Path(cfg.import_.inbox_root))
+    with db.connect(cfg.database.path, busy_timeout_ms=1000, tz=cfg.tz) as opened:
+        opened.insert_recording(_orphan_row(state=PartStatus.DISCOVERED))
+
+    out, _ = run(path, tmp_path / "state")
+    assert "[✓] Inbox orphans" in out
+
+
+def _orphan_row(state: str = PartStatus.COMPLETED) -> Recording:
+    folder = "TX_MIC001_20260912_120950"
+    relpath = f"{folder}/TX00_MIC001_20260912_120950_orig.wav"
+    return Recording(
+        partkey=partkey_for("DJIMIC3", DevicePath(PurePosixPath(relpath))),
+        device_id="DJIMIC3",
+        source_folder=folder,
+        transmitter_id="TX00",
+        mic_index=1,
+        started_at="2026-09-12T12:09:50+09:00",
+        status=state,
+        updated_at="2026-09-12T12:09:50+09:00",
+        duration_seconds=60.0,
+        source_path=relpath,
+    )
