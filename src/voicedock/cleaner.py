@@ -32,12 +32,7 @@ from voicedock.db import Recording, Session
 from voicedock.device import DeviceInventory
 from voicedock.log import Logger
 from voicedock.paths import DevicePath, PartKey, QueuePath, SessionKey, StagingPath
-from voicedock.states import (
-    PART_DELETABLE,
-    PART_TERMINAL,
-    SESSION_DELETABLE,
-    STAGING_DISPOSABLE,
-)
+from voicedock.states import PART_DELETABLE, STAGING_DISPOSABLE
 
 QUEUE_SCHEMA: Final = 1
 """`queue/delete/<request_id>.json` の `schema`（§14.1.1）。"""
@@ -98,12 +93,24 @@ def can_delete_source(
 ) -> bool:
     """§14.1 の必要十分条件。**論理式をそのまま写す。**
 
-    **`all()` を使う条件は、対象集合が空でないことを別条件として必ず明示する**
-    （空集合の `all()` は真になる。v3.0 の不具合 A-14）。`_orig` 固定で削除対象は
-    1 ファイルになったが、**`NULL` / 空文字の番犬は消さない** —
-    `os.path.join(volume, "")` は**ボリュームのルートを指す**（§14.1）。
+    **根拠は「テキストが 2 か所に独立して存在すること」である**（v5.36→v5.37 の変更 AY-1）。
 
-    **DB の `status` を信用しない**（§14.4 N-12）。Raw / Daily ノートは実ファイルを
+    - **Vault の Raw ノート** —— `verify_raw_note()` が実ファイルを読み直して
+      §13.7 R-1〜R-6 を再実行し、`_note_contains()` がその Part の鍵を確かめる
+    - **`/data/transcripts/parts/`** —— `part_transcript_is_valid()`。
+      `retain_transcript_days: 0` で**無期限保持**され、Raw ノートの再生成元になる
+
+    **Daily ノートと解析結果は条件にしない。**要約は元音声を使わないので、
+    **要約の成否を記録保全の根拠にする理由が無い。**条件にしていると、LLM が
+    落ちているあいだ**本文は Vault に在るのにデバイスの容量が永久に解放されない。**
+
+    **全 Part 終端も条件にしない。**1 本詰まるとその日ぶん丸ごと解放されない
+    （#131 / #133 と同じ「1 件の失敗が全体を止める」形）。**Part ごとに評価する。**
+
+    **`NULL` / 空文字の番犬は消さない** — `os.path.join(volume, "")` は
+    **ボリュームのルートを指す**（§14.1）。
+
+    **DB の `status` を信用しない**（§14.4 N-12）。Raw ノートは実ファイルを
     読み直して §13.7 を再実行する。
     """
     return (
@@ -114,22 +121,13 @@ def can_delete_source(
         and session.raw_output_path is not None
         and verify_raw_note(session, parts, vault_root=vault_root) is True
         and _note_contains(vault_root, session.raw_output_path, part.partkey)
-        # --- Daily ノートが保存検証済みで、この Part を含む ---
-        and session.status in {status.value for status in SESSION_DELETABLE}
-        and session.output_path is not None
-        and verify_daily_note(session, parts, cfg, vault_root=vault_root) is True
-        and _note_contains(vault_root, session.output_path, part.partkey)
-        # --- 解析結果が有効 ---
-        and session.analysis_path is not None
-        and analysis_is_schema_valid(session, cfg)
-        # --- Part 自身の処理が完了 ---
+        # --- Part 自身の処理が完了（**transcript がテキストの 2 つ目のコピーである**） ---
         and part.session_key == session.session_key
         and part.status in {status.value for status in PART_DELETABLE}
         and part.transcript_path is not None
         and part_transcript_is_valid(part)
-        # --- 同一 Session の全 Part が終端状態（**空集合を真にしない**） ---
+        # --- Part を 1 つも持たない Session を真にしない ---
         and len(parts) >= 1
-        and all(p.status in {status.value for status in PART_TERMINAL} for p in parts)
         # --- 削除対象ファイルの同定（§14.1.1）。**NULL / 空文字を真にしない** ---
         and part.source_path is not None
         and part.source_path != ""
