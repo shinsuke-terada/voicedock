@@ -14,7 +14,7 @@ DJI Mic 3 で録音 → 帰宅 → Mac へ USB 接続 → （以降すべて自�
 
 ## ドキュメント
 
-実装時の規範は **[docs/SPEC.md](docs/SPEC.md)（詳細仕様書 v5.2）** に集約されている。
+実装時の規範は **[docs/SPEC.md](docs/SPEC.md)（詳細仕様書）** に集約されている。
 
 前身の方針書は [docs/archive/](docs/archive/) に保存してある。両者が矛盾する場合は `docs/SPEC.md` を優先する。
 
@@ -26,7 +26,7 @@ cp config/config.example.yaml config/config.yaml
 # .env の OBSIDIAN_VAULT と VOICEDOCK_HOME を自分の環境に合わせる
 
 ./helper/install.sh          # ホスト側 Helper の導入（§3.4(6)）
-./scripts/doctor.sh          # ホスト設定の検査（§19.2 DH-1〜DH-15）
+./scripts/doctor.sh          # ホスト設定の検査（§19.2 の DH 表 7 件）
 ./scripts/fetch-models.sh
 make up                      # = docker compose up -d --build
 ```
@@ -35,8 +35,8 @@ make up                      # = docker compose up -d --build
 気づきにくい。`doctor` の DH-12 と healthcheck の H-8 がこれを検出する。
 
 `./scripts/doctor.sh`（= `make doctor`）は **初回セットアップ検査と環境診断を兼ねる。検査のみを
-行い、ホスト設定は変更しない。**`make up` の前はホスト側の 5 件だけを実行し、起動後に実行すると
-続けてコンテナ内の 12 件も走る（合計 17）。
+行い、ホスト設定は変更しない。**`make up` の前はホスト側の 7 件だけを実行し、起動後に実行すると
+続けてコンテナ内の 13 件も走る（合計 20）。
 
 日常操作は `make` にまとめてある（`up` / `down` / `logs` / `status` / `test` / `doctor` / `models`
 / `helper-install` / `helper-status`）。
@@ -79,7 +79,7 @@ make up                      # 起動（= docker compose up -d --build）
 make down                    # 停止
 make logs                    # ログを追う
 make status                  # 処理状況サマリ（失敗・滞留を見る唯一の窓口）
-make doctor                  # ホスト 5 件 → コンテナ 12 件の診断（合計 17）
+make doctor                  # ホスト 7 件 → コンテナ 13 件の診断（合計 20）
 ```
 
 **異常は `docker ps` に出る。**healthcheck（§19.1）が落ちるとコンテナが `unhealthy` に
@@ -144,9 +144,9 @@ Python 依存は `uv.lock` と `requirements*.lock` で固定してある（`mak
 
 | Phase | 状態 |
 |---|---|
-| 0 PoC | 一部完了（[docs/POC.md](docs/POC.md)）。**残りは実機が要る** |
+| 0 PoC | **完了**（[docs/POC.md](docs/POC.md)）。送信機 2 台（機材なし）と電池切れ（運用の中で確認）を除く |
 | 1〜6 取り込み・変換・文字起こし・ノート生成 | 実装済み |
-| 7 削除 | **コードは揃っている**（`cleaner.py` と `voicedock-reaper`、削除禁止テスト ND-01〜31）が、**有効化していない。**§21.1 は E2E-01〜E2E-12 の全件 PASS を前提にしており、**実機での確認が残っている** |
+| 7 削除 | **コードは揃っている**（`cleaner.py` と `voicedock-reaper`、削除禁止テスト ND-01〜31）が、**有効化していない。**§21.2 は ND-01〜ND-31 と E2E-01〜E2E-12 の全件 PASS を前提にしており、**E2E-04 / E2E-08 の実機確認が残っている** |
 | 8 運用 | 本章のとおり |
 
 Phase 0 の実機検証の結果を受けて v4.0 で**アーキテクチャを変更した**（コンテナが直接
