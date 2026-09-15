@@ -45,11 +45,11 @@ docker compose exec voicedock voicedock doctor   # コンテナ側（§19.2 の 
 |---|---|---|---|
 | E2E-01 | 1 分程度の録音を 1 本。削除 OFF | ✅ **PASS** | §3.1 |
 | E2E-02 | **コピー中に** USB を抜く | ✅ **PASS** | §3.2。**変換中ではない** — 変換は inbox から読むので USB と無関係 |
-| E2E-03 | Whisper 実行中に USB を抜く | ⬜ 未実施 | §3.3 |
+| E2E-03 | Whisper 実行中に USB を抜く | ✅ **PASS** | §3.3。**判定条件の `SOURCE_DELETE_PENDING` は v3.x の名残**（削除が無効なら `COMPLETED`） |
 | E2E-04 | Obsidian Vault を一時的に利用不可にする | ✅ **PASS** | §3.4。**v5.33 まで手順が空振りしていた**（#134） |
 | E2E-05 | 同じ Mic を再接続 | ✅ **PASS** | §3.5 |
 | E2E-06 | **1 日分（16 時間・32 Part 相当）を投入** | ⬜ **運用の中で確認する** | **#125**。P0-14 / P0-15b と Docker Desktop の再起動を兼ねる。**リリースはこれを待たない** |
-| E2E-07 | **無音だけの Part を混ぜる** | ⬜ 未実施 | §3.7 |
+| E2E-07 | **無音だけの Part を混ぜる** | ✅ **PASS** | §3.7。**この試験で #140 が見つかった** |
 | E2E-08 | **1 本だけ Whisper を失敗させる** | ✅ **PASS** | §3.8。**この試験で #131 / #133 / #135 が見つかった** |
 | E2E-09 | Daily ノート保存後に同じ日の Part を追加投入 | ✅ **PASS** | §3.9 |
 | E2E-10 | 十分な試験後に削除を ON | ⬜ Phase 7 | §3.10 |
@@ -212,15 +212,50 @@ cat: .../TX00_MIC006_...wav: No such file or directory
 ### 3.3 E2E-03 — Whisper 実行中に USB を抜く
 
 **Whisper 以降が継続する**（staging に変換済みが在るため）。Raw / Daily が保存される。
-`SOURCE_DELETE_PENDING` になる。
+
+> **削除が無効なあいだは `COMPLETED` になる。**v3.x の判定条件は
+> 「`SOURCE_DELETE_PENDING` になる」だったが、**あれは削除を有効にしたあとの姿**である。
+> 安全ロック 1（`cleanup.delete_source_audio: false`）が掛かっていると
+> §9.3 の `RAW_SAVED → COMPLETED` を通るので、**要求そのものが書かれない。**
+> Phase 7 で有効化したら E2E-10 と併せて再確認する。
+
+> **10 秒の録音では取れない。**whisper の RTF は 0.131（§12.3）なので、
+> **10 秒の音声は 1.3 秒で終わる。**抜く窓を作るには**数分の録音が要る。**
+> 無音だと VAD が全区間を飛ばすのでさらに一瞬で終わる —— **E2E-07 と同じ録音では
+> 両立しない。**
 
 ```bash
 # `transcription_completed` の前に抜く
-docker compose logs voicedock | grep -E 'transcription_completed|obsidian_saved|source_delete'
-docker compose exec voicedock voicedock status        # ★SOURCE_DELETE_PENDING の件数
+docker compose logs voicedock | grep -E 'transcription_completed|obsidian_saved'
+docker compose exec voicedock voicedock status        # ★COMPLETED になること
+ls ~/VoiceDock/queue/delete/                          # ★空であること（削除は無効）
 ```
 
-判定: ⬜ 未実施
+#### 実測（2026-09-15。203.6 秒の録音）
+
+```text
+14:36:09  normalize_completed recording_key=…MIC020… in_bytes=29352616 out_bytes=6515656 elapsed_s=0.1
+          ← ここから whisper。**14:36:29 に USB を抜いた**（開始 20 秒後）
+14:37:08  transcription_completed recording_key=…MIC020… elapsed_s=58.5 chars=116 rtf=0.287 speech_ratio=0.959
+14:37:08  raw_note_saved session_key=DJIMIC3:20260915 parts=4 bytes=1986
+14:37:42  llm_completed session_key=DJIMIC3:20260915 chunks=2 elapsed_s=33.6
+14:37:42  obsidian_saved session_key=DJIMIC3:20260915 bytes=5763
+```
+
+| 判定条件 | 結果 |
+|---|---|
+| Whisper が完走する | ✅ 抜去後も 39 秒走り切った（全 58.5 秒） |
+| Raw が保存される | ✅ `raw_note_saved parts=4` |
+| Daily が保存される | ✅ `obsidian_saved bytes=5763`（LLM も抜去後に走った） |
+| Part が `COMPLETED` | ✅ |
+| 削除要求が書かれない | ✅ `queue/delete/` は空 |
+
+**変換も文字起こしも LLM もデバイスを見ない。**§10.5 以降は `/data/staging` と
+`/data/transcripts` だけで完結するので、**USB の有無と無関係である。**
+E2E-02 の注記（変換は inbox から読むので USB と無関係）が文字起こし以降にも当てはまる
+ことを実機で確かめた。
+
+判定: ✅ **PASS**
 
 ### 3.4 E2E-04 — Vault を利用不可にする
 
@@ -358,9 +393,46 @@ ls -1 "$OBSIDIAN_VAULT/Daily/Voice/Raw/"*/ "$OBSIDIAN_VAULT/Daily/Voice/Wiki/"*/
 ```bash
 docker compose logs voicedock | grep -E 'part_skipped|NO_SPEECH_DETECTED'
 docker compose exec voicedock voicedock status        # ★SKIPPED があっても止まらない
+grep '^>' "$OBSIDIAN_VAULT/Daily/Voice/Wiki/<日付>/"*.md   # ★警告行の文言
 ```
 
-判定: ⬜ 未実施
+#### 実測（2026-09-15。15.62 秒の無音を 1 本）
+
+```text
+14:36:09  normalize_completed recording_key=…MIC019… in_bytes=2282056 out_bytes=499976 elapsed_s=0.1
+14:36:09  part_skipped recording_key=…MIC019… reason=no_speech
+14:37:08  session_merged session_key=DJIMIC3:20260915 parts=4 excluded=2 chars=416
+14:37:42  obsidian_saved session_key=DJIMIC3:20260915 bytes=5763
+```
+
+| 判定条件 | 結果 |
+|---|---|
+| `SKIPPED` になる | ✅ `NO_SPEECH_DETECTED` |
+| セッション全体が停止しない | ✅ `parts=4 excluded=2` で統合が進んだ |
+| Daily ノートが生成される | ✅ |
+
+**ノートの報告（v5.36 の #140 の修正を実機で確認）**
+
+```yaml
+voicedock_failed_parts: []
+voicedock_skipped_parts:
+  - "DJIMIC3/…/TX00_MIC018_20260915_110509_orig.wav"   # SOURCE_MISSING
+  - "DJIMIC3/…/TX00_MIC019_20260915_143115_orig.wav"   # NO_SPEECH_DETECTED
+```
+
+```text
+> ⚠ この日の録音のうち 2 本を除外しました（元ファイルが見つかりません・無音）。自動では再試行されません。デバイスから採り直してください。
+```
+
+- **`voicedock_failed_parts` が空**である（`SKIPPED` を混ぜていない）
+- 理由の並びが **§15.1 の順**（`SOURCE_MISSING` → `NO_SPEECH_DETECTED`）であり、Part の処理順に依存しない
+- `SOURCE_MISSING` が混ざっているので **`⚠` が付き、次の操作が書かれている**
+
+> **v5.35 まではこのノートが「2 本が処理できませんでした。次にデバイスを接続したときに
+> 自動で再試行されます」と書いていた。**`SKIPPED` は終端であり、**起きないことを
+> 約束していた**（#140）。**無音を失敗として報告する試験結果になるところだった。**
+
+判定: ✅ **PASS**
 
 ### 3.8 E2E-08 — 1 本だけ Whisper を失敗させる
 
