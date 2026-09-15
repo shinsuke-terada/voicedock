@@ -733,3 +733,109 @@ def _fail(database: Database, partkey: str) -> None:
         to_status=PartStatus.FAILED,
         error_code=ErrorCode.NORMALIZE_VERIFY_FAILED,
     )
+
+
+# --- 削除の再評価（#154）------------------------------------------------
+
+
+def add_saved_session(
+    database: Database,
+    *,
+    status: str = SessionStatus.SAVED,
+    attempts: int = 0,
+    at: str | None = None,
+) -> str:
+    """`SAVED` 以降に座ったセッション。**`process_ready_sessions()` では拾えない。**"""
+    key = "DJIMIC3:20260912"
+    database.insert_session(
+        Session(
+            session_key=key,
+            day_date="2026-09-12",
+            device_id="DJIMIC3",
+            status=status,
+            updated_at=at or (NOW - timedelta(hours=1)).isoformat(),
+        )
+    )
+    if attempts:
+        database.conn.execute(
+            "UPDATE sessions SET delete_attempts = ? WHERE session_key = ?", (attempts, key)
+        )
+        database.conn.commit()
+    return key
+
+
+def test_a_saved_session_is_evaluated_for_deletion(
+    database: Database, cfg: Config, logger: tuple[Logger, io.StringIO], alive: Path
+) -> None:
+    """**`SAVED` に座ったセッションを拾うこと**（#154）。
+
+    `process_ready_sessions()` の走査対象は `pipeline.PROCESSABLE` であり、
+    **`SAVED` は入っていない。**v5.41 まで、一度 `SAVED` に座ったセッションは
+    **新しい Part が届いて再オープンされないかぎり誰も触らなかった。**
+
+    実機では「新しい録音が届いているあいだは動くが、止まった瞬間に二度と進まない」
+    という形で現れた。
+    """
+    key = add_saved_session(database)
+    worker = build(database, cfg, logger, alive)
+
+    assert worker.deletable_session_keys() == [key]
+
+
+def test_processable_sessions_are_not_swept_here(
+    database: Database, cfg: Config, logger: tuple[Logger, io.StringIO], alive: Path
+) -> None:
+    """**`PROCESSABLE` を広げてはならない。**
+
+    あれは「Daily ノートを書き直す」経路の入口であり、`SAVED` を入れると
+    **書き終えたノートを毎周回作り直す。**ここは別の集合で回す。
+    """
+    add_saved_session(database, status=SessionStatus.READY)
+    worker = build(database, cfg, logger, alive)
+
+    assert worker.deletable_session_keys() == []
+
+
+@pytest.mark.parametrize(
+    ("attempts", "ago_seconds", "expected"),
+    [
+        pytest.param(1, 30, False, id="1 回目・30 秒後はまだ"),
+        pytest.param(1, 120, True, id="1 回目・120 秒後は来た"),
+        pytest.param(4, 1800, False, id="4 回目・30 分後はまだ"),
+        pytest.param(4, 7200, True, id="4 回目・2 時間後は来た"),
+    ],
+)
+def test_the_backoff_is_honoured(
+    database: Database,
+    cfg: Config,
+    logger: tuple[Logger, io.StringIO],
+    alive: Path,
+    attempts: int,
+    ago_seconds: int,
+    expected: bool,
+) -> None:
+    """**`delete_evaluation_delay()` に従うこと**（§15.2）。
+
+    5 秒ごとに実ファイル検証（SHA-256 を含む）を繰り返すビジーループを避ける。
+    **この関数は v5.41 までテストからしか呼ばれていなかった。**
+    """
+    key = add_saved_session(
+        database, attempts=attempts, at=(NOW - timedelta(seconds=ago_seconds)).isoformat()
+    )
+    worker = build(database, cfg, logger, alive)
+
+    assert (worker.deletable_session_keys() == [key]) is expected
+
+
+def test_the_tick_evaluates_deletions(
+    database: Database, cfg: Config, logger: tuple[Logger, io.StringIO], alive: Path
+) -> None:
+    """**配線。**`tick()` が呼ばなければ、上の判定は誰にも使われない。"""
+    add_saved_session(database)
+    worker = build(database, cfg, logger, alive)
+    called: list[str] = []
+    worker.evaluate_deletions = lambda: called.append("yes")  # type: ignore[method-assign]
+
+    worker.tick()
+
+    assert called == ["yes"], "tick() が evaluate_deletions を呼んでいない"
