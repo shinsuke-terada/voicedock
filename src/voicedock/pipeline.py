@@ -358,6 +358,13 @@ class Pipeline:
         if record.status not in TRANSCRIBABLE or record.normalized_path is None:
             return False
 
+        # **whisper を起動する前に入力を確かめる**（§10.6 / #135）。whisper-cli は
+        # `-f` のファイルを開けないと **usage を吐いて終了コード 2** で落ちるので、
+        # そのまま記録すると `error_message` がヘルプ全文になり原因を隠す
+
+        if not self._usable_source(Path(record.normalized_path)):
+            return self._renormalize_or_fail(record)
+
         # **既に `TRANSCRIBING` なら遷移を記録しない**（`NORMALIZABLE` と同じ）
         if record.status == PartStatus.NORMALIZED:
             self._transition(record.partkey, PartStatus.NORMALIZED, PartStatus.TRANSCRIBING)
@@ -1290,6 +1297,36 @@ class Pipeline:
             f"{root} に {self.cfg.obsidian.vault_marker}/ がありません"
             "（Vault が未マウントか、別の場所を指しています）"
         )
+    def _renormalize_or_fail(self, record: Recording) -> bool:
+        """16 kHz 音声が消えていたときの行き先（§9.3 / §10.6 / #135）。
+
+        **必ず `NORMALIZING` を経由する。**§15.2 の再投入は `events` が持つ
+        「どの進行中状態から落ちたか」へ戻すので、`TRANSCRIBING` のまま落とすと
+        **入力が戻っても永久に文字起こしを試み続ける。**
+
+        inbox に原本が在れば作り直す。無ければ `FAILED` にするが、**終端にはしない** —
+        墓標（§10.2）を外してデバイスから採り直せば直る余地がある。
+        """
+        self._transition(record.partkey, record.status, PartStatus.NORMALIZING)
+
+        source = record.inbox_path
+        if source is not None and self._usable_source(Path(source)):
+            # **ログを出さない。**§16.4 は「状態遷移は `events` テーブルが持つので
+            # ログへ二重に並べない」と定めている。上の遷移そのものが記録である
+            return False
+
+        # **`normalize_failed` を使う。**遷移は `NORMALIZING → FAILED` であり、
+        # §15.1 の区分も「音声」である。§16.4 の「名前を増やさず `reason=` で表す」に従う
+        self._fail(
+            record.partkey,
+            PartStatus.NORMALIZING,
+            ErrorCode.NORMALIZED_MISSING,
+            f"16 kHz 音声も inbox の原本もありません（{record.normalized_path}）。"
+            "デバイスから採り直す必要があります",
+            event="normalize_failed",
+            reason="input",
+        )
+        return False
 
     def _discard_staging(self, path: StagingPath) -> None:
         try:
