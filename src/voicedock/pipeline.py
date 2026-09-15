@@ -653,6 +653,15 @@ class Pipeline:
         for part in parts:
             if part.status not in {status.value for status in PART_DELETABLE}:
                 continue
+            if part.status == PartStatus.SOURCE_DELETING:
+                # **要求が既に出ている。**自己遷移は `PART_TRANSITIONS` に無く、
+                # 二重に要求を並べることにもなる（§10.12）
+                continue
+            if part.status == PartStatus.COMPLETED:
+                # **通常運用の経路から `COMPLETED` を消しにいかない。**
+                # `PART_DELETABLE` に入っているのは §17.1 の `cleanup --backlog`（#38）
+                # のためである
+                continue
             request = cleaner.request_part_deletion(
                 part,
                 row,
@@ -665,9 +674,15 @@ class Pipeline:
             )
             if request is None:
                 continue
-            self._transition(
-                PartKey(part.partkey), PartStatus.RAW_SAVED, PartStatus.SOURCE_DELETING
-            )
+            try:
+                # **遷移元は `part.status` である**（v5.41→v5.42 の変更 BD-2）。
+                # `RAW_SAVED` の決め打ちだと、§9.3 が正規の辺として定義している
+                # `SOURCE_DELETE_PENDING → SOURCE_DELETING`（再試行）で例外になる
+                self._transition(PartKey(part.partkey), part.status, PartStatus.SOURCE_DELETING)
+            except TransitionConflict:
+                # 別の経路が先に動かした。**握って次の Part へ進む**（`resume_failed()`
+                # と同じ扱い）。**1 件の食い違いでセッション全体の評価を止めない**
+                continue
             requested += 1
         return requested
 
