@@ -53,7 +53,7 @@ docker compose exec voicedock voicedock doctor   # コンテナ側（§19.2 の 
 | E2E-08 | **1 本だけ Whisper を失敗させる** | ✅ **PASS** | §3.8。**この試験で #131 / #133 / #135 が見つかった** |
 | E2E-09 | Daily ノート保存後に同じ日の Part を追加投入 | ✅ **PASS** | §3.9 |
 | E2E-10 | 十分な試験後に削除を ON | ✅ **PASS** | §3.10。**この試験で #151 / #152 / #154 / #156 が見つかった** |
-| E2E-11 | Phase 7 移行時に後追いの一括削除 | ⬜ Phase 7 | §3.11 |
+| E2E-11 | Phase 7 移行時に後追いの一括削除 | ✅ **PASS** | §3.11。**`--backlog` は 0 件が正しい**（古い Part は §14.1 が偽） |
 | E2E-12 | Docker Desktop を再起動 | ✅ **PASS**（コンテナ再起動で実施） | §3.12 |
 
 **E2E-10 / E2E-11 は Phase 7 のものである**（#39 / #38）。
@@ -595,12 +595,50 @@ ls -la "/Volumes/<VOL>/TX_.../"                       # ★元音声が消えて
 
 ### 3.11 E2E-11 — 後追いの一括削除（**Phase 7**）
 
-既に `COMPLETED` の Part も §14.1 が真なら削除される。
+**既に `COMPLETED` の Part も §14.1 が真なら削除される。**
 
-**入口そのものが未実装である**（#38）。`cleanup` サブコマンドは v5.0 で削除されており、
-**Phase 7 に入るまで存在しないほうが安全である**（削除の入口を 1 本に保てる。§17.1）。
+```bash
+docker compose exec voicedock voicedock cleanup --backlog --dry-run   # ★何も書かない
+docker compose exec voicedock voicedock cleanup --backlog
+docker compose exec voicedock voicedock cleanup --resolve-absent --dry-run
+docker compose exec voicedock voicedock cleanup --resolve-absent
+```
 
-判定: ⬜ Phase 7
+#### 実測（2026-09-16）
+
+**`--resolve-absent`** —— #151 / #156 を直す前に「実体は消えたのに保留」になっていた
+6 件を解消した。
+
+```text
+10:45:41  source_delete_skipped recording_key=…TX00_MIC007_20260915_195731_orig.wav reason=already_absent
+処理しました: 6 件
+
+SOURCE_DELETE_PENDING: 0     ← 6 → 0
+COMPLETED            : 23    ← 17 → 23
+```
+
+| 判定条件 | 結果 |
+|---|---|
+| 保留が解消される | ✅ 6 件すべて `COMPLETED` |
+| **`source_deleted_at` を入れない** | ✅ `(なし)` のまま。**VoiceDock が消したのではない** |
+| 削除要求を書かない | ✅ `Delete queue: 0 requested` |
+
+**`--backlog`** —— 対象 **0 件**、対象外 13 件（すべて `not_deletable`）。
+
+```text
+対象（--dry-run。何も書きません）: 0 件
+対象外: 13 件
+  DJIMIC3/TX_MIC001_20260912_163444/TX00_MIC001_20260912_163444_orig.wav  (not_deletable)
+```
+
+**0 件が正しい。**削除 OFF の期間に処理した古い Part は Raw ノートの保存検証を
+経ておらず、**§14.1 が偽**である。**「`COMPLETED` だから消してよい」ではない**ことが
+実機で確認できた。
+
+> **対象外の理由を出すことに意味がある。**出さないと「なぜ消えないのか」が分からず、
+> 利用者は判断できない。
+
+判定: ✅ **PASS**
 
 ### 3.12 E2E-12 — Docker Desktop を再起動
 
