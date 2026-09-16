@@ -240,6 +240,17 @@ class Pipeline:
     state_root: Path = DEFAULT_STATE_ROOT
     """`/state`（Helper の報告）。**§14.1 のロック 2-B を読むのに要る**（§7.5）。"""
 
+    vault_index: wiki.VaultIndex | None = None
+    """Vault の索引（§13.8 / v5.48→v5.49 の変更 BK-3）。**呼び手が持つ。**
+
+    v5.48 まで `_plan_links()` が `wiki.index_for()` を `cached=` 無しで呼んでいたため、
+    **`obsidian.wiki.vault_index_cache_seconds` が一度も効かず、Daily ノートを書くたびに
+    Vault 全体を `scandir` で走査していた。**`Pipeline` は tick ごとに作り直される
+    dataclass でキャッシュを持てないので、**`Worker` が周回をまたいで持つ。**
+
+    `link_tags: false` なら `None`（索引そのものが要らない）。
+    """
+
     helper_fresh: bool = True
     """Helper のハートビートが新しいか（§10.0 / v5.45→v5.46 の変更 BH-4）。
 
@@ -1225,13 +1236,14 @@ class Pipeline:
     ) -> wiki.LinkPlan:
         """§13.8。**失敗しても空の計画を返す**（保存検証の合否に影響させない）。"""
         try:
-            index = wiki.index_for(self.cfg, Path(self.cfg.obsidian.root))
+            # **索引はここで作らない**（変更 BK-3）。`Worker.refresh_vault_index()` が
+            # 周回ごとに 1 回だけ更新し、TTL に従って使い回す
             tags = getattr(analysis, "tags", None)
             return wiki.plan_links(
                 cfg=self.cfg,
                 day=day,
                 tags=[str(tag) for tag in tags] if isinstance(tags, list) else [],
-                index=index,
+                index=self.vault_index,
                 self_name=daily.daily_filename(self.cfg, day),
                 name_for_day=lambda other: daily.daily_filename(self.cfg, other),
                 raw_names=daily.raw_note_names(session_key, self.cfg, day),
@@ -1519,7 +1531,7 @@ def recover_interrupted(database: Database, *, cfg: Config, log: Logger) -> int:
     """
     moved = 0
     for part_status, part_target in PART_RECOVERY.items():
-        for record in _recordings_with_status(database, part_status):
+        for record in database.recordings_with_status(part_status):
             _discard_partial(record, part_status, cfg=cfg, log=log)
             database.record_transition(
                 EntityType.RECORDING,
@@ -1542,15 +1554,6 @@ def recover_interrupted(database: Database, *, cfg: Config, log: Logger) -> int:
     if moved:
         log.info("recovery_completed", rolled_back=moved)
     return moved
-
-
-def _recordings_with_status(database: Database, status: str) -> list[Recording]:
-    rows = database.conn.execute(
-        "SELECT * FROM recordings WHERE status = ? ORDER BY started_at", (status,)
-    ).fetchall()
-    from voicedock.db import _from_row
-
-    return [_from_row(Recording, row) for row in rows]
 
 
 def _discard_partial(record: Recording, status: str, *, cfg: Config, log: Logger) -> None:

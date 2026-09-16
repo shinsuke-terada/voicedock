@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime, tzinfo
 from enum import StrEnum
@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Final, Self
 
 from voicedock.log import MAX_VALUE_CHARS
+from voicedock.paths import PartKey
 from voicedock.states import FAILED_STATUS, RETRY_RESET_STATUSES
 
 SCHEMA_VERSION: Final = 2
@@ -458,11 +459,31 @@ class Database:
         return [_from_row(Session, row) for row in rows]
 
     def recordings_with_status(self, status: str) -> list[Recording]:
-        """`status` の Part を `partkey` 昇順で返す（§17.1 の `cleanup` が使う）。"""
+        """`status` の Part を **`started_at` 昇順**で返す（§9.4 / §17.1）。
+
+        **§10.0 の処理順に合わせる。**v5.48 まで `pipeline` 側に
+        `ORDER BY started_at` の写しがあり、こちらは `partkey` 順だった ——
+        **同じ問い合わせが 2 本あり、順序だけ違った**（v5.48→v5.49 の変更 BK-4）。
+        あちらは `db._from_row`（非公開）を関数内 import で掴んでもいた。
+        """
         rows = self.conn.execute(
-            "SELECT * FROM recordings WHERE status = ? ORDER BY partkey", (status,)
+            "SELECT * FROM recordings WHERE status = ? ORDER BY started_at, partkey", (status,)
         ).fetchall()
         return [_from_row(Recording, row) for row in rows]
+
+    def pending_partkeys(self, terminal: Collection[str]) -> list[PartKey]:
+        """終端でない Part の鍵を **`started_at` 昇順**で（§10.0）。
+
+        **SQL を `db` の外に置かない**（変更 BK-4）。v5.48 までは `worker` が
+        `self.database.conn.execute(...)` を直に書いていた。
+        """
+        placeholders = ", ".join("?" for _ in terminal)
+        rows = self.conn.execute(
+            "SELECT partkey FROM recordings "  # noqa: S608 - placeholders は ? のみ
+            f"WHERE status NOT IN ({placeholders}) ORDER BY started_at, partkey",
+            list(terminal),
+        ).fetchall()
+        return [PartKey(row["partkey"]) for row in rows]
 
     def failed_from(self, entity: EntityType, entity_key: str) -> str | None:
         """**直前にどの進行中状態から `FAILED` へ落ちたか**（§9.3 / §15.2）。
