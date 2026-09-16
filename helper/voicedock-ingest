@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-HELPER_VERSION="5.7.0"
+HELPER_VERSION="5.7.1"
 LOG_MAX_BYTES=5242880       # 5 MiB。超えたら .1 へ退避する（§10.1 手順 2）
 LOCK_STALE_SECONDS=21600    # 6 時間。PID の再利用とハングへの歯止め（§10.1 手順 1）
 META_SCHEMA=1
@@ -614,7 +614,11 @@ inventory_add() {          # $1=device_id, $2...=relpath
             printf '%s\t%s\n' "$device_id" "$rel" >> "$INVENTORY_WORK"
         done
     else
-        # 録音 0 件のデバイスは §5.4 規則 5 で検出されないので通常ここへ来ない
+        # **録音 0 件のデバイスはここへ来る**（変更 BO-1）。§5.4 規則 5 は「録音が
+        # 1 件以上ある」を**検出**の条件にしているが、**検出した後に最後の 1 本を
+        # 削除すれば 0 件になる** —— それはこの系の定常状態そのものである。
+        # v5.52 までコメントは「通常ここへ来ない」と書いてあり、`write_inventory()` が
+        # その前提で壊れていた。
         printf '%s\t\n' "$device_id" >> "$INVENTORY_WORK"
     fi
 }
@@ -651,9 +655,19 @@ write_inventory() {
                     first_device=0
                     printf '\n    %s: [' "$(_json_string "$device")"
                     prev_device="$device"
-                    [ -n "$rel" ] && printf '\n      %s' "$(_json_string "$rel")"
+                    # ★`[ -n "$rel" ] && printf ...` と書いてはならない（変更 BO-1）。
+                    #   **録音 0 件のデバイスでは `rel` が空**であり、それがループ本体の
+                    #   最後のコマンドになると while が 1 を返す。`sort | while` の
+                    #   パイプラインも 1 になり、`set -euo pipefail` が
+                    #   **`{ ... }` ブロックごと中断する** —— tmp が途中で切れ、
+                    #   `mv` も `run_reaper` も実行されない。`if` なら偽でも 0 を返す
+                    if [ -n "$rel" ]; then
+                        printf '\n      %s' "$(_json_string "$rel")"
+                    fi
                 else
-                    [ -n "$rel" ] && printf ',\n      %s' "$(_json_string "$rel")"
+                    if [ -n "$rel" ]; then
+                        printf ',\n      %s' "$(_json_string "$rel")"
+                    fi
                 fi
             done
             printf '\n    ]\n  }\n'

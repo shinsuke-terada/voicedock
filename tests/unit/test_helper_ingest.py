@@ -1205,3 +1205,57 @@ def test_a_missing_fast_path_key_does_not_disable_the_stability_check(
     assert "stability_pending" in result.stdout, (
         "即断経路が全件に当たっている。**§10.3 の確認が丸ごと消えている**\n" + result.stdout
     )
+
+
+# --- 録音 0 件のデバイス（v5.52→v5.53 の変更 BO-1） ---------------------
+
+
+def test_a_device_with_no_recordings_finishes_the_run(tmp_path: Path, volumes: Path) -> None:
+    """**最後の 1 本を削除したデバイスでも走り切ること**（変更 BO-1）。
+
+    §5.4 規則 5 は「録音が 1 件以上ある」を**検出**の条件にしているが、
+    **検出した後に最後の 1 本を削除すれば 0 件になる** —— それはこの系の
+    定常状態そのものである（2026-09-16 に実機で踏んだ）。
+
+    v5.52 は `write_inventory()` の中で
+    `[ -n "$rel" ] && printf ...` をループ本体の**最後のコマンド**に置いていた。
+    `rel` が空だと while が 1 を返し、`sort | while` のパイプラインも 1 になり、
+    **`set -euo pipefail` が `{ ... }` ブロックごと中断した。**
+
+    結果、**`inventory.json` が永久に古いまま凍り、`run_reaper` も走らなくなる** ——
+    しかも `heartbeat.json` は更新され続けるので **H-8 も doctor も緑のまま**である
+    （§22 R-23 の「黙って止まる」）。
+    """
+    for wav in volumes.rglob("*.wav"):
+        wav.unlink()
+
+    result = run_ingest(write_conf(tmp_path))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ingest_finished" in result.stdout, result.stdout
+
+
+def test_an_empty_device_still_updates_the_inventory(tmp_path: Path, volumes: Path) -> None:
+    """**録音 0 件でも `inventory.json` を書き替えること**（変更 BO-1）。
+
+    ここが凍ると、**削除が成功した Part が永久に `SOURCE_DELETING` から出られない** ——
+    コンテナは「結果より新しい inventory」を待つからである（BE-1 / #156）。
+    1 時間後に `DELETE_TIMEOUT` で保留へ落ち、**成功した削除が失敗として記録される。**
+    """
+    run_ingest(write_conf(tmp_path))
+    before = read_json(tmp_path / "home" / "state" / "inventory.json")["devices"]
+    assert isinstance(before, dict)
+    assert before[DEVICE_ID], "前提が崩れている（録音が 1 件も無い）"
+
+    for wav in volumes.rglob("*.wav"):
+        wav.unlink()
+    run_ingest(write_conf(tmp_path))
+
+    after = read_json(tmp_path / "home" / "state" / "inventory.json")["devices"]
+    # **`generated_at` では見ない。**秒の分解能しかないので、同じ秒に 2 回走ると
+    # 同値になり、**壊れていても通ってしまう**（§20.5）
+    assert isinstance(after, dict)
+    assert after[DEVICE_ID] == [], "inventory が更新されていない（凍結すると BE-1 が永久に待つ）"
+    assert not (tmp_path / "home" / "state" / "inventory.json.tmp").exists(), (
+        "一時ファイルが残っている（ブロックが途中で中断した痕跡）"
+    )
