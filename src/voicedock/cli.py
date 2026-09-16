@@ -11,6 +11,7 @@ import argparse
 import sys
 
 from voicedock import __version__, db, doctor, health, status, worker
+from voicedock import backlog as backlog_module
 from voicedock.config import ConfigError, load_config, logger_for, startup_notices
 from voicedock.errors import EXIT_CONFIG, EXIT_ERROR, EXIT_OK
 
@@ -22,15 +23,21 @@ SUBCOMMANDS: dict[str, str] = {
     "doctor": "環境診断（§19.2）",
     "health": "health check（§19.1）",
     "version": "バージョンを表示する",
+    "cleanup": "後追いの一括削除（§17.1。**引数を取る唯一のコマンド**）",
 }
-"""SPEC §17.1 の全サブコマンド。**引数を取るものは無い。**
+"""SPEC §17.1 の全サブコマンド。**引数を取るのは `cleanup` だけである。**
 
-v5.0 で `scan` / `history` / `show` / `retry` / `pending` / `cleanup` を削除した
-（v4.6→v5.0 の変更 L-4）。
+v5.0 で `scan` / `history` / `show` / `retry` / `pending` / `cleanup` を削除し
+（v4.6→v5.0 の変更 L-4）、**`cleanup` は Phase 7 の後追い削除が必要になった
+v5.43→v5.44 で戻した**（変更 BF-1。#38）。**破壊的な一括操作に `--dry-run` が
+無いほうが危ないので、引数を取ることを許す。**
+
 **`health` は `compose.yaml` の healthcheck が呼ぶので消せない。**
 """
 
-IMPLEMENTED: frozenset[str] = frozenset({"doctor", "health", "service", "status", "version"})
+IMPLEMENTED: frozenset[str] = frozenset(
+    {"cleanup", "doctor", "health", "service", "status", "version"}
+)
 
 UNIMPLEMENTED_MESSAGE = "voicedock: サブコマンド '{name}' は未実装です（SPEC §17.1）。"
 
@@ -45,9 +52,34 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", metavar="<subcommand>")
 
     for name, help_text in SUBCOMMANDS.items():
-        sub.add_parser(name, help=help_text, description=help_text)
+        child = sub.add_parser(name, help=help_text, description=help_text)
+        if name == "cleanup":
+            _add_cleanup_arguments(child)
 
     return parser
+
+
+def _add_cleanup_arguments(parser: argparse.ArgumentParser) -> None:
+    """`cleanup` の引数（§17.1 / #38）。
+
+    **どちらか一方を必ず選ばせる。**引数無しで破壊的な操作が走る形にしない。
+    """
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--backlog",
+        action="store_true",
+        help="削除 OFF の期間に COMPLETED になった Part を、§14.1 が真なら削除要求へ回す",
+    )
+    group.add_argument(
+        "--resolve-absent",
+        action="store_true",
+        help="実体がもう無い SOURCE_DELETE_PENDING を COMPLETED にする（**消さない**）",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="対象を列挙するだけで、何も書かない",
+    )
 
 
 def dispatch(args: argparse.Namespace) -> int:
@@ -74,8 +106,32 @@ def dispatch(args: argparse.Namespace) -> int:
     if command == "service":
         return _service()
 
+    if command == "cleanup":
+        return _cleanup(
+            backlog=args.backlog, resolve_absent=args.resolve_absent, dry_run=args.dry_run
+        )
+
     print(UNIMPLEMENTED_MESSAGE.format(name=command), file=sys.stderr)
     return EXIT_ERROR
+
+
+def _cleanup(*, backlog: bool, resolve_absent: bool, dry_run: bool) -> int:
+    """`cleanup`（§17.1 / #38）。**デバイスに触れない** —— 要求を書くだけである。"""
+    try:
+        cfg = load_config()
+    except ConfigError as e:
+        print(f"voicedock: 設定エラー（SPEC §7.3）: {e.path}", file=sys.stderr)
+        for violation in e.violations:
+            print(f"  {violation.render()}", file=sys.stderr)
+        return EXIT_CONFIG
+
+    return backlog_module.run(
+        backlog=backlog,
+        resolve_absent=resolve_absent,
+        dry_run=dry_run,
+        cfg=cfg,
+        log=logger_for(cfg),
+    )
 
 
 def _service() -> int:

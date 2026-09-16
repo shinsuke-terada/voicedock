@@ -219,6 +219,10 @@ make helper-status    # 稼働確認
 ```bash
 make enable-deletion    # 有効にする（確認入力を求める）
 make disable-deletion   # 元に戻す
+
+# 有効にする前に溜まっていた録音を後から消す（§17.1）
+docker compose exec voicedock voicedock cleanup --backlog --dry-run
+docker compose exec voicedock voicedock cleanup --backlog
 ```
 
 削除の根拠は**テキストが 2 か所に独立して存在すること**です。
@@ -322,8 +326,8 @@ make lock    # 依存 lock の再生成
 | Phase | 状態 |
 |---|---|
 | 0 PoC | **完了**（[docs/POC.md](docs/POC.md)）。送信機 2 台（機材なし）と電池切れ（運用の中で確認）を除く |
-| 1〜6 取り込み・変換・文字起こし・ノート生成 | 実装済み。**E2E-01〜E2E-05 / E2E-07〜E2E-10 / E2E-12 を実機で PASS**（[docs/E2E.md](docs/E2E.md)） |
-| 7 削除 | **実機で成立した**（2026-09-16。E2E-10 PASS）。削除禁止テスト ND-01〜32（**ND-10〜17 は廃止し欠番**）。残るのは E2E-06（運用の中で確認）と E2E-11（後追いの一括削除。#38） |
+| 1〜6 取り込み・変換・文字起こし・ノート生成 | 実装済み。**E2E-06 以外を実機で PASS**（[docs/E2E.md](docs/E2E.md)） |
+| 7 削除 | **実機で成立した**（2026-09-16。E2E-10 / E2E-11 PASS）。削除禁止テスト ND-01〜32（**ND-10〜17 は廃止し欠番**）。残るのは **E2E-06 のみ**（運用の中で確認。#125） |
 | 8 運用 | 本書のとおり |
 
 Phase 0 の実機検証を受けて v4.0 で**アーキテクチャを変更しました**（コンテナが直接
