@@ -32,7 +32,7 @@ from voicedock.db import Recording, Session
 from voicedock.device import DeviceInventory
 from voicedock.log import Logger
 from voicedock.paths import DevicePath, PartKey, QueuePath, SessionKey, StagingPath
-from voicedock.states import PART_DELETABLE, STAGING_DISPOSABLE
+from voicedock.states import PART_DELETABLE, RAW_NOTE_MEMBERS, STAGING_DISPOSABLE
 
 QUEUE_SCHEMA: Final = 1
 """`queue/delete/<request_id>.json` の `schema`（§14.1.1）。"""
@@ -162,6 +162,17 @@ def verify_raw_note(session: Session, parts: list[Recording], *, vault_root: Pat
 
     **#23 の `notes.verify_note()` を再利用する。**検証ロジックを 2 本に分けると、
     片方だけ直った状態が生まれる。
+
+    **R-6 が要求する鍵は `RAW_NOTE_MEMBERS` に合わせる**（v5.46→v5.47 の変更 BI-1）。
+    v5.46 までは「`transcript_path` があれば要求する」だったが、**書き手
+    （`pipeline._raw_parts()`）は `FAILED` を載せない。**そのため文字起こしまで進んで
+    Raw ノートの書き込みで落ちた Part が 1 本あるだけで R-6 が偽になり、
+    **同じ日の他の Part がすべて削除不可になった** —— `can_delete_source()` の
+    docstring が「Part ごとに評価するから起きない」と書いている形そのものである。
+
+    **緩めても安全性は落ちない。**「そのノートがこの Part を含むか」は
+    `_note_contains()` が別途確かめており、R-6 が見ているのは
+    **「そのノートがいまのセッションのものか」**である。
     """
     if session.raw_output_path is None or session.raw_output_sha256 is None:
         return False
@@ -170,45 +181,27 @@ def verify_raw_note(session: Session, parts: list[Recording], *, vault_root: Pat
         kind=notes.NoteKind.RAW,
         session_key=session.session_key,
         expected_sha=session.raw_output_sha256,
-        expected_keys=[p.partkey for p in parts if p.transcript_path is not None],
+        expected_keys=[
+            p.partkey
+            for p in parts
+            if p.transcript_path is not None and p.status in RAW_NOTE_MEMBERS
+        ],
     )
     return notes.all_passed(results)
 
 
-def verify_daily_note(
-    session: Session, parts: list[Recording], cfg: Config, *, vault_root: Path
-) -> bool:
-    """Daily ノートを**実ファイルで**検証し直す（§13.7 W-1〜W-9 / §14.4 N-12）。"""
-    if session.output_path is None or session.output_sha256 is None:
-        return False
-    results = notes.verify_note(
-        vault_root / session.output_path,
-        kind=notes.NoteKind.DAILY,
-        session_key=session.session_key,
-        expected_sha=session.output_sha256,
-        expected_keys=[p.partkey for p in parts if p.transcript_path is not None],
-        require_raw_link=cfg.obsidian.wiki.link_raw,
-    )
-    return notes.all_passed(results)
-
-
-def analysis_is_schema_valid(session: Session, cfg: Config) -> bool:
-    """`analysis_path` が実在しスキーマ検証を通るか（§14.1 / §10.9）。"""
-    from pydantic import ValidationError
-
-    from voicedock import llm
-
-    if session.analysis_path is None:
-        return False
-    try:
-        document = json.loads(Path(session.analysis_path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    try:
-        llm.build_schema(cfg).model_validate(document)
-    except ValidationError:
-        return False
-    return True
+# **`verify_daily_note()` と `analysis_is_schema_valid()` は v5.47 で削除した**（変更 BI-2）。
+#
+# どちらも **AY-1（v5.37）で §14.1 の条件から外れた**ものの残骸である ——
+# 削除の根拠は「テキストが Vault に確実に残っていること」であり、
+# **要約の成否を記録保全の根拠にしない**（要約は元音声を使わない）。
+# 呼び手はその時点で消えており、以後 1 行も実行されていなかった。
+#
+# **残すほうが危なかった。**`verify_daily_note()` は W-9 を
+# `require_raw_link=cfg.obsidian.wiki.link_raw` で見ており、
+# **書き手（`daily.write_daily_note()`）の `not include_transcript` と既にズレていた。**
+# W-8 の見出しも既定の `## Summary` 決め打ちで、設定した見出しを見ていない。
+# **配線した瞬間に、書き手と違う判定を返す。**安全機構の顔をした死んだコードである。
 
 
 def part_transcript_is_valid(part: Recording) -> bool:

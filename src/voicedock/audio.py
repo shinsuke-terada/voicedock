@@ -409,11 +409,13 @@ def normalize(
     # **冪等性**: 出力が存在し検証を通れば再実行しない（§10.5）
     verified, _detail = verify_output(Path(out_path), duration_seconds=duration_seconds, cfg=cfg)
     if verified:
-        return NormalizeResult(
-            path=out_path,
-            sha256=None,
-            reused=True,
-            out_bytes=Path(out_path).stat().st_size,
+        return _reuse(
+            Path(source),
+            out_path,
+            partkey=partkey,
+            sha256_helper=sha256_helper,
+            duplicate_of=duplicate_of,
+            cfg=cfg,
         )
 
     space = check_space(cfg, duration_seconds=duration_seconds)
@@ -489,6 +491,93 @@ def normalize(
         in_bytes=in_bytes,
         out_bytes=Path(out_path).stat().st_size,
     )
+
+
+def _reuse(
+    source: Path,
+    out_path: StagingPath,
+    *,
+    partkey: PartKey,
+    sha256_helper: str | None,
+    duplicate_of: Callable[[str], str | None] | None,
+    cfg: Config,
+) -> NormalizeResult:
+    """既にある 16 kHz 出力を再利用する（§10.5 の冪等性）。
+
+    **それでも入力の SHA-256 は出す**（v5.46→v5.47 の変更 BI-3）。v5.46 までここは
+    `sha256=None` を返し、呼び手がそれを `recordings.sha256` へ**そのまま書いていた**。
+    結果として、
+
+    - `recording_by_sha256()` が二度と一致せず、**同じ音声の再コピーが 2 度処理される**
+    - §10.5 の**コピー整合検査（`sha256_helper` との照合）が恒久的に飛ばされる**
+
+    **「まだ計算していない」を「無い」として書き込んでいた。**
+
+    到達するのは、正規化に成功してから `update_recording()` の前に落ちた場合である
+    （`recover_interrupted()` は `normalized_path` が `NULL` なので消す対象を見つけられず、
+    健全な出力が残ったまま行だけ `DISCOVERED` へ巻き戻る）。
+
+    **入力は必ず在る。**呼び手が `_usable_source()` で確かめてから来る（§9.3）。
+    """
+    try:
+        digest, in_bytes = _digest_file(source, cfg=cfg)
+    except OSError as exc:
+        return NormalizeResult(
+            path=None,
+            sha256=None,
+            error_code=ErrorCode.IMPORT_FAILED,
+            error_message=f"{type(exc).__name__}: {exc}",
+        )
+
+    # **コピー検証**（§10.5）。再実行した場合と同じ判定にする
+    if sha256_helper is not None and digest != sha256_helper:
+        _discard_output(out_path)
+        return NormalizeResult(
+            path=None,
+            sha256=digest,
+            error_code=ErrorCode.SOURCE_HASH_MISMATCH,
+            error_message=(
+                f"再計算した SHA-256 が .meta.json と一致しません"
+                f"（{digest[:16]}… ≠ {sha256_helper[:16]}…）"
+            ),
+            in_bytes=in_bytes,
+        )
+
+    # **二重処理防止**（§10.5）。**飛ばせない** —— `idx_recordings_sha` は
+    # `sha256` の部分 UNIQUE なので、衝突する値を書くと `update_recording()` が落ちる
+    if duplicate_of is not None:
+        other = duplicate_of(digest)
+        if other is not None and other != partkey:
+            _discard_output(out_path)
+            return NormalizeResult(
+                path=None,
+                sha256=digest,
+                error_code=ErrorCode.DUPLICATE_CONTENT,
+                error_message=f"同じ内容の Part が既にあります: {other}",
+                in_bytes=in_bytes,
+            )
+
+    return NormalizeResult(
+        path=out_path,
+        sha256=digest,
+        reused=True,
+        in_bytes=in_bytes,
+        out_bytes=Path(out_path).stat().st_size,
+    )
+
+
+def _digest_file(path: Path, *, cfg: Config) -> tuple[str, int]:
+    """ファイル全体の SHA-256 と読んだバイト数。**`_stream()` と同じ値を出すこと。**
+
+    刻み幅は `_stream()` と同じ `import.hash_chunk_bytes` を使う。
+    """
+    digest = hashlib.sha256()
+    read = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(cfg.import_.hash_chunk_bytes):
+            digest.update(chunk)
+            read += len(chunk)
+    return digest.hexdigest(), read
 
 
 def _stream(
