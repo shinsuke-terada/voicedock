@@ -584,6 +584,103 @@ def test_an_unfinished_sibling_no_longer_blocks_a_finished_part(scene: Scene) ->
     assert document["partkey"] == PARTKEY, "進行中の Part の要求が書かれた"
 
 
+def test_a_failed_sibling_that_has_a_transcript_no_longer_blocks_a_finished_part(
+    scene: Scene,
+) -> None:
+    """**書き手が載せない Part を、検証側が要求しない**（変更 BI-1）。
+
+    上の試験より鋭い形である。兄弟 B が**文字起こしまで成功して `transcript_path` を
+    持ち**、そのあと Raw ノートの書き込みで落ちて `FAILED` になった場合 ——
+
+    - 書き手（`pipeline._raw_parts()`）は `FAILED` を**載せない**
+    - v5.46 の検証側は `transcript_path` があれば `FAILED` でも**要求していた**
+
+    そのため R-6（包含）が偽になり、**同じ日の他の Part がすべて削除不可**になった。
+    「1 本詰まるとその日ぶん丸ごと解放されない」は `can_delete_source()` の docstring が
+    避けると書いている形そのものである（#131 / #133 と同じ）。
+
+    **安全性は落ちない。**「そのノートがこの Part を含むか」は `_note_contains()` が
+    別途確かめる。R-6 が見ているのは「そのノートがいまのセッションのものか」である。
+    """
+    scene.rearm()
+    other = partkey_for(
+        DEVICE_ID,
+        DevicePath(PurePosixPath("TX_MIC001_20260912_110000/TX00_MIC001_20260912_110000_orig.wav")),
+    )
+    scene.database.insert_recording(
+        Recording(
+            partkey=other,
+            device_id=DEVICE_ID,
+            source_folder="TX_MIC001_20260912_110000",
+            transmitter_id="TX00",
+            mic_index=1,
+            started_at="2026-09-12T11:00:00+09:00",
+            status=PartStatus.FAILED,
+            updated_at="2026-09-12T11:00:00+09:00",
+            session_key=SESSION_KEY,
+            # **文字起こしは通っている。**落ちたのは Raw ノートの書き込みである
+            transcript_path="/data/transcripts/parts/does-not-matter.json",
+        )
+    )
+
+    scene.evaluate()
+
+    requests = scene.requests()
+    assert len(requests) == 1, "FAILED の兄弟 1 本で、終わった Part の削除まで止まっている"
+    document = json.loads(requests[0].read_text(encoding="utf-8"))
+    assert document["partkey"] == PARTKEY
+
+
+def test_a_failed_part_is_not_written_into_the_raw_note(scene: Scene) -> None:
+    """**書き手の側を単独で固定する**（§13.3 / 変更 BI-1）。
+
+    `RAW_NOTE_MEMBERS` は書き手（`pipeline._raw_parts()`）と検証側
+    （`cleaner.verify_raw_note()` の R-6）が**同じ集合を見る**ための定数である。
+    上の試験は検証側しか固定しない —— **書き手だけを広げても落ちない**ので、
+    「FAILED は Raw ノートに載らない」をここで独立に固定する（§20.6）。
+
+    **`transcript_path` の実ファイルも置く。**置かないと `_raw_parts()` が
+    「本文が読めない」を理由に落とすので、**`FAILED` を弾いたかどうかを見分けられない。**
+    """
+    other_rel = "TX_MIC001_20260912_120000/TX00_MIC001_20260912_120000_orig.wav"
+    other = partkey_for(DEVICE_ID, DevicePath(PurePosixPath(other_rel)))
+    target = paths.transcript_path_for(PartKey(other))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(
+            {
+                "partkey": other,
+                "language": "ja",
+                "duration_seconds": 30.0,
+                "started_at": "2026-09-12T12:00:00+09:00",
+                "text": "こんにちは。",
+                "segments": [{"start": 0.0, "end": 2.0, "text": "こんにちは。"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    scene.database.insert_recording(
+        Recording(
+            partkey=other,
+            device_id=DEVICE_ID,
+            source_folder="TX_MIC001_20260912_120000",
+            transmitter_id="TX00",
+            mic_index=1,
+            started_at="2026-09-12T12:00:00+09:00",
+            status=PartStatus.FAILED,
+            updated_at="2026-09-12T12:00:00+09:00",
+            session_key=SESSION_KEY,
+            transcript_path=str(target),
+        )
+    )
+
+    keys = {part.partkey for part in scene.runner._raw_parts(SessionKey(SESSION_KEY))}
+
+    assert PARTKEY in keys, "終わった Part が載っていない"
+    assert other not in keys, "FAILED の Part を Raw ノートに載せている（§13.3）"
+
+
 # --- ND-21: 空集合・空文字を真にしない（§14.1 の番犬） ------------------
 
 

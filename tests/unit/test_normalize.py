@@ -579,7 +579,77 @@ def test_a_verified_output_is_reused(cfg: Config, source: InboxPath) -> None:
     )
     assert again.reused
     assert again.ok
-    assert again.sha256 is None, "再利用時はハッシュを算出しない（入力を読まない）"
+    assert again.sha256 == first.sha256, (
+        "**再利用でも入力の SHA-256 を出す**（変更 BI-3）。v5.46 まではここが `None` で、"
+        "呼び手がそれを `recordings.sha256` へそのまま書いていた —— "
+        "**重複検出と §10.5 のコピー整合検査がその Part について恒久的に無効になる**"
+    )
+
+
+@pytest.mark.needs_ffmpeg
+def test_a_successful_result_always_carries_a_digest(cfg: Config, source: InboxPath) -> None:
+    """**`ok` なら `sha256` は必ず在る**（変更 BI-3）。
+
+    呼び手（`pipeline.ensure_normalized_audio()`）は `result.sha256` を
+    **無条件に** `recordings.sha256` へ書く。`None` を通す経路があると、
+    **「まだ計算していない」が「無い」として保存される。**
+    """
+    for _ in range(2):  # 1 周目は生成、2 周目は再利用
+        result = normalize(
+            source, partkey=PARTKEY, duration_seconds=SECONDS, sha256_helper=None, cfg=cfg
+        )
+        assert result.ok
+        assert result.sha256 is not None
+
+
+@pytest.mark.needs_ffmpeg
+def test_the_copy_check_runs_on_the_reuse_path_too(cfg: Config, source: InboxPath) -> None:
+    """**再利用でも §10.5 のコピー整合検査を行う**（変更 BI-3）。
+
+    v5.46 は再利用のとき入力を読まなかったので、**`.meta.json` との照合が
+    丸ごと飛んでいた** —— Helper のコピーが壊れていても気づけない。
+    """
+    first = normalize(
+        source, partkey=PARTKEY, duration_seconds=SECONDS, sha256_helper=None, cfg=cfg
+    )
+    assert first.ok
+
+    again = normalize(
+        source,
+        partkey=PARTKEY,
+        duration_seconds=SECONDS,
+        sha256_helper="0" * 64,  # 墓標の値が食い違っている
+        cfg=cfg,
+    )
+
+    assert not again.ok
+    assert again.error_code is ErrorCode.SOURCE_HASH_MISMATCH
+    assert not Path(normalized_path_for(PARTKEY)).exists(), "壊れた入力の出力を残した"
+
+
+@pytest.mark.needs_ffmpeg
+def test_the_duplicate_check_runs_on_the_reuse_path_too(cfg: Config, source: InboxPath) -> None:
+    """**再利用でも二重処理防止を行う**（変更 BI-3）。
+
+    **飛ばせない。**`idx_recordings_sha` は `sha256` の部分 UNIQUE なので、
+    衝突する値を書くと呼び手の `update_recording()` が `IntegrityError` で落ちる。
+    """
+    first = normalize(
+        source, partkey=PARTKEY, duration_seconds=SECONDS, sha256_helper=None, cfg=cfg
+    )
+    assert first.ok
+
+    again = normalize(
+        source,
+        partkey=PARTKEY,
+        duration_seconds=SECONDS,
+        sha256_helper=None,
+        cfg=cfg,
+        duplicate_of=lambda _digest: "DJIMIC3/somewhere/else_orig.wav",
+    )
+
+    assert not again.ok
+    assert again.error_code is ErrorCode.DUPLICATE_CONTENT
 
 
 @pytest.mark.needs_ffmpeg

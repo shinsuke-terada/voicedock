@@ -22,8 +22,6 @@ from datetime import datetime, tzinfo
 from pathlib import Path, PurePosixPath
 from typing import Final, Literal
 
-from voicedock import paths
-from voicedock.db import Recording
 from voicedock.paths import DevicePath, InboxPath, PartKey, partkey_for
 
 DEFAULT_STATE_ROOT: Final = Path("/state")
@@ -170,25 +168,11 @@ class DeviceInventory:
         return not self.devices
 
 
-def resolve_delete_targets(part: Recording) -> list[DevicePath]:
-    """削除対象の `relpath` を返す（§11.1 / §14.1.1）。**削除そのものは行わない。**
-
-    **`_orig` 固定なので常に 0 か 1 要素である**（§5.3）。`source_path` が `NULL` /
-    空文字 / 健全でない `relpath` なら空を返す — **`os.path.join(volume, "")` は
-    ボリュームのルートを指す**（§14.1）。
-
-    **引数は DB 行（`Recording`）である。**§11.1 の初出は `PartCandidate` と書いていたが、
-    あれは inbox 走査の型であり `status` も `source_path` も持たない（v5.8→v5.9 の変更 U-1）。
-    §14.1 の論理式が見ている `part` は最初から DB 行である。
-
-    返す型は `DevicePath`（`PurePosixPath`）なので、**呼び手は開くことも消すこともできない。**
-    """
-    if not part.source_path:
-        return []
-    rel = PurePosixPath(part.source_path)
-    if not paths.is_safe_relpath(rel):
-        return []
-    return [DevicePath(rel)]
+# **`resolve_delete_targets()` は v5.47 で削除した**（変更 BI-2）。
+#
+# 削除対象の同定は `cleaner.target_is_identical()` と reaper の §14.1.1 検証 10 が行う。
+# この関数を呼ぶ者は v5.9 以降 1 人も居なかった。**削除に関わる名前を、
+# 誰も通らない場所に置いたままにしない** —— 読んだ人が「ここが同定している」と誤解する。
 
 
 def read_inventory(state_root: Path = DEFAULT_STATE_ROOT) -> DeviceInventory | None:

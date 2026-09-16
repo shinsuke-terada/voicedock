@@ -473,3 +473,22 @@ def test_a_replayed_result_also_carries_the_key(bench: Bench) -> None:
     written = bench.results()[0]
     assert written["partkey"] == PARTKEY
     assert written["detail"] == "replayed"
+
+
+def test_the_mtime_tolerance_matches_the_container() -> None:
+    """**`MTIME_TOLERANCE` はコンテナ側と同じ値であること**（§14.1.1 検証 10）。
+
+    `cleaner.MTIME_TOLERANCE_SECONDS` の docstring は「**reaper と同じ値でなければ
+    ならない**」と書いているが、**それを確かめるものが 1 つも無かった**
+    （v5.46→v5.47 の変更 BI-2）。
+
+    ずれると何が起きるか。**コンテナが「同じファイルだ」と判断して要求を書き、
+    reaper が「違う」と言って拒む** —— あるいは逆に、コンテナが要求を書かないので
+    元音声が永久に残る。どちらも「設定が効かない」ではなく**2 者の判断が食い違う**形で、
+    ログには `reason=mtime_mismatch` としか出ない（#151 で実際に踏んだ形である）。
+    """
+    from voicedock.cleaner import MTIME_TOLERANCE_SECONDS
+
+    matched = re.search(r"^MTIME_TOLERANCE=(\d+)", REAPER.read_text(encoding="utf-8"), re.M)
+    assert matched is not None, "reaper に MTIME_TOLERANCE が見つからない"
+    assert float(matched.group(1)) == MTIME_TOLERANCE_SECONDS

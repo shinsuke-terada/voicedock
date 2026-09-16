@@ -49,6 +49,7 @@ from voicedock.states import (
     PART_DELETABLE,
     PART_RECOVERY,
     PART_RETRYABLE_FROM_FAILED,
+    RAW_NOTE_MEMBERS,
     SESSION_RECOVERY,
     SESSION_RETRYABLE_FROM_FAILED,
     PartStatus,
@@ -566,7 +567,9 @@ class Pipeline:
         """
         built: list[raw.RawPart] = []
         for record in self.database.recordings_for_session(session_key):
-            if record.status not in TRANSCRIBED_OR_BEYOND | {PartStatus.RAW_WRITING}:
+            if record.status not in RAW_NOTE_MEMBERS:
+                # **`cleaner.verify_raw_note()` と同じ集合を見る**（変更 BI-1）。
+                # 別々に書くと、書き手が載せない Part を検証側が要求しうる
                 continue
             loaded = transcribe.load_transcript(PartKey(record.partkey))
             if loaded is None:
