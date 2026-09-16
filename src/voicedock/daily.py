@@ -428,8 +428,8 @@ def _summary_heading(cfg: Config) -> str:
 def raw_note_names(session_key: SessionKey, cfg: Config, day: date) -> list[str]:
     """`## Sources` から辿る Raw ノートの basename（§13.8 の `link_raw`）。
 
-    **`granularity: day` なら 1 本。**`part` のときは呼び手が Part ごとの名前を渡す
-    （#24 の `write_raw_notes_per_part()` と対になる）。
+    **常に 1 本である。**Raw ノートは日単位で 1 ファイルに書き直される（§13.3）。
+    `granularity: part` は v5.48 で廃止した（変更 BJ-1）。
     """
     return [raw.raw_filename(cfg.obsidian.raw, day, max_bytes=cfg.obsidian.max_title_bytes)]
 

@@ -128,7 +128,7 @@ def test_all_ok_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert lines[0] == "VoiceDock doctor"
     assert lines[1] == SEPARATOR
     assert lines[2] == f"[✓] {'Config file':<21}{path}"
-    assert lines[3] == f"[✓] {'Config validation':<21}108 keys, 0 errors"
+    assert lines[3] == f"[✓] {'Config validation':<21}107 keys, 0 errors"
     assert lines[4].startswith(f"[✓] {'Database':<21}")
     assert lines[5].startswith(f"[✓] {'Data volume':<21}")
     assert lines[6].startswith(f"[✓] {'Whisper executable':<21}")
@@ -167,7 +167,7 @@ def test_violations_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     lines = out.splitlines()
 
     assert lines[2] == f"[✓] {'Config file':<21}{path}"
-    assert lines[3] == f"[✗] {'Config validation':<21}108 keys, 2 errors"
+    assert lines[3] == f"[✗] {'Config validation':<21}107 keys, 2 errors"
     assert lines[4].startswith(" " * DETAIL_INDENT)
     assert "V-3  CONFIG_INVALID_VALUE  audio.target_sample_rate" in lines[4]
     assert "V-7  CONFIG_INVALID_VALUE  session.group_by" in lines[5]
@@ -379,7 +379,7 @@ def test_run_defaults_to_the_env_config(
     # `now` を渡す。**渡さないと D-18 が実時刻で heartbeat の鮮度を見る**ので、
     # fixture の時刻との差で stale になり、このテストが日によって落ちる
     assert doctor.run(state_root=tmp_path / "state", now=NOW) == EXIT_OK
-    assert "108 keys, 0 errors" in capsys.readouterr().out
+    assert "107 keys, 0 errors" in capsys.readouterr().out
 
 
 # --- D-10 ffmpeg / ffprobe -----------------------------------------------

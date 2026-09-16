@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import IO, Final
 
-from voicedock import __version__, db, device, paths
+from voicedock import __version__, cleaner, db, device, paths
 from voicedock.config import Config, ConfigError, load_config
 from voicedock.device import read_inventory
 from voicedock.errors import EXIT_CONFIG, EXIT_OK
@@ -240,7 +240,7 @@ def collect(
         devices=inventory,
         device_free=_free_space_text(state_root),
         inbox=_inbox_text(cfg, orphaned),
-        delete_queue=_queue_text(),
+        delete_queue=_queue_text(cfg),
         locks=Locks(
             config_delete=cfg.cleanup.delete_source_audio,
             helper_delete=beat.delete_source_audio if beat else None,
@@ -467,10 +467,17 @@ def _inbox_text(cfg: Config, orphaned_keys: frozenset[str]) -> str:
     return text
 
 
-def _queue_text() -> str:
-    """`queue/delete/` と `queue/result/` の件数（§14.1.1 / §14.3）。"""
-    requested = _json_count(paths.QUEUE_ROOT / "delete")
-    results = _json_count(paths.QUEUE_ROOT / "result")
+def _queue_text(cfg: Config) -> str:
+    """`queue/delete/` と `queue/result/` の件数（§14.1.1 / §14.3）。
+
+    **`cleanup.queue_root` を見る**（v5.47→v5.48 の変更 BJ-3）。v5.47 までは
+    `paths.QUEUE_ROOT`（`/queue`）決め打ちで、**既定以外に置くと `_json_count()` の
+    `OSError` 握りつぶしに落ちて恒久的に `0 requested, 0 awaiting result` と出た** ——
+    要求が積まれているのに、**削除の唯一の運用窓が実態の逆を報せる。**
+    """
+    root = Path(cfg.cleanup.queue_root)
+    requested = _json_count(root / cleaner.DELETE_DIRNAME)
+    results = _json_count(root / cleaner.RESULT_DIRNAME)
     return f"{requested} requested, {results} awaiting result"
 
 
