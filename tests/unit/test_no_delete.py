@@ -26,7 +26,7 @@ import json
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Final
 from zoneinfo import ZoneInfo
@@ -37,6 +37,7 @@ from voicedock import cleaner, device, llm, notes, paths, pipeline
 from voicedock.config import Config
 from voicedock.db import Database, Recording, Session
 from voicedock.device import DeviceInventory
+from voicedock.errors import ErrorCode
 from voicedock.log import Logger
 from voicedock.paths import DevicePath, PartKey, SessionKey, partkey_for
 from voicedock.pipeline import Pipeline
@@ -1096,7 +1097,7 @@ def write_result(scene: Scene, *, status: str = "DELETED", detail: str = "", **e
     payload = {
         "schema": 1,
         "request_id": request_id,
-        "completed_at": "2026-09-13T09:00:00+09:00",
+        "completed_at": extra.pop("completed_at", NOW.isoformat()),
         "reaper_version": "5.9.0",
         "device_id": DEVICE_ID,
         "partkey": extra.pop("partkey", PARTKEY),
@@ -1113,13 +1114,112 @@ def gone(scene: Scene) -> DeviceInventory:
     return DeviceInventory(generated_at=NOW, mount_readonly=False, devices={DEVICE_ID: frozenset()})
 
 
+def stale(scene: Scene) -> DeviceInventory:
+    """**結果より古い** `inventory.json`。まだファイルが在ると言っている。
+
+    **これが実機の既定の姿である。**`inventory.json` は ingest が 5 分ごとに書き、
+    reaper は ingest の**最後**に走るので、**削除の直後は必ず inventory のほうが古い。**
+    """
+    return DeviceInventory(
+        generated_at=NOW - timedelta(minutes=5),
+        mount_readonly=False,
+        devices={DEVICE_ID: frozenset({DevicePath(PurePosixPath(RELPATH))})},
+    )
+
+
+def test_a_stale_inventory_does_not_fail_the_deletion(scene: Scene) -> None:
+    """**「まだ観測していない」を「失敗した」と読まない**（#156）。
+
+    実機では**成功した削除 6 本がちょうど 1 度ずつ失敗として記録され**、
+    `status` が「削除保留 6 件」と出た。ファイルは消えているのに、である。
+
+    #148 / #107 と同じ型 —— **観測していないことと、そうでないことを区別しない。**
+    """
+    result = write_result(scene)
+
+    pending = scene.runner.collect_delete_results([scene.part()], stale(scene))
+
+    assert pending == set(), "古い inventory で保留へ落とした"
+    assert scene.part().status == PartStatus.SOURCE_DELETING, "待たずに進めた"
+    assert result.exists(), "**結果を捨ててしまうと、次の周回で回収できない**"
+
+
+def test_the_deletion_completes_once_the_inventory_catches_up(scene: Scene) -> None:
+    """**次の周回で inventory が追いつけば完了する。**待つだけで直る。"""
+    write_result(scene)
+    scene.runner.collect_delete_results([scene.part()], stale(scene))
+    assert scene.part().status == PartStatus.SOURCE_DELETING
+
+    scene.runner.collect_delete_results([scene.part()], gone(scene))
+
+    assert scene.part().status == PartStatus.COMPLETED
+    assert scene.part().source_deleted_at is not None
+
+
+def test_a_fresh_inventory_that_still_has_the_file_is_a_failure(scene: Scene) -> None:
+    """**本物の失敗は見逃さない。**新しい inventory がまだ在ると言うなら失敗である。"""
+    write_result(scene)
+    fresh = DeviceInventory(
+        generated_at=NOW + timedelta(minutes=1),
+        mount_readonly=False,
+        devices={DEVICE_ID: frozenset({DevicePath(PurePosixPath(RELPATH))})},
+    )
+
+    pending = scene.runner.collect_delete_results([scene.part()], fresh)
+
+    assert pending == {PARTKEY}
+    assert scene.part().status == PartStatus.SOURCE_DELETE_PENDING
+    assert scene.part().error_code == ErrorCode.SOURCE_DELETE_FAILED
+
+
+@pytest.mark.parametrize("missing", ["generated_at", "completed_at"])
+def test_an_unknown_order_falls_to_the_safe_side(scene: Scene, missing: str) -> None:
+    """**新旧が判定できないときは今までどおり**（§7.5 の「不明は安全側」）。
+
+    **消えたことにしない。**
+    """
+    if missing == "completed_at":
+        write_result(scene, completed_at="")
+        inventory = stale(scene)
+    else:
+        write_result(scene)
+        inventory = DeviceInventory(
+            generated_at=None,
+            mount_readonly=False,
+            devices={DEVICE_ID: frozenset({DevicePath(PurePosixPath(RELPATH))})},
+        )
+
+    pending = scene.runner.collect_delete_results([scene.part()], inventory)
+
+    assert pending == {PARTKEY}
+    assert scene.part().status == PartStatus.SOURCE_DELETE_PENDING
+
+
+def test_a_part_just_moved_to_pending_is_not_requested_again(scene: Scene) -> None:
+    """**同じ周回で保留へ落とした Part を再要求しない**（#156）。
+
+    実機では回収で保留へ落とした直後に**同じ周回でもう一度要求を書き**、
+    reaper が `target_missing` で拒否して**また保留へ落ちた。**
+    """
+    scene.rearm()
+    scene.set_part(status=PartStatus.SOURCE_DELETING)
+    write_result(scene, status="SOURCE_IDENTITY_MISMATCH", detail="size_mismatch")
+    for path in scene.requests():
+        path.unlink()
+
+    scene.evaluate()
+
+    assert scene.requests() == [], "保留へ落とした直後に再要求した"
+    assert scene.part().status == PartStatus.SOURCE_DELETE_PENDING
+
+
 def test_a_successful_result_completes_the_part(scene: Scene) -> None:
     """§10.12: 結果が成功 ∧ `inventory.json` でも不在 → `COMPLETED`。"""
     assert scene.part().status == PartStatus.SOURCE_DELETING
     result = write_result(scene)
-    moved = scene.runner.collect_delete_results([scene.part()], gone(scene))
+    pending = scene.runner.collect_delete_results([scene.part()], gone(scene))
 
-    assert moved == 1
+    assert pending == set(), "成功したのに保留へ落とした"
     assert scene.part().status == PartStatus.COMPLETED
     assert scene.part().source_deleted_at is not None, "不可逆操作の記録が入らない"
     assert not result.exists(), "回収した結果を捨てていない"
@@ -1159,9 +1259,9 @@ def test_an_unknown_inventory_does_not_complete(scene: Scene) -> None:
 def test_a_result_for_another_part_is_left_alone(scene: Scene) -> None:
     """**別の Part の結果は捨てない。**そのセッションを処理する周回で回収される。"""
     result = write_result(scene, partkey=f"{DEVICE_ID}/other/other.wav")
-    moved = scene.runner.collect_delete_results([scene.part()], gone(scene))
+    pending = scene.runner.collect_delete_results([scene.part()], gone(scene))
 
-    assert moved == 0
+    assert pending == set()
     assert result.exists()
     assert scene.part().status == PartStatus.SOURCE_DELETING
 
@@ -1175,9 +1275,9 @@ def test_a_result_for_a_part_that_moved_on_is_left_alone(scene: Scene) -> None:
     """
     scene.set_part(status=PartStatus.COMPLETED)
     result = write_result(scene)
-    moved = scene.runner.collect_delete_results([scene.part()], gone(scene))
+    pending = scene.runner.collect_delete_results([scene.part()], gone(scene))
 
-    assert moved == 0
+    assert pending == set()
     assert result.exists(), "別の周回で回収されるべき結果を捨てている"
     assert scene.part().status == PartStatus.COMPLETED
     assert scene.part().source_deleted_at is None
@@ -1203,7 +1303,7 @@ def test_a_missing_result_expires_and_withdraws_the_request(scene: Scene) -> Non
         now=datetime.fromtimestamp(later, tz=JST),
         state_root=scene.runner.state_root,
     )
-    assert runner.collect_delete_results([scene.part()], scene.inventory) == 1
+    runner.collect_delete_results([scene.part()], scene.inventory)
 
     assert scene.part().status == PartStatus.SOURCE_DELETE_PENDING
     assert scene.requests() == [], "古い要求がキューに残っている"
@@ -1211,6 +1311,6 @@ def test_a_missing_result_expires_and_withdraws_the_request(scene: Scene) -> Non
 
 def test_a_fresh_request_is_not_expired(scene: Scene) -> None:
     """**タイムアウト前に取り下げない。**reaper は接続のたびにしか動かない。"""
-    assert scene.runner.collect_delete_results([scene.part()], scene.inventory) == 0
+    assert scene.runner.collect_delete_results([scene.part()], scene.inventory) == set()
     assert scene.part().status == PartStatus.SOURCE_DELETING
     assert len(scene.requests()) == 1
