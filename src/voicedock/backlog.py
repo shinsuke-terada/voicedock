@@ -207,6 +207,8 @@ def _mark_absent(
             now=now,
         )
         cleaner.withdraw_request(partkey, cfg=cfg)
+        # **結果も取り下げる**（#160）。要求だけ消すと、対応する試行が無い結果が残る
+        cleaner.withdraw_result(partkey, cfg=cfg)
         log.info("source_delete_skipped", recording_key=partkey, reason="already_absent")
         done += 1
     return done
