@@ -4235,7 +4235,7 @@ $ voicedock cleanup --backlog --dry-run
 ```text
 $ voicedock status
 
-VoiceDock v0.1.0
+VoiceDock v1.0.0
 ────────────────────────────────────────────────────────
 Helper                : running   (last seen 42s ago, v5.5.0, mount=readOnly (MOUNT_MODE=ro))
 Devices connected     : 1  (DJIMIC3, readOnly)
