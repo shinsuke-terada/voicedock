@@ -34,7 +34,7 @@ from voicedock.db import (
 )
 from voicedock.log import MAX_VALUE_CHARS
 from voicedock.paths import DevicePath, partkey_for
-from voicedock.states import FAILED_STATUS, RETRY_RESET_STATUSES
+from voicedock.states import FAILED_STATUS, RETRY_RESET_STATUSES, PartStatus
 
 NOW = datetime(2026, 9, 13, 9, 0, 0)
 
@@ -712,3 +712,28 @@ def test_the_static_check_actually_matches() -> None:
     assert STATUS_UPDATE.search("UPDATE recordings SET status = ? WHERE id = ?")
     assert STATUS_UPDATE.search("update sessions set status=?, x=?")
     assert not STATUS_UPDATE.search("SELECT status FROM recordings WHERE id = ?")
+
+
+def test_recordings_with_status_is_ordered_by_started_at(database: Database) -> None:
+    """**§10.0 の処理順（古い録音から）で返す**（変更 BK-4）。
+
+    v5.48 まで同じ問い合わせが 2 本あり、**順序だけ違った** ——
+    `db` の側は `partkey` 昇順、`pipeline` 側の写しは `started_at` 昇順である。
+    写しのほうは `db._from_row`（非公開）を関数内 import で掴んでもいた。
+
+    **`partkey` 順に戻すとこのテストが落ちる**（`partkey` は
+    `<device>/<folder>/<file>` なので、時刻の逆順になる木を作ってある）。
+    """
+    for hour, folder in ((15, "TX_MIC001_20260912_090000"), (9, "TX_MIC001_20260912_150000")):
+        database.insert_recording(
+            make_recording(
+                partkey=f"DJIMIC3/{folder}/TX00_MIC001_{hour:02d}_orig.wav",
+                source_folder=folder,
+                started_at=f"2026-09-12T{hour:02d}:00:00+09:00",
+                status=PartStatus.SOURCE_DELETE_PENDING,
+            )
+        )
+
+    found = database.recordings_with_status(PartStatus.SOURCE_DELETE_PENDING)
+
+    assert [row.started_at[11:13] for row in found] == ["09", "15"], "古い録音から返していない"

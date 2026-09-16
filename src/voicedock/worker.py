@@ -25,7 +25,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Final
 
-from voicedock import __version__, db, device, discover, pipeline, session
+from voicedock import __version__, db, device, discover, pipeline, session, wiki
 from voicedock.config import Config
 from voicedock.device import DeviceInventory
 from voicedock.heartbeat import DEFAULT_STATE_ROOT, read_heartbeat
@@ -77,6 +77,17 @@ class Worker:
 
     last_inventory_empty: bool | None = None
     """前回の周回で `inventory.devices` が空だったか。**起動直後は `None`（不明）。**"""
+
+    vault_index: wiki.VaultIndex | None = None
+    """Vault の索引（§13.8）。**周回をまたいで持つ**（変更 BK-3）。
+
+    `obsidian.wiki.vault_index_cache_seconds`（既定 300 秒）の TTL は**保持する者が
+    要る。**v5.48 までキャッシュを持つ者が居らず、`Pipeline` は tick ごとに作り直される
+    ので、**Daily ノートを書くたびに Vault 全体を `scandir` で走査していた** ——
+    1 万ノートの Vault で、再オープンを含めると 1 日 32 回になる（§10.7）。
+
+    `link_tags: false` なら `None` のままである（索引そのものが要らない）。
+    """
 
     helper_fresh: bool = True
     """直近の周回で Helper のハートビートが新しかったか（§10.0 / 変更 BH-4）。
@@ -134,6 +145,7 @@ class Worker:
         # **ここから 3 段は Helper に一切触れない。**止める理由が無い
         self.close_idle_sessions()
         self.process_pending_parts()
+        self.refresh_vault_index()
         self.process_ready_sessions()
 
         if self.helper_fresh:
@@ -153,6 +165,35 @@ class Worker:
                 break
             self.sleep(self.cfg.device.poll_interval_seconds)
         self.log.info("service_stopping", version=__version__)
+
+    def _pipeline(self) -> pipeline.Pipeline:
+        """その周回の `Pipeline`。**生成を 1 か所に寄せてある**（変更 BK-1）。
+
+        v5.48 まで 3 か所で組み立てており、**`state_root` を 1 つも渡していなかった。**
+        `Worker` が `/alt/state` を見ていても `Pipeline` は既定の `/state` を読むので、
+        **同じ周回の中で 2 つが別のデバイス視界を持った** —— `request_deletions()` と
+        `delete_sources_if_safe()` が `inventory` を読めず、**書き込み可能なデバイスを
+        読み取り専用と判断して削除を黙って見送る。**
+
+        **`now` は注入されたときだけ渡す**（変更 BK-2）。v5.48 までは周回の先頭で
+        `self.now()` を固定して渡しており、**32 Part の日は tick が数時間走る**ので
+        （whisper が 1 本 30 分）、最後の Part の `updated_at` が**数時間前の時刻**になった。
+        `Pipeline._moment()` も同じ値を返すため、`_expire_delete_requests()` の経過時間が
+        実際より短く出る一方、`deletable_session_keys()` は `self.now()` を呼び直していて
+        **両者が tick の長さぶん食い違っていた。**
+
+        本番では `None` を渡す —— `Pipeline._moment()` と `db._now()` が**呼ばれた時点の
+        時刻**を使う。`clock` を注入したテストだけが固定される。
+        """
+        return pipeline.Pipeline(
+            database=self.database,
+            cfg=self.cfg,
+            log=self.log,
+            now=self.clock() if self.clock is not None else None,
+            state_root=self.state_root,
+            helper_fresh=self.helper_fresh,
+            vault_index=self.vault_index,
+        )
 
     # --- 各段 ------------------------------------------------------------
 
@@ -185,16 +226,7 @@ class Worker:
         32 Part の日が 160 秒以上かかる。**停止要求は 1 件ごとに見る** — 30 分の
         文字起こしの途中では止まれないが、次の Part へ進む前には止まれる。
         """
-        runner = pipeline.Pipeline(
-            database=self.database,
-            cfg=self.cfg,
-            log=self.log,
-            now=self.now(),
-            # **Helper が止まっていれば新しい削除要求を書かせない**（変更 BH-4）。
-            # `process_part()` は `ensure_raw_note()` の直後に `request_deletions()` を
-            # 呼ぶので、**古い `inventory` で要求が出てしまう**
-            helper_fresh=self.helper_fresh,
-        )
+        runner = self._pipeline()
         for partkey in self.pending_partkeys():
             if self.stopper.should_stop():
                 return
@@ -234,14 +266,7 @@ class Worker:
         **一覧を先に確定させる。**処理の途中で足された Part を同じ周回で拾うと、
         **停止要求が効かないまま走り続けうる。**
         """
-        terminal = [status.value for status in PART_TERMINAL]
-        placeholders = ", ".join("?" for _ in terminal)
-        rows = self.database.conn.execute(
-            "SELECT partkey FROM recordings "  # noqa: S608 - placeholders は ? のみ
-            f"WHERE status NOT IN ({placeholders}) ORDER BY started_at, partkey",
-            terminal,
-        ).fetchall()
-        return [PartKey(row["partkey"]) for row in rows]
+        return self.database.pending_partkeys([status.value for status in PART_TERMINAL])
 
     def should_requeue(self, inventory: DeviceInventory | None, *, startup: bool = False) -> bool:
         """§15.2: **立ち上がりのエッジ**か。**この判定だけを独立させてある。**
@@ -280,19 +305,30 @@ class Worker:
             return 0
         return pipeline.requeue_failed(self.database, log=self.log, now=self.now())
 
+    def refresh_vault_index(self) -> None:
+        """Vault の索引を TTL に従って作り直す（§13.8 / 変更 BK-3）。
+
+        **周回ごとに 1 回だけ呼ぶ。**`Pipeline` は tick ごとに作り直される dataclass で
+        キャッシュを持てないので、**保持する者をここに置く。**
+        `obsidian.wiki.vault_index_cache_seconds` はこれで初めて効く。
+
+        **失敗しても止めない**（§13.8）。索引はリンクの見栄えのためであり、
+        ノートの保存検証の合否には影響しない。
+        """
+        try:
+            self.vault_index = wiki.index_for(
+                self.cfg, Path(self.cfg.obsidian.root), cached=self.vault_index
+            )
+        except OSError as exc:
+            self.log.debug("obsidian_saved", reason=f"vault_index: {exc}")
+
     def process_ready_sessions(self) -> None:
         """§10.8〜§10.9 を 1 件ずつ（**Part と同じく直列**。§10.0）。
 
         **停止要求は 1 件ごとに見る。**LLM の 1 回が最大 1800 秒（§7.2）なので途中では
         止まれないが、次のセッションへ進む前には止まれる。
         """
-        runner = pipeline.Pipeline(
-            database=self.database,
-            cfg=self.cfg,
-            log=self.log,
-            now=self.now(),
-            helper_fresh=self.helper_fresh,
-        )
+        runner = self._pipeline()
         for session_key in self.ready_session_keys():
             if self.stopper.should_stop():
                 return
@@ -317,13 +353,7 @@ class Worker:
         ビジーループを避ける（§15.2）。**この関数は v5.41 までテストからしか
         呼ばれていなかった。**
         """
-        runner = pipeline.Pipeline(
-            database=self.database,
-            cfg=self.cfg,
-            log=self.log,
-            now=self.now(),
-            helper_fresh=self.helper_fresh,
-        )
+        runner = self._pipeline()
         for session_key in self.deletable_session_keys():
             if self.stopper.should_stop():
                 return
