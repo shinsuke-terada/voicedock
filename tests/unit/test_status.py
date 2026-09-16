@@ -41,6 +41,8 @@ def cfg(make_config: Callable[..., Config], tmp_path: Path, db_path: Path) -> Co
         {
             "database": {"path": str(db_path)},
             "import": {"inbox_root": str(inbox), "staging_root": str(staging)},
+            # **設定値を見る**（変更 BJ-3）。`paths.QUEUE_ROOT` 決め打ちではない
+            "cleanup": {"queue_root": str(tmp_path / "queue")},
         }
     )
 
@@ -494,9 +496,46 @@ def test_device_free_space_lists_every_device(cfg: Config, state_root: Path) -> 
 
 
 def test_the_delete_queue_is_counted(cfg: Config, state_root: Path) -> None:
-    (paths.QUEUE_ROOT / "delete" / "r1.json").write_text("{}", encoding="utf-8")
-    (paths.QUEUE_ROOT / "result" / "r0.json").write_text("{}", encoding="utf-8")
+    root = Path(cfg.cleanup.queue_root)
+    (root / "delete" / "r1.json").write_text("{}", encoding="utf-8")
+    (root / "result" / "r0.json").write_text("{}", encoding="utf-8")
     assert row_value(text(cfg, state_root), "Delete queue") == "1 requested, 1 awaiting result"
+
+
+def test_the_delete_queue_follows_the_configured_root(
+    make_config: Callable[..., Config], tmp_path: Path, db_path: Path, state_root: Path
+) -> None:
+    """**`cleanup.queue_root` を見る**（変更 BJ-3）。
+
+    v5.47 までは `paths.QUEUE_ROOT`（`/queue`）決め打ちだった。既定以外に置くと
+    `_json_count()` の `OSError` 握りつぶしに落ち、**恒久的に
+    `0 requested, 0 awaiting result` と出る** —— 要求が積まれているのに、
+    **削除の唯一の運用窓が実態の逆を報せる。**
+
+    `paths.QUEUE_ROOT` は autouse fixture が別の場所を指しており、そちらは空である。
+    **決め打ちに戻すと 0 になるので、この試験が落ちる。**
+    """
+    alt = tmp_path / "alt-queue"
+    (alt / "delete").mkdir(parents=True)
+    (alt / "result").mkdir(parents=True)
+    (alt / "delete" / "r1.json").write_text("{}", encoding="utf-8")
+    (alt / "delete" / "r2.json").write_text("{}", encoding="utf-8")
+    (alt / "result" / "r0.json").write_text("{}", encoding="utf-8")
+    assert not list((paths.QUEUE_ROOT / "delete").glob("*.json")), "既定側にも置いてしまった"
+
+    inbox = tmp_path / "inbox"
+    inbox.mkdir(exist_ok=True)
+    staging = tmp_path / "data" / "staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    cfg = make_config(
+        {
+            "database": {"path": str(db_path)},
+            "import": {"inbox_root": str(inbox), "staging_root": str(staging)},
+            "cleanup": {"queue_root": str(alt)},
+        }
+    )
+
+    assert row_value(text(cfg, state_root), "Delete queue") == "2 requested, 1 awaiting result"
 
 
 # --- DB が無い / 壊れている ---------------------------------------------

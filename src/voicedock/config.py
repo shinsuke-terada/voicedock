@@ -41,8 +41,13 @@ CONFIG_PATH_ENV: Final = "VOICEDOCK_CONFIG"
 NO_RULE: Final = "-"
 """§7.3 に規則が無い設定エラー（キー欠落・型違い）を表す規則 ID。"""
 
-TEMPLATE_PLACEHOLDERS: Final = frozenset({"yyyymmdd", "date", "time", "part"})
-"""V-13 が許すプレースホルダ。`{title}` は含めない（V-14 が別に扱う）。"""
+TEMPLATE_PLACEHOLDERS: Final = frozenset({"yyyymmdd", "date", "time"})
+"""V-13 が許すプレースホルダ。`{title}` は含めない（V-14 が別に扱う）。
+
+**`{part}` は v5.48 で外した**（変更 BJ-1）。`obsidian.raw.granularity: part` 用
+だったが、その設定ごと廃止した。**空文字へ展開する実装が残っていると、
+`{date} raw {part}` が末尾に空白の付いた 1 本のノートを作る。**
+"""
 
 _PLACEHOLDER = re.compile(r"\{([^}]*)\}")
 
@@ -111,7 +116,6 @@ RULES: Final[tuple[Rule, ...]] = (
     Rule("V-12", "obsidian.wiki.folder_template", _IV),
     Rule("V-13", "obsidian.raw.folder_template", _IV),
     Rule("V-14", "obsidian.wiki.filename_template", _IV),
-    Rule("V-15", "obsidian.raw.granularity", _IV),
     Rule("V-16", "obsidian.max_title_bytes", _IV),
     Rule("V-17", "llm.analysis.order", _IV),
     Rule("V-18", "llm.analysis.sections.summary.enabled", _IV),
@@ -123,12 +127,12 @@ RULES: Final[tuple[Rule, ...]] = (
     Rule("V-24", "transcription.executable", ErrorCode.WHISPER_EXEC_MISSING),
     Rule("V-25", "transcription.vad.model", ErrorCode.WHISPER_MODEL_MISSING),
     Rule("V-26", "cleanup.delete_source_audio", _IV),
-    Rule("V-27", "obsidian.raw.filename_template", _IV),
     Rule("V-29", "import.inbox_retain", _IV),
     Rule("V-30", "cleanup.delete_source_audio", ErrorCode.CONFIG_LOCK_MISMATCH),
     Rule("V-31", "import.helper_heartbeat_max_age_seconds", _IV),
     Rule("V-32", "timezone", _IV),
     Rule("V-33", "cleanup.delete_source_audio", ErrorCode.CONFIG_LOCK_MISMATCH),
+    Rule("V-34", "obsidian.wiki.link_raw", _IV),
 )
 
 RULE_BY_ID: Final[Mapping[str, Rule]] = {r.id: r for r in RULES}
@@ -143,7 +147,6 @@ _RULE_BY_LOCATION: Final[Mapping[tuple[str | int, ...], str]] = {
     ("device", "poll_interval_seconds"): "V-4",
     ("session", "group_by"): "V-7",
     ("session", "block_gap_seconds"): "V-8",
-    ("obsidian", "raw", "granularity"): "V-15",
     ("obsidian", "max_title_bytes"): "V-16",
     ("cleanup", "retain_transcript_days"): "V-21",
     ("import", "inbox_retain"): "V-29",
@@ -304,21 +307,26 @@ class LlmConfig(_Section):
 
 
 class RawConfig(_Section):
+    """Raw ノートの出力設定（§13.3）。
+
+    **`granularity` は v5.48 で廃止した**（変更 BJ-1）。`day` / `part` を受理して
+    V-15 / V-27 で検証までしていたが、**`part` を選んでも `pipeline.ensure_raw_note()` は
+    day 単位の書き手しか呼ばなかった** —— 全 Part が 1 本のノートに入り、
+    `{part}` は空文字に展開されて**設定が黙って無視された。**
+
+    **実装しなかったのは、`sessions.raw_output_path` が単数の列だからである。**
+    Part ごとに書くには Part 単位の保存先を持ち、**§14.1 の削除根拠（この系で
+    最も危険な場所）を Part 単位へ書き換える**必要がある。V-15 / V-27 は**欠番**にした。
+    """
+
     folder_template: str
-    granularity: Literal["day", "part"]  # V-15
     filename_template: str
     timestamp_interval_seconds: int
     part_boundary_heading: bool
 
     @model_validator(mode="after")
     def _check(self) -> RawConfig:
-        key = "obsidian.raw.filename_template"
-        _check_placeholders(key, self.filename_template)  # V-13
-        if self.granularity == "part" and "{part}" not in self.filename_template:
-            raise ValueError(
-                f"V-27: {key}: granularity が part のときは {{part}} を含むこと"
-                "（含まないと Part ごとのファイルが同名衝突する）"
-            )
+        _check_placeholders("obsidian.raw.filename_template", self.filename_template)  # V-13
         return self
 
 
@@ -345,6 +353,11 @@ class WikiConfig(_Section):
                 f"V-14: {key}: {{title}} を含んではならない（再生成のたびにファイルが増殖する）"
             )
         _check_placeholders(key, self.filename_template)  # V-13
+        if not self.include_transcript and not self.link_raw:
+            raise ValueError(
+                "V-34: obsidian.wiki.link_raw: include_transcript が false なら true にすること"
+                "（Daily ノートに本文もリンクも残らず、§13.7 W-9 が永久に満たせない）"
+            )
         return self
 
 

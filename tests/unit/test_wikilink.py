@@ -410,7 +410,12 @@ def test_raw_notes_are_linked(cfg: Config) -> None:
 
 
 def test_link_raw_false(make_config: Callable[..., Config]) -> None:
-    cfg = make_config({"obsidian": {"wiki": {"link_raw": False}}})
+    """**`include_transcript: true` と組にする**（V-34 / 変更 BJ-2）。
+
+    両方 false は起動時に弾かれる —— Daily ノートに本文もリンクも残らず、
+    **§13.7 W-9 が永久に満たせない**からである。
+    """
+    cfg = make_config({"obsidian": {"wiki": {"link_raw": False, "include_transcript": True}}})
     assert plan(cfg, raw_names=("2026-09-12 raw",)).raw == ()
 
 

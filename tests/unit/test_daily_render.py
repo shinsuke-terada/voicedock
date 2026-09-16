@@ -18,8 +18,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from tests.helpers import example_document, merge
 from voicedock import daily, notes, wiki
-from voicedock.config import Config
+from voicedock.config import Config, parse_config
 from voicedock.daily import TimelineBlock, build_timeline, render_daily_note
 from voicedock.errors import ErrorCode
 from voicedock.llm import Chunk, build_schema
@@ -572,3 +573,31 @@ def test_saving_a_timeline_never_raises(tmp_path: Path) -> None:
     blocked = tmp_path / "sub" / "abc.json"
     (tmp_path / "sub").write_text("not a directory", encoding="utf-8")
     daily.save_timeline(blocked, [], fingerprint=FINGERPRINT)  # 例外を投げない
+
+
+def test_w9_is_satisfiable_under_every_accepted_config() -> None:
+    """**W-9 が満たせない設定を受理しない**（V-34 / 変更 BJ-2）。
+
+    `write_daily_note()` は `require_raw_link=not include_transcript` で検証する。
+    一方 `wiki.plan_links()` は **`link_raw` が偽なら Raw へのリンクを 1 本も作らない。**
+
+    つまり `include_transcript: false`（既定）＋ `link_raw: false` では、
+    ノートに `[[...]]` が 1 つも現れず、**W-9 が構造的に満たせない** ——
+    `ensure_daily_note()` は毎回 `OBSIDIAN_VERIFY_FAILED` で落ち、
+    **その日の Daily ノートは二度と `SAVED` にならない。**
+
+    v5.47 まで V 規則が 1 つも無く、**この設定は起動時に通っていた。**
+    """
+    document = merge(example_document(), {"obsidian": {"wiki": {"link_raw": False}}})
+    parsed, violations = parse_config(document)
+
+    assert parsed is None, "W-9 を満たせない設定が受理された"
+    assert [v.rule for v in violations] == ["V-34"], violations
+
+    # **対照**: 全文を埋め込むなら W-9 は要求されないので、`link_raw: false` は通る
+    both = merge(
+        example_document(),
+        {"obsidian": {"wiki": {"link_raw": False, "include_transcript": True}}},
+    )
+    parsed_both, violations_both = parse_config(both)
+    assert parsed_both is not None, violations_both

@@ -1,9 +1,0 @@
-# SPEC §7.3 V-27 の違反。config.example.yaml へ patch を深くマージして使う。
-# filename_template は "{date} raw" のままで {part} を含まない
-rule: V-27
-code: CONFIG_INVALID_VALUE
-key: obsidian.raw.filename_template
-patch:
-  obsidian:
-    raw:
-      granularity: part
