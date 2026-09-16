@@ -10,7 +10,7 @@
 # **`elapsed_s` / `rtf` / `speech_ratio` / `chars` / `chunks` は両形式とも引用されない数値**
 # なので、`"key":` を `key=` へ正規化すれば同じ抽出で足りる。
 #
-# **8 時間判定は「測った音声の長さ」を基準に外挿する。**
+# **処理時間の判定は「測った音声の長さ」を基準に外挿する。**
 #
 # 平均 `rtf` からの換算は Part 長のばらつきを潰す。かといって **Part 数で外挿するのも誤る** —
 # 26 秒の録音 2 本で測ると「1 Part = 13 秒」として 32 倍し、**0.25 時間で PASS と答える**
@@ -34,7 +34,7 @@ set -euo pipefail
 # 印で拾うのは、**この道具の方針にすぎない定数（下の MIN_COVERAGE_PERCENT など）を
 # 巻き込まないため**である。
 DAY_HOURS=16          # SPEC §21.2 Phase 2「1 日分（16 時間）」
-LIMIT_HOURS=8         # SPEC §21.2 Phase 2「8 時間以内に処理しきる」
+LIMIT_HOURS=24        # SPEC §21.2 Phase 2「24 時間以内に処理しきる」（= 次の接続まで）
 DAY_PARTS=32          # SPEC §20.3 E2E-06「16 時間・32 Part 相当」
 DAY_CHUNKS=18         # SPEC §21.2 Phase 3「約 18 チャンク」
 LIMIT_MINUTES=30      # SPEC §21.2 Phase 3「30 分以内」
@@ -56,7 +56,7 @@ perf-report.sh — Phase 2 / Phase 3 の受け入れ条件を判定する（SPEC
 
   docker compose logs voicedock | ./scripts/perf-report.sh [--asr|--llm]
 
-  --asr   文字起こしだけ（§21.2 Phase 2。8 時間）
+  --asr   文字起こしだけ（§21.2 Phase 2。24 時間）
   --llm   LLM だけ（§21.2 Phase 3。30 分）
 
 終了コード: 0=達成 / 6=未達 / 7=対象のログが無い / 8=判定に足るデータが無い

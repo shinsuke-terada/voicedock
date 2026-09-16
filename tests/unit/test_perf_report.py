@@ -30,12 +30,15 @@ EXIT_INSUFFICIENT = 8
 DAY_SECONDS = 16 * 3600
 """1 日分の音声（§21.2 Phase 2）。判定に足るかの分母になる。"""
 
+_LIMIT_RATIO = spec_phase_acceptance()["LIMIT_HOURS"] / spec_phase_acceptance()["DAY_HOURS"]
+"""判定の境界（音声長あたりの所要）。**SPEC から引く** —— 直書きすると一緒に動かない。"""
+
 
 def sample(*, audio_s: float, ratio: float, parts: int = 1) -> str:
     """合計 `audio_s` 秒の音声を `parts` 本に分け、処理時間を `audio × ratio` にしたログ。
 
     **`ratio` がそのまま判定になる** — 1 日分への外挿は
-    `elapsed 合計 / 音声合計 × 16 時間` なので、`ratio <= 0.5` が 8 時間以内である。
+    `elapsed 合計 / 音声合計 × 16 時間` なので、`ratio <= _LIMIT_RATIO` が上限以内である。
     """
     each = audio_s / parts
     return "\n".join(
@@ -122,7 +125,7 @@ def test_a_fast_run_passes() -> None:
 
 
 def test_a_slow_run_fails() -> None:
-    result = run(sample(audio_s=DAY_SECONDS * 0.5, ratio=1.2, parts=16), "--asr")
+    result = run(sample(audio_s=DAY_SECONDS * 0.5, ratio=_LIMIT_RATIO * 1.5, parts=16), "--asr")
     assert result.returncode == EXIT_BELOW_TARGET
     assert "✗ **FAIL**" in result.stdout
 
@@ -162,17 +165,18 @@ def test_the_measured_audio_length_is_shown() -> None:
     assert "50.00%" in result.stdout, result.stdout
 
 
-@pytest.mark.parametrize(
-    ("ratio", "expected"),
-    [(0.49, 0), (0.51, EXIT_BELOW_TARGET)],
-)
-def test_the_eight_hour_boundary_flips(ratio: float, expected: int) -> None:
+@pytest.mark.parametrize("over", [False, True])
+def test_the_processing_limit_boundary_flips(over: bool) -> None:
     """**境界のすぐ上と下で反転すること。**
 
-    1 日分 16 時間を 8 時間で処理する ＝ **音声長あたり 0.5**。
+    1 日分 16 時間を `LIMIT_HOURS` で処理する ＝ **音声長あたり `LIMIT_HOURS / 16`**。
+
+    **数字を書かずに SPEC から引く**（変更 BL-1）。v5.49 まで `0.49` / `0.51` と
+    書いてあり、**「8 時間以内」を 24 時間へ改めたときに一緒に動かなかった。**
     """
+    ratio = _LIMIT_RATIO * (1.02 if over else 0.98)
     result = run(sample(audio_s=DAY_SECONDS * 0.2, ratio=ratio, parts=8), "--asr")
-    assert result.returncode == expected, result.stdout
+    assert result.returncode == (EXIT_BELOW_TARGET if over else 0), result.stdout
 
 
 def test_the_judgement_does_not_use_the_part_count() -> None:
