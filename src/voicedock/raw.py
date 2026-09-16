@@ -35,6 +35,14 @@ NOTE_TYPE: Final = "voice-raw"
 SOURCE_LABEL: Final = "DJI Mic 3"
 SUFFIX: Final = ".md"
 
+SEGMENT_JOIN: Final = " "
+"""セグメントを連結する区切り（§13.3）。
+
+**半角スペース 1 つ。**whisper のセグメントは句読点で終わらないことがあり
+（`…走ってたんですけど` / `そっちは止まって`）、**空文字で詰めると語の切れ目が消えて
+読めなくなる。**日本語では半角スペース 1 つは視覚的に軽く、句点で終わる並びでも邪魔にならない。
+"""
+
 _INTRO: Final = "> 自動文字起こしの生データ。未編集。"
 
 
@@ -181,17 +189,32 @@ def _render_segments(part: RawPart, interval_seconds: int) -> list[str]:
 
     **`0` で見出しを入れない**（§13.3）。終日録音では「録音開始からの経過秒」より
     実時刻のほうが振り返りに使えるため、**絶対時刻**を使う。
+
+    **見出しごとに 1 段落にまとめる**（v5.50→v5.51 の変更 BM-1）。v5.50 までは
+    `lines += [text, ""]` で**セグメント 1 つごとに空行**を入れていた。whisper は
+    発話の切れ目で切るので、**1 発話 = 1 段落**になり、読むときに文脈が切れる
+    （§13.3 の例は見出しの下に 1 段落である）。
+
+    **セグメント境界は失われない。**`/data/transcripts/parts/*.json` に
+    `retain_transcript_days: 0`（無期限）で残る（§14.1 の 2 つ目のコピー）。
+    **Raw ノートが持つ必要は無い。**
     """
     lines: list[str] = []
+    chunk: list[str] = []
     next_mark: datetime | None = None
     for segment in part.segments:
         text = segment.text.strip()
         if not text:
             continue
         if interval_seconds > 0 and (next_mark is None or segment.at >= next_mark):
+            if chunk:
+                lines += [SEGMENT_JOIN.join(chunk), ""]
+                chunk = []
             lines += [f"{HEADING_TIMESTAMP} {segment.at.strftime('%H:%M:%S')}", ""]
             next_mark = segment.at + timedelta(seconds=interval_seconds)
-        lines += [text, ""]
+        chunk.append(text)
+    if chunk:
+        lines += [SEGMENT_JOIN.join(chunk), ""]
     return lines
 
 
