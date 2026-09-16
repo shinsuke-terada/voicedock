@@ -908,3 +908,105 @@ def test_the_tick_evaluates_deletions(
     worker.tick()
 
     assert called == ["yes"], "tick() が evaluate_deletions を呼んでいない"
+
+
+# --- 生成経路と時刻（v5.48→v5.49 の変更 BK-1〜BK-3） --------------------
+
+
+def test_the_pipeline_gets_the_workers_state_root(
+    database: Database, cfg: Config, logger: tuple[Logger, io.StringIO], alive: Path
+) -> None:
+    """**`state_root` を `Pipeline` へ渡す**（変更 BK-1）。
+
+    v5.48 まで 3 か所で組み立てており、**1 つも渡していなかった。**`Worker` が
+    `/alt/state` を見ていても `Pipeline` は既定の `/state` を読むので、
+    **同じ周回の中で 2 つが別のデバイス視界を持つ** ——
+    `delete_sources_if_safe()` は `inventory` を読めず、**書き込み可能なデバイスを
+    読み取り専用と判断して削除を黙って見送る。**
+    """
+    runner = build(database, cfg, logger, alive)
+    assert runner._pipeline().state_root == alive
+
+
+def test_the_pipeline_is_not_given_a_frozen_clock_in_production(
+    database: Database, cfg: Config, logger: tuple[Logger, io.StringIO], alive: Path
+) -> None:
+    """**本番では `now` を固定しない**（変更 BK-2）。
+
+    v5.48 は周回の先頭で `self.now()` を固定して渡していた。**32 Part の日は tick が
+    数時間走る**（whisper が 1 本 30 分）ので、最後の Part の `updated_at` が
+    **数時間前の時刻**になる。`Pipeline._moment()` も同じ値を返すため
+    `_expire_delete_requests()` の経過時間が実際より短く出る一方、
+    `deletable_session_keys()` は `self.now()` を呼び直していて、
+    **両者が tick の長さぶん食い違っていた。**
+
+    `clock` はテストの注入口である。**注入されていなければ渡さない。**
+    """
+    production = Worker(
+        cfg=cfg,
+        log=logger[0],
+        database=database,
+        state_root=alive,
+        sleep=lambda _seconds: None,
+    )
+    assert production.clock is None
+    assert production._pipeline().now is None, "本番の時刻を周回の先頭で固定した"
+
+    # **対照**: 注入されていれば固定する（テストが再現可能であること）
+    assert build(database, cfg, logger, alive)._pipeline().now == NOW
+
+
+def test_the_vault_index_is_kept_across_ticks(
+    database: Database, cfg: Config, logger: tuple[Logger, io.StringIO], alive: Path
+) -> None:
+    """**索引を周回をまたいで持つ**（変更 BK-3）。
+
+    v5.48 は `_plan_links()` が `wiki.index_for()` を `cached=` 無しで呼んでいたので、
+    **`obsidian.wiki.vault_index_cache_seconds`（既定 300 秒）が一度も効かず、
+    Daily ノートを書くたびに Vault 全体を `scandir` で走査していた** ——
+    1 万ノートの Vault で、再オープンを含めると 1 日 32 回になる（§10.7）。
+
+    `Pipeline` は tick ごとに作り直される dataclass なので、**保持する者は `Worker` である。**
+
+    **同一性で見る。**`cached=` を渡していなければ `index_for()` は毎回
+    `build_index()` の**新しいオブジェクト**を返すので、`is` が偽になる。
+    """
+    runner = build(database, cfg, logger, alive)
+    assert cfg.obsidian.wiki.link_tags, "link_tags: false だと索引そのものを作らない"
+
+    runner.refresh_vault_index()
+    first = runner.vault_index
+    assert first is not None, "索引を作っていない"
+
+    runner.refresh_vault_index()
+
+    assert runner.vault_index is first, "TTL 内なのに作り直した"
+    assert runner._pipeline().vault_index is first, "Pipeline へ渡していない"
+
+
+def test_a_stale_vault_index_is_rebuilt(
+    database: Database,
+    make_config: Callable[..., Config],
+    logger: tuple[Logger, io.StringIO],
+    alive: Path,
+    tmp_path: Path,
+    db_path: Path,
+) -> None:
+    """**TTL を過ぎたら作り直す**（変更 BK-3）。**キャッシュが固まらないこと。**"""
+    inbox = tmp_path / "inbox"
+    inbox.mkdir(exist_ok=True)
+    cfg = make_config(
+        {
+            "database": {"path": str(db_path)},
+            "import": {"inbox_root": str(inbox)},
+            "obsidian": {"wiki": {"vault_index_cache_seconds": 0}},
+        }
+    )
+    runner = build(database, cfg, logger, alive)
+
+    runner.refresh_vault_index()
+    first = runner.vault_index
+    runner.refresh_vault_index()
+
+    assert first is not None
+    assert runner.vault_index is not first, "TTL 0 なのに作り直していない"
