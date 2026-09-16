@@ -137,7 +137,6 @@ obsidian:
   # 文字起こし生データ
   raw:
     folder_template: "Daily/Voice/Raw/{yyyymmdd}"
-    granularity: day             # day | part
     filename_template: "{date} raw"
     timestamp_interval_seconds: 300   # 0 で見出しを入れない
     part_boundary_heading: true

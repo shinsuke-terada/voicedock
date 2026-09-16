@@ -25,7 +25,6 @@ from voicedock.raw import (
     render_raw_note,
     render_template,
     write_raw_note,
-    write_raw_notes_per_part,
 )
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -271,8 +270,14 @@ def test_template_placeholders(template: str, expected: str) -> None:
     assert render_template(template, DAY) == expected
 
 
-def test_part_placeholder() -> None:
-    assert render_template("{date} raw {part}", DAY, part="071204") == "2026-08-29 raw 071204"
+def test_an_unknown_placeholder_is_left_alone(tmp_path: Path) -> None:
+    """**`render_template()` は埋めるだけである。**未知のものは V-13 が起動時に弾く。
+
+    `{part}` は v5.48 で許可リストから外した（変更 BJ-1）。
+    **空文字へ展開する実装を残さない** —— 残すと `{date} raw {part}` が
+    「末尾に空白の付いた 1 本のノート」を静かに作る。
+    """
+    assert render_template("{date} raw {part}", DAY) == "2026-08-29 raw {part}"
 
 
 def test_folder_follows_the_spec_layout(tmp_path: Path) -> None:
@@ -395,52 +400,29 @@ def test_written_note_is_verifiable_by_cleaner(tmp_path: Path) -> None:
     assert notes.all_passed(again), "R-6 は包含なので 1 件でも通る"
 
 
-# --- granularity: part（§13.3 / V-27） ---------------------------------
+# --- granularity は v5.48 で廃止（変更 BJ-1） ---------------------------
 
 
-def test_per_part_writes_one_file_each(tmp_path: Path) -> None:
-    results = write_raw_notes_per_part(
-        [part_a(), part_b()],
-        day=DAY,
-        session_key=SESSION_KEY,
-        cfg=raw_config(granularity="part", filename_template="{date} raw {part}"),
-        vault_root=tmp_path,
-        max_title_bytes=MAX_BYTES,
-    )
-    assert len(results) == 2
-    names = sorted(Path(r.path).name for r in results)
-    assert names == ["2026-08-29 raw 071204.md", "2026-08-29 raw 074210.md"]
-    for result in results:
-        assert result.ok, result.failed_rules
+def test_the_part_placeholder_is_rejected(tmp_path: Path) -> None:
+    """**`{part}` は未知のプレースホルダである**（V-13 / 変更 BJ-1）。
 
+    v5.47 まで `granularity: part` 用に受理していたが、
+    **`pipeline.ensure_raw_note()` は Part ごとの書き手を一度も呼んでいなかった。**
+    設定は V-15 / V-27 で検証までされたうえで**黙って無視され**、
+    `{part}` は空文字に展開されて**末尾に空白の付いた 1 本のノート**になっていた。
 
-def test_per_part_files_do_not_collide(tmp_path: Path) -> None:
-    """**ファイル名が衝突しない**（V-27 が `{part}` を必須にする理由）。
-
-    衝突すると `resolve_output_path` が ` (2)` を付けるか上書きし、
-    **最後の 1 本だけが残る。**
+    設定ごと廃止したので、`{part}` を書いたら**起動時に落ちる。**
     """
-    results = write_raw_notes_per_part(
-        [part_a(), part_b()],
-        day=DAY,
-        session_key=SESSION_KEY,
-        cfg=raw_config(granularity="part", filename_template="{date} raw {part}"),
-        vault_root=tmp_path,
-        max_title_bytes=MAX_BYTES,
-    )
-    assert len({Path(r.path) for r in results}) == 2
-    assert not any("(2)" in Path(r.path).name for r in results)
+    patch = {"obsidian": {"raw": {"filename_template": "{date} raw {part}"}}}
+    document = merge(example_document(), patch)
+    cfg, violations = parse_config(document)
+    assert cfg is None, "{part} が通ってしまった"
+    assert any(v.rule == "V-13" for v in violations), violations
 
 
-def test_per_part_note_lists_only_its_own_key(tmp_path: Path) -> None:
-    """Part ごとのノートには**その Part の鍵だけ**が載る（§14.1 の判定に効く）。"""
-    results = write_raw_notes_per_part(
-        [part_a(), part_b()],
-        day=DAY,
-        session_key=SESSION_KEY,
-        cfg=raw_config(granularity="part", filename_template="{date} raw {part}"),
-        vault_root=tmp_path,
-        max_title_bytes=MAX_BYTES,
-    )
-    keys = [notes.frontmatter_keys(Path(r.path)) for r in results]
-    assert sorted(keys) == [(KEY_A,), (KEY_B,)]
+def test_granularity_is_no_longer_a_key(tmp_path: Path) -> None:
+    """**設定キーごと消えている**（V-1 が未知キーを弾く。変更 BJ-1）。"""
+    document = merge(example_document(), {"obsidian": {"raw": {"granularity": "part"}}})
+    cfg, violations = parse_config(document)
+    assert cfg is None, "granularity がまだ受理されている"
+    assert any(v.rule == "V-1" for v in violations), violations

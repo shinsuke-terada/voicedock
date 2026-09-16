@@ -86,7 +86,7 @@ class RawNoteResult:
 # --- パスとファイル名（§13.2 / §13.5） ---------------------------------
 
 
-def render_template(template: str, day: date, *, part: str | None = None) -> str:
+def render_template(template: str, day: date) -> str:
     """テンプレートのプレースホルダを埋める（V-13 が許すのは 4 つだけ）。
 
     | プレースホルダ | 値 |
@@ -94,16 +94,18 @@ def render_template(template: str, day: date, *, part: str | None = None) -> str
     | `{yyyymmdd}` | `20260829` |
     | `{date}` | `2026-08-29` |
     | `{time}` | `000000`（Raw は日単位なので固定） |
-    | `{part}` | `granularity: part` のときの Part 識別子 |
 
     **未知のプレースホルダは設定検証（V-13）が起動時に弾く。**ここでは埋めるだけである。
+
+    **`{part}` は v5.48 で廃止した**（変更 BJ-1）。`granularity: part` 用だったが、
+    **その設定は本番から一度も使われていなかった。**空文字に展開する実装が残っていると、
+    `{date} raw {part}` のようなテンプレートが**末尾に空白の付いた 1 本のノート**を作る。
     """
-    filled = (
+    return (
         template.replace("{yyyymmdd}", day.strftime("%Y%m%d"))
         .replace("{date}", day.isoformat())
         .replace("{time}", "000000")
     )
-    return filled.replace("{part}", part or "")
 
 
 def raw_folder(vault_root: Path, cfg: RawConfig, day: date) -> VaultPath:
@@ -114,15 +116,9 @@ def raw_folder(vault_root: Path, cfg: RawConfig, day: date) -> VaultPath:
     return VaultPath(vault_root / render_template(cfg.folder_template, day))
 
 
-def raw_filename(cfg: RawConfig, day: date, *, part: str | None = None, max_bytes: int) -> str:
-    """`.md` を除いたファイル名。**sanitize を必ず通す**（§13.5）。
-
-    `granularity: part` のときは `{part}` が必須である（V-27）。含まないと
-    **Part ごとのファイルが同名衝突して上書きし合う。**
-    """
-    return notes.sanitize_filename(
-        render_template(cfg.filename_template, day, part=part), max_bytes=max_bytes
-    )
+def raw_filename(cfg: RawConfig, day: date, *, max_bytes: int) -> str:
+    """`.md` を除いたファイル名。**sanitize を必ず通す**（§13.5）。"""
+    return notes.sanitize_filename(render_template(cfg.filename_template, day), max_bytes=max_bytes)
 
 
 # --- レンダリング（§13.3） ---------------------------------------------
@@ -210,7 +206,6 @@ def write_raw_note(
     cfg: RawConfig,
     vault_root: Path,
     max_title_bytes: int,
-    part_label: str | None = None,
 ) -> RawNoteResult:
     """レンダリング → atomic write → 保存検証（§13.6 手順 1〜7）。
 
@@ -225,7 +220,7 @@ def write_raw_note(
     folder = raw_folder(vault_root, cfg, day)
     Path(folder).mkdir(parents=True, exist_ok=True)
 
-    basename = raw_filename(cfg, day, part=part_label, max_bytes=max_title_bytes)
+    basename = raw_filename(cfg, day, max_bytes=max_title_bytes)
     path = notes.resolve_output_path(folder, basename, session_key)
 
     content = render_raw_note(parts, day=day, session_key=session_key, cfg=cfg).encode("utf-8")
@@ -241,42 +236,12 @@ def write_raw_note(
     return RawNoteResult(path=path, sha256=sha256, verification=verification)
 
 
-def write_raw_notes_per_part(
-    parts: Sequence[RawPart],
-    *,
-    day: date,
-    session_key: str,
-    cfg: RawConfig,
-    vault_root: Path,
-    max_title_bytes: int,
-) -> list[RawNoteResult]:
-    """`granularity: part` のとき、Part ごとに 1 ファイルを書く（§13.3）。
-
-    **ファイル名に `{part}` が要る**（V-27）。含まないと全 Part が同名になり、
-    **最後の 1 本だけが残る。**設定検証が起動時に弾くので、ここでは信頼してよい。
-
-    1 年で 11,680 枚になり、Obsidian の検索・起動・同期と §13.8 の Vault インデックス
-    構築が重くなる（§13.2）。**既定は `day` である。**
-    """
-    return [
-        write_raw_note(
-            [part],
-            day=day,
-            session_key=session_key,
-            cfg=cfg,
-            vault_root=vault_root,
-            max_title_bytes=max_title_bytes,
-            part_label=_part_label(part),
-        )
-        for part in sorted(parts, key=lambda p: (p.started_at, p.partkey))
-    ]
-
-
-def _part_label(part: RawPart) -> str:
-    """ファイル名に入れる Part 識別子。
-
-    **`partkey` をそのまま使わない。**`/` を含むのでパスが割れる（sanitize が `-` へ
-    置換するが、70 文字になりファイル名として読めない）。開始時刻で十分に一意である
-    （同じ Session 内で同じ秒に始まる Part は物理的に存在しない）。
-    """
-    return part.started_at.strftime("%H%M%S")
+# **`write_raw_notes_per_part()` と `_part_label()` は v5.48 で削除した**（変更 BJ-1）。
+#
+# `obsidian.raw.granularity: part` 用だったが、**`pipeline.ensure_raw_note()` は
+# 一度も呼んでいなかった** —— 設定は受理され、V-15 / V-27 で検証までされたうえで
+# **黙って無視されていた。**参照はテストからだけだった。
+#
+# **実装せずに消したのは、`sessions.raw_output_path` が単数の列だからである。**
+# Part ごとに書くには Part 単位の保存先を持ち、**§14.1 の削除根拠（この系で最も
+# 危険な場所）を Part 単位へ書き換える**必要がある。欲しくなったら、その作業と一緒に戻す。
