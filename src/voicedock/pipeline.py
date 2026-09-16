@@ -239,6 +239,16 @@ class Pipeline:
     state_root: Path = DEFAULT_STATE_ROOT
     """`/state`（Helper の報告）。**§14.1 のロック 2-B を読むのに要る**（§7.5）。"""
 
+    helper_fresh: bool = True
+    """Helper のハートビートが新しいか（§10.0 / v5.45→v5.46 の変更 BH-4）。
+
+    **偽のとき新しい削除要求を書かない。**`inventory.json` も同じだけ古く、
+    **「デバイスに在る」と言っている根拠が無い**（§7.5 の「不明は安全側」）。
+
+    **結果の回収は行う。**あれは既に出した要求の決着であり、
+    古い `inventory` でも `_expire_delete_requests()` が歯止めになる。
+    """
+
     # --- §11.3 の本体 ----------------------------------------------------
 
     def process_part(self, partkey: PartKey) -> PartOutcome:
@@ -647,6 +657,11 @@ class Pipeline:
         just_pending = self.collect_delete_results(parts, inventory)
         parts = self.database.recordings_for_session(session_key)
 
+        if not self.helper_fresh:
+            # **Helper が止まっている**（変更 BH-4）。`inventory` も同じだけ古く、
+            # **デバイスに在ると言っている根拠が無い**（§7.5）。結果の回収は済ませた
+            return 0
+
         if not self.cfg.cleanup.delete_source_audio:
             # **安全ロック 1 が掛かっている**（§14.2）。要求を 1 件も書かない
             return 0
@@ -680,6 +695,13 @@ class Pipeline:
             )
             if request is None:
                 continue
+            # **要求 ID を先に記録する**（v5.45→v5.46 の変更 BH-1）。`SOURCE_DELETING` に
+            # 入ってから書くと、**その間に届いた結果を「別の試行のもの」として捨てる。**
+            # 照合先が DB なのは、`queue/delete/` を **reaper が処理した瞬間に消す**
+            # ためである（キューはコンテナの台帳ではない）
+            self.database.update_recording(
+                PartKey(part.partkey), delete_request_id=request.request_id, now=self.now
+            )
             try:
                 # **遷移元は `part.status` である**（v5.41→v5.42 の変更 BD-2）。
                 # `RAW_SAVED` の決め打ちだと、§9.3 が正規の辺として定義している
@@ -791,10 +813,14 @@ class Pipeline:
                 # `status` の `awaiting result` が実態と食い違い、ファイルも溜まり続ける
                 cleaner.discard_result(result, cfg=self.cfg)
                 continue
-            if result.request_id != cleaner.outstanding_request_id(part.partkey, cfg=self.cfg):
-                # **古い試行の結果である**（変更 BG-2）。`partkey` だけで照合すると、
-                # **`DELETED` の古い結果が新しい要求に適用されうる** ——
-                # まだ消えていないものを「消えた」と判定する側の誤りである
+            if result.request_id != part.delete_request_id:
+                # **古い試行の結果である**（変更 BG-2 / 直し BH-1）。`partkey` だけで
+                # 照合すると、**`DELETED` の古い結果が新しい要求に適用されうる** ——
+                # まだ消えていないものを「消えた」と判定する側の誤りである。
+                #
+                # **`queue/delete/` は見ない**（v5.46）。あそこは **reaper が所有し、
+                # 処理した瞬間に消す**ので、結果が届くとき要求は必ず 0 件だった ——
+                # v5.45 はそれを走査していたため、**すべての結果を捨てていた。**
                 cleaner.discard_result(result, cfg=self.cfg)
                 continue
             if result.deleted and cleaner.inventory_is_newer(inventory, result) is False:
@@ -812,6 +838,9 @@ class Pipeline:
                 self.database.update_recording(
                     PartKey(part.partkey),
                     source_deleted_at=self._moment().isoformat(timespec="seconds"),
+                    # **決着した要求 ID は外す**（変更 BH-1）。残すと、あとから届いた
+                    # 同 ID の結果が次の試行の判定に使われうる
+                    delete_request_id=None,
                     now=self.now,
                 )
                 self._transition(
@@ -830,18 +859,34 @@ class Pipeline:
 
         **reaper が存在しない場合もここへ落ちる**（安全ロック 2-A）。§10.12 は
         「**これは正常な状態である**（Phase 7 前）」と規定している。
+
+        **`parts` は `collect_delete_results()` が受け取ったままの snapshot である**
+        （v5.45→v5.46 の変更 BH-2）。同じ周回で `COMPLETED` / `SOURCE_DELETE_PENDING` へ
+        動かした Part が、そこには **`SOURCE_DELETING` のまま残っている。**
+        **もう持っていない状態から遷移させると `TransitionConflict` が飛び、
+        捕まえる者が居ないので常駐サービスが死ぬ。**だから**鍵だけ使って読み直す。**
+
+        **読み直しだけでは足りない。**読んだ直後にも変わりうるので例外も捕まえる。
         """
         limit = self.cfg.cleanup.delete_result_timeout_seconds
         moment = self._moment()
         expired = 0
-        for part in parts:
-            if part.status != PartStatus.SOURCE_DELETING:
+        for stale in parts:
+            part = self.database.get_recording(PartKey(stale.partkey))
+            if part is None or part.status != PartStatus.SOURCE_DELETING:
                 continue
             age = (moment - datetime.fromisoformat(part.updated_at)).total_seconds()
             if age < limit:
                 continue
             cleaner.withdraw_request(part.partkey, cfg=self.cfg)
-            self._delete_pending(part, ErrorCode.DELETE_TIMEOUT, "no_result")
+            # **結果も取り下げる**（変更 BH-2）。`SOURCE_DELETING` を抜ける経路のうち
+            # **ここだけが結果を消していなかった** —— 残すと、次の試行で届く前に
+            # 古い結果が読まれうる
+            cleaner.withdraw_result(part.partkey, cfg=self.cfg)
+            try:
+                self._delete_pending(part, ErrorCode.DELETE_TIMEOUT, "no_result")
+            except TransitionConflict:
+                continue
             expired += 1
         return expired
 
@@ -856,6 +901,11 @@ class Pipeline:
             detail=reason,
             now=self.now,
         )
+        # **要求 ID を外す**（変更 BH-1）。この要求はもう有効でない —— 残すと、
+        # あとから届いた同 ID の結果が**次の試行の判定に使われる。**
+        # **`record_transition()` の後である** —— 逆にすると、遷移が
+        # `TransitionConflict` で落ちたときに列だけ消える
+        self.database.update_recording(PartKey(part.partkey), delete_request_id=None, now=self.now)
         self.log.warning("source_delete_pending", recording_key=part.partkey, reason=reason)
 
     def _moment(self) -> datetime:

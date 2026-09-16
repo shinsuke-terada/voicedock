@@ -1126,13 +1126,22 @@ def test_the_reaper_layer_lives_in_its_own_file() -> None:
 
 
 def write_result(scene: Scene, *, status: str = "DELETED", detail: str = "", **extra: str) -> Path:
-    """reaper が書いた体の結果を置く（§14.1.1 の結果の形式。v5.9→v5.10 の変更 X-1）。"""
+    """reaper が書いた体の結果を置く（§14.1.1 の結果の形式。v5.9→v5.10 の変更 X-1）。
+
+    **要求ファイルを消す。**reaper は結果を書いた**直後に** `rm -f "$file"` する
+    （`voicedock-reaper` の `process_request`）。
+
+    **v5.45 までこの fixture は消していなかった。**そのため「結果が届くとき要求は
+    必ず 0 件」という実機の姿を**一度も再現しておらず**、`queue/delete/` を走査して
+    照合する実装が**すべての結果を捨てていた**欠陥を、どのテストも検出できなかった
+    （v5.45→v5.46 の変更 BH-1）。
+    """
     directory = scene.queue / cleaner.RESULT_DIRNAME
     directory.mkdir(parents=True, exist_ok=True)
-    # **いま出ている要求の `request_id` を既定にする。**reaper は要求の ID を
-    # そのまま返すので、そのほうが実態に近い。**食い違う結果は捨てられる**（#160）
-    outstanding = cleaner.outstanding_request_id(PARTKEY, cfg=scene.cfg)
-    request_id = extra.pop("request_id", outstanding or "20260913T090000-slug-a1b2c3")
+    # **DB が持つ要求 ID を既定にする。**reaper は要求の ID をそのまま返すので、
+    # そのほうが実態に近い。**食い違う結果は捨てられる**（#160）
+    part = scene.part()
+    request_id = extra.pop("request_id", part.delete_request_id or "20260913T090000-slug-a1b2c3")
     payload = {
         "schema": 1,
         "request_id": request_id,
@@ -1145,6 +1154,9 @@ def write_result(scene: Scene, *, status: str = "DELETED", detail: str = "", **e
     }
     path = directory / f"{request_id}.json"
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # **reaper と同じように要求を消す。**ここを省くと実機の姿にならない（BH-1）
+    for leftover in scene.requests():
+        leftover.unlink()
     return path
 
 
@@ -1354,14 +1366,34 @@ def test_a_result_from_an_older_attempt_is_discarded(scene: Scene) -> None:
     assert scene.part().source_deleted_at is None
 
 
-def test_a_result_without_an_outstanding_request_is_discarded(scene: Scene) -> None:
-    """**要求を取り下げたあとに届いた結果は捨てる**（#160）。
+def test_the_result_is_collected_after_the_reaper_removed_the_request(scene: Scene) -> None:
+    """**reaper が要求を消した後でも結果を回収できること**（変更 BH-1 の回帰試験）。
+
+    v5.45 は `queue/delete/` を走査して「いま出ている要求」を求めていた。
+    **reaper は結果を書いた瞬間に要求を消す**ので、その走査は**必ず空**を返し、
+    **すべての結果が捨てられていた** —— Part は 1 時間後に `DELETE_TIMEOUT` で
+    保留へ落ち、**本当の理由が隠れた。自動削除は 1 件も完了しない。**
+
+    照合先は `recordings.delete_request_id` である。**コンテナの事実はコンテナが持つ。**
+    """
+    write_result(scene)
+    assert scene.requests() == [], "fixture が reaper の姿を再現していない"
+
+    scene.runner.collect_delete_results([scene.part()], gone(scene))
+
+    assert scene.part().status == PartStatus.COMPLETED
+    assert scene.part().source_deleted_at is not None
+    assert scene.part().delete_request_id is None, "決着した要求 ID を外していない"
+
+
+def test_a_result_for_a_withdrawn_request_is_discarded(scene: Scene) -> None:
+    """**取り下げた要求の結果は捨てる**（#160 / 変更 BH-1）。
 
     対応する試行が存在しない。**残すと `awaiting result` が実態と食い違う。**
+    取り下げの印は**キューではなく `delete_request_id` が `None` になること**である。
     """
     result = write_result(scene)
-    for path in scene.requests():
-        path.unlink()
+    scene.set_part(delete_request_id=None)
 
     scene.runner.collect_delete_results([scene.part()], gone(scene))
 
@@ -1393,6 +1425,7 @@ def test_a_missing_result_expires_and_withdraws_the_request(scene: Scene) -> Non
 
     assert scene.part().status == PartStatus.SOURCE_DELETE_PENDING
     assert scene.requests() == [], "古い要求がキューに残っている"
+    assert scene.part().delete_request_id is None, "取り下げた要求 ID が残っている"
 
 
 def test_a_fresh_request_is_not_expired(scene: Scene) -> None:
@@ -1400,3 +1433,148 @@ def test_a_fresh_request_is_not_expired(scene: Scene) -> None:
     assert scene.runner.collect_delete_results([scene.part()], scene.inventory) == set()
     assert scene.part().status == PartStatus.SOURCE_DELETING
     assert len(scene.requests()) == 1
+
+
+def test_expiry_survives_a_change_between_the_read_and_the_transition(
+    scene: Scene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**読み直した直後にも変わりうる**（変更 BH-2 の 2 つ目の歯止め）。
+
+    歯止めは 2 つある。**片方ずつ壊して、それぞれが単独で落ちるようにしてある**
+    （§20.6。多重防御は条件の破損を隠す）。
+
+    | 歯止め | 固定するテスト |
+    |---|---|
+    | DB から読み直す | `test_expiry_reads_the_current_timestamp_not_the_snapshot` |
+    | `TransitionConflict` を捕まえる | **これ** |
+
+    読み直しは競合を**狭める**だけで、無くしはしない —— 読んでから
+    `record_transition()` を撃つまでの窓で別の書き手が commit しうる。
+    **そこで例外が飛ぶと捕まえる者が居らず、常駐サービスが死ぬ**（v5.45 の姿）。
+
+    その窓を `get_recording()` の差し替えで再現する。
+    """
+    stale_row = scene.part()
+    assert stale_row.status == PartStatus.SOURCE_DELETING
+
+    # 実際には別の周回で決着している
+    write_result(scene)
+    scene.runner.collect_delete_results([scene.part()], gone(scene))
+    assert scene.part().status == PartStatus.COMPLETED
+
+    started = datetime.fromisoformat(stale_row.updated_at)
+    later = started + timedelta(seconds=scene.cfg.cleanup.delete_result_timeout_seconds + 1)
+    runner = pipeline.Pipeline(
+        database=scene.database,
+        cfg=scene.cfg,
+        log=Logger(level="DEBUG", fmt="text", stream=scene.log),
+        now=later,
+        state_root=scene.runner.state_root,
+    )
+
+    # **差し替えは `_expire_delete_requests()` のあいだだけにする。**`scene.part()` も
+    # `get_recording()` を通るので、**出しっぱなしにすると最後の検証が自分の偽装を読む**
+    with monkeypatch.context() as patched:
+        # **読み直しが古い行を返す** = 読んだ直後に別の書き手が commit した姿
+        patched.setattr(scene.database, "get_recording", lambda _partkey: stale_row)
+
+        # **例外が飛ばないこと。**v5.45 はここで TransitionConflict を上げた
+        assert runner._expire_delete_requests([stale_row]) == 0
+
+    assert scene.part().status == PartStatus.COMPLETED, "決着を期限切れが上書きした"
+
+
+def test_the_expiry_withdraws_the_result_too(scene: Scene) -> None:
+    """**期限切れで抜けるときは結果も取り下げる**（変更 BH-2）。
+
+    `SOURCE_DELETING` を抜ける経路のうち、**ここだけが結果を消していなかった。**
+    残すと、次の試行の前に古い結果が読まれうる。
+    """
+    result = write_result(scene, status="DELETED")
+    # **結果は在るが、この Part はもう待っていない状態を作る**（照合で捨てられない
+    # ように、要求 ID は合わせたまま inventory を古くして「待つ」側へ倒す）
+    old = datetime.fromisoformat(scene.part().updated_at)
+    later = old.timestamp() + scene.cfg.cleanup.delete_result_timeout_seconds + 1
+    runner = pipeline.Pipeline(
+        database=scene.database,
+        cfg=scene.cfg,
+        log=Logger(level="DEBUG", fmt="text", stream=scene.log),
+        now=datetime.fromtimestamp(later, tz=JST),
+        state_root=scene.runner.state_root,
+    )
+
+    runner.collect_delete_results([scene.part()], stale(scene))
+
+    assert scene.part().status == PartStatus.SOURCE_DELETE_PENDING
+    assert not result.exists(), "取り下げた試行の結果が残っている"
+
+
+def test_a_stale_helper_does_not_write_new_requests(scene: Scene) -> None:
+    """**Helper が止まっているあいだは新しい削除要求を書かない**（変更 BH-4）。
+
+    `request_deletions()` は `process_part()` から `ensure_raw_note()` の直後に
+    呼ばれる（AY-1）。Helper が止まると `inventory.json` も同じだけ古くなり、
+    **「デバイスに在る」と言っている根拠が無い**（§7.5 の「不明は安全側」）。
+
+    **結果の回収は行う。**あれは既に出した要求の決着であり、止める理由が無い。
+    """
+    scene.rearm()
+    runner = pipeline.Pipeline(
+        database=scene.database,
+        cfg=scene.cfg,
+        log=Logger(level="DEBUG", fmt="text", stream=scene.log),
+        now=NOW,
+        state_root=scene.runner.state_root,
+        helper_fresh=False,
+    )
+
+    assert runner.request_deletions(SESSION_KEY) == 0
+    assert scene.requests() == [], "古い inventory で要求を書いた"
+    assert scene.part().status == PartStatus.RAW_SAVED
+
+
+def test_a_fresh_helper_still_writes_requests(scene: Scene) -> None:
+    """**対照。**`helper_fresh` が真なら従来どおり要求を書く。"""
+    scene.rearm()
+    assert scene.runner.request_deletions(SESSION_KEY) == 1
+    assert len(scene.requests()) == 1
+
+
+def test_expiry_reads_the_current_timestamp_not_the_snapshot(scene: Scene) -> None:
+    """**期限切れの判定に古い `updated_at` を使わない**（変更 BH-2 の 1 つ目の歯止め）。
+
+    `collect_delete_results()` が受け取る `parts` は**その周回の頭で読んだ写し**である。
+    tick は 32 Part の日なら数時間走るので（1 本あたり whisper が約 30 分）、
+    **写しの `updated_at` は実際の値から大きく遅れる。**
+
+    そのまま `now - updated_at` を測ると、**まだ期限内の要求を期限切れと判定して
+    `SOURCE_DELETE_PENDING` へ落とす** —— 決着していないものを「諦めた」ことにする側の
+    誤りである。**鍵だけ使って読み直す。**
+
+    例外捕捉（`test_expiry_does_not_crash_on_a_part_that_moved_on_in_the_same_pass`）
+    では止まらない経路であり、**片方ずつ壊して落ちることを確かめてある**（§20.6）。
+    """
+    snapshot = [scene.part()]
+    assert snapshot[0].status == PartStatus.SOURCE_DELETING
+    limit = scene.cfg.cleanup.delete_result_timeout_seconds
+    started = datetime.fromisoformat(snapshot[0].updated_at)
+
+    # **DB 側だけ時計を進める**（別の書き手が触った、あるいは要求が出し直された）。
+    # 写しは古いままである
+    refreshed = started + timedelta(seconds=limit)
+    scene.database.update_recording(PARTKEY, retry_count=0, now=refreshed)
+
+    runner = pipeline.Pipeline(
+        database=scene.database,
+        cfg=scene.cfg,
+        log=Logger(level="DEBUG", fmt="text", stream=scene.log),
+        now=refreshed + timedelta(seconds=1),
+        state_root=scene.runner.state_root,
+    )
+
+    runner.collect_delete_results(snapshot, scene.inventory)
+
+    assert scene.part().status == PartStatus.SOURCE_DELETING, (
+        "古い写しの updated_at で期限切れにした。**まだ 1 秒しか経っていない**"
+    )
+    assert scene.requests(), "期限内の要求を取り下げた"

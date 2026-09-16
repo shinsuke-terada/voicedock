@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-HELPER_VERSION="5.6.0"
+HELPER_VERSION="5.7.0"
 LOG_MAX_BYTES=5242880       # 5 MiB。超えたら .1 へ退避する（§10.1 手順 2）
 LOCK_STALE_SECONDS=21600    # 6 時間。PID の再利用とハングへの歯止め（§10.1 手順 1）
 META_SCHEMA=1
@@ -196,9 +196,17 @@ validate_conf() {
         || _fail_config "7: STABILITY_INTERVAL_SECONDS must be an integer >= 1: ${STABILITY_INTERVAL_SECONDS:-<unset>}"
     _is_positive_int "${MAX_SCAN_DEPTH:-}" 1 \
         || _fail_config "7: MAX_SCAN_DEPTH must be an integer >= 1: ${MAX_SCAN_DEPTH:-<unset>}"
-    # STABILITY_FAST_PATH_SECONDS は検査 7 の対象ではない（§7.4）が、未設定なら 0 除算ではなく
-    # 「即断しない」に倒す
-    _is_positive_int "${STABILITY_FAST_PATH_SECONDS:-}" 0 || STABILITY_FAST_PATH_SECONDS=0
+    # STABILITY_FAST_PATH_SECONDS は検査 7 の対象ではない（§7.4）が、未設定・不正なら
+    # **SPEC §10.3 の既定値 60 へ倒す**（v5.45→v5.46 の変更 BH-5）。
+    #
+    # ★0 にしてはならない。`mtime <= now - 0` は**存在する全ファイルに真**なので、
+    #   即断経路が全件に当たり、**§10.3 のサンプリング確認が丸ごと消える。**
+    #   v5.45 まではここが 0 だった —— コメントは「即断しない」と書いてあったが、
+    #   コードは「**全件を即断する**」であり、意図の正反対だった。
+    #   その状態では書き込み途中の WAV をコピーし、墓標に途中のサイズと SHA を記録する。
+    #
+    # ★下限を 1 にしてある。0 を明示的に設定する運用上の意味が無い（判定の無効化である）
+    _is_positive_int "${STABILITY_FAST_PATH_SECONDS:-}" 1 || STABILITY_FAST_PATH_SECONDS=60
 
     [ -z "$CONFIG_ERROR" ]
 }

@@ -24,7 +24,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from voicedock import backlog, cleaner
+from voicedock import backlog, cleaner, db
 from voicedock.config import Config
 from voicedock.db import Database, Recording, Session
 from voicedock.device import DeviceInventory
@@ -287,3 +287,68 @@ def test_resolve_absent_withdraws_the_result_too(
     )
 
     assert not stale.exists(), "結果を残した"
+
+
+# --- BH-3: 計画と実行の間に状態が変わる ---------------------------------
+
+
+OTHER_RELPATH = f"{FOLDER}/TX01_MIC001_20260912_091500_orig.wav"
+OTHER_PARTKEY = partkey_for(DEVICE_ID, DevicePath(PurePosixPath(OTHER_RELPATH)))
+
+
+def add_second(database: Database, *, status: str) -> None:
+    """同じセッションの 2 本目。**「残りは処理される」ことを見るのに要る。**"""
+    database.insert_recording(
+        Recording(
+            partkey=OTHER_PARTKEY,
+            device_id=DEVICE_ID,
+            source_folder=FOLDER,
+            transmitter_id="TX01",
+            mic_index=1,
+            started_at="2026-09-12T09:15:00+09:00",
+            status=status,
+            updated_at="2026-09-12T09:15:00+09:00",
+            source_path=OTHER_RELPATH,
+            source_size=4096,
+            source_mtime=1787000000.0,
+            session_key=str(SESSION_KEY),
+        )
+    )
+
+
+def test_a_status_change_between_plan_and_action_does_not_crash(
+    database: Database, cfg: Config, log: Logger
+) -> None:
+    """**計画と実行の間に状態が変わっても中断しない**（変更 BH-3）。
+
+    サービス稼働中に `cleanup --resolve-absent` を流すと起きる —— 計画を取った後、
+    worker が `request_deletions()` でその Part を `SOURCE_DELETING` へ動かす。
+
+    v5.45 は `TransitionConflict` が `backlog.run()` → `cli._cleanup()` を**貫通し、
+    スタックトレースでコマンドが落ちた。**残りの Part は未処理、
+    **既に書いた分は半適用**である。`pipeline.py` の 3 箇所は既に捕捉していた。
+    """
+    add(database, status=PartStatus.SOURCE_DELETE_PENDING)
+    add_second(database, status=PartStatus.SOURCE_DELETE_PENDING)
+
+    plan = backlog.plan_absent(database, absent())
+    assert set(plan.eligible) == {PARTKEY, OTHER_PARTKEY}
+
+    # **計画の後に 1 本目だけ動かす**（worker がやること）
+    database.record_transition(
+        db.EntityType.RECORDING,
+        PARTKEY,
+        from_status=PartStatus.SOURCE_DELETE_PENDING,
+        to_status=PartStatus.SOURCE_DELETING,
+        now=NOW,
+    )
+
+    # **例外が飛ばないこと**
+    done = backlog._mark_absent(database, plan, cfg, absent(), log=log, now=NOW)
+
+    assert done == 1, "動いた 1 本だけを飛ばし、残りは処理すること"
+    moved = database.get_recording(PARTKEY)
+    other = database.get_recording(OTHER_PARTKEY)
+    assert moved is not None and other is not None
+    assert moved.status == PartStatus.SOURCE_DELETING, "他所の遷移を上書きした"
+    assert other.status == PartStatus.COMPLETED, "残りが処理されていない"
