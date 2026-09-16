@@ -371,9 +371,19 @@ Part の件数は **`COMPLETED: 12` のまま増えていない。**
 
 ### 3.6 E2E-06 — 1 日分（32 Part 相当）
 
-**Daily 1 枚 + Raw 1 枚に集約される。Timeline から時間帯を辿れる。8 時間以内に終わる。**
+**Daily 1 枚 + Raw 1 枚に集約される。Timeline から時間帯を辿れる。次にデバイスを接続するまで（24 時間以内）に終わる。**
 
-> **「8 時間以内」は密な発話では満たせない**（2026-09-15 実測。#125）。
+> **「8 時間以内」から改めた**（#125 / SPEC v5.50 の変更 BL-1）。
+>
+> **あの数字は導出が誤っていた。**「16 時間録音 + 8 時間処理 = 24 時間」は
+> **処理が録音を塞ぐ前提**だが、録音はデバイスが単独で行い、**コンテナが塞ぐのは
+> 接続している間だけ**である（DJI Mic 3 は PC へ接続すると録音を自動停止する。SPEC §10.3）。
+> Helper が `/inbox` へコピーし終えてデバイスを抜けば録音は再開し、
+> **コンテナはその裏で処理を続ける。**
+>
+> **本当の不変量は「遅延が累積しないこと」**であり、境界は**次の接続まで**である。
+>
+> **実測（2026-09-15）:**
 >
 > | | 音声 | 所要 | RTF | 文字数 |
 > |---|---|---|---|---|
@@ -390,11 +400,12 @@ Part の件数は **`COMPLETED: 12` のまま増えていない。**
 >
 > **16 時間の密な発話なら 15 時間前後かかる。**この機械（コンテナに 7 CPU / ホストは
 > 14）で `threads: 0`（= `min(nproc, 8)` → 7）を使った場合である。
+> **24 時間に対して余裕は 9 時間。**
 >
-> **判定条件をどうするかは #125 で決める。**速くする手立ては
+> **満たせなくなる条件は「1 日に 2 度接続する」である。**そのときは
 > (1) Docker Desktop の CPU 割り当てを増やす（7 → 10〜12。POC の実測で 4→7 が
-> 1.72 倍とほぼ線形）、(2) `-nf`（温度フォールバック無効）、(3) `-bs 1 -bo 1`
-> （ビーム探索をやめる）、(4) ホスト側で Metal を使う、がある。**いずれも未着手。**
+> 1.72 倍とほぼ線形）、(2) `-bs 1 -bo 1`（ビーム探索をやめる）、(3) `-nf`
+> （温度フォールバック無効）、(4) ホスト側で Metal を使う、の順に試す。**いずれも未着手。**
 
 ```bash
 date; docker compose exec voicedock voicedock status  # 開始時刻と開始前の状態
@@ -402,7 +413,7 @@ date; docker compose exec voicedock voicedock status  # 開始時刻と開始前
 docker compose logs voicedock | grep -E 'session_merged|obsidian_saved'
 date
 
-docker compose logs voicedock | ./scripts/perf-report.sh   # ★8 時間判定
+docker compose logs voicedock | ./scripts/perf-report.sh   # ★24 時間判定
 ls -1 "$OBSIDIAN_VAULT/Daily/Voice/Raw/"*/ "$OBSIDIAN_VAULT/Daily/Voice/Wiki/"*/
 #   ★Raw 1 枚 + Daily 1 枚であること。Obsidian で Timeline を目視確認する
 ```
