@@ -117,7 +117,7 @@ def test_service_runs_the_worker_loop(
     assert started, "worker が回っていない"
     out = capsys.readouterr().out
     assert "service_started" in out, "設定を読めたら service_started を出す（§16.2）"
-    assert "schema_version=1" in out, "起動時にスキーマを自動適用する（§8.5）"
+    assert f"schema_version={db.SCHEMA_VERSION}" in out, "起動時にスキーマを自動適用する（§8.5）"
     assert (tmp_path / "data" / "voicedock.db").is_file(), "起動時に DB を作ること"
 
 

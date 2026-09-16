@@ -100,8 +100,8 @@ def test_schema_has_the_spec_tables(database: Database) -> None:
     assert tables == {"recordings", "sessions", "events", "schema_version"}
 
 
-def test_recordings_has_24_columns(database: Database) -> None:
-    """列数の記録（v5.1 で 30 列 → 24 列）。
+def test_recordings_has_25_columns(database: Database) -> None:
+    """列数の記録（v5.1 で 30 列 → 24 列、v5.46 で 25 列）。
 
     v5.0 までは「v1 完全形」を保つための数だった（§8.5 が破壊的変更を禁じており、
     後から足せない列を先に入れてあった）。**v5.1 で `0001_initial.sql` を 1 回だけ
@@ -109,10 +109,13 @@ def test_recordings_has_24_columns(database: Database) -> None:
 
     いまこの数が意味するのは「不要な列が紛れ込んでいないこと」だけである。
     増やすのは `ALTER TABLE ADD COLUMN` で構わない（§8.5 の禁則は算出規則だけになった）。
+
+    **v5.46 で `delete_request_id` を 1 列足した**（変更 BH-1）。
+    `ALTER TABLE ADD COLUMN` である（`0002_delete_request_id.sql`）。
     """
     columns = structure(database.conn)["table:recordings"]
     assert isinstance(columns, list)
-    assert len(columns) == 24
+    assert len(columns) == 25
 
 
 @pytest.mark.parametrize(
@@ -207,19 +210,19 @@ def test_journal_mode_failure_raises(db_path: Path, monkeypatch: pytest.MonkeyPa
 
 
 def test_schema_version_is_recorded(database: Database) -> None:
+    """**適用した版が 1 行ずつ残る。**`schema_version()` はその最大値を返す。"""
     assert database.schema_version() == SCHEMA_VERSION
     rows = database.conn.execute("SELECT version, applied_at FROM schema_version").fetchall()
-    assert len(rows) == 1
-    assert rows[0][0] == SCHEMA_VERSION
+    assert [row[0] for row in rows] == list(range(1, SCHEMA_VERSION + 1))
 
 
 def test_migration_is_idempotent(db_path: Path) -> None:
-    """2 回 `connect()` しても `schema_version` が 1 行のまま（`restart` 相当）。"""
+    """2 回 `connect()` しても `schema_version` の行が増えないこと（`restart` 相当）。"""
     with connect(db_path) as first:
         assert first.schema_version() == SCHEMA_VERSION
     with connect(db_path) as second:
         rows = second.conn.execute("SELECT version FROM schema_version").fetchall()
-    assert [row[0] for row in rows] == [SCHEMA_VERSION]
+    assert [row[0] for row in rows] == list(range(1, SCHEMA_VERSION + 1))
 
 
 def test_migrate_returns_nothing_when_current(database: Database) -> None:
@@ -245,12 +248,16 @@ def test_migration_backs_up_before_applying(db_path: Path, monkeypatch: pytest.M
         opened.insert_recording(make_recording())
 
     real = db.load_migrations()  # monkeypatch の前に取る（取らないと無限再帰する）
-    extra = db.Migration(version=2, name="0002_extra.sql", sql="ALTER TABLE events ADD COLUMN x;")
+    # **いまの最新より 1 つ新しい版**を足す。番号を決め打ちすると版を上げるたびに落ちる
+    nxt = SCHEMA_VERSION + 1
+    extra = db.Migration(
+        version=nxt, name=f"{nxt:04d}_extra.sql", sql="ALTER TABLE events ADD COLUMN x;"
+    )
     monkeypatch.setattr(db, "load_migrations", lambda: [*real, extra])
 
     with connect(db_path) as opened:
-        assert opened.schema_version() == 2
-    backups = sorted(db_path.parent.glob(f"{db_path.name}.backup-v1-*"))
+        assert opened.schema_version() == nxt
+    backups = sorted(db_path.parent.glob(f"{db_path.name}.backup-v{SCHEMA_VERSION}-*"))
     assert len(backups) == 1
     restored = sqlite3.connect(backups[0])
     assert restored.execute("SELECT COUNT(*) FROM recordings").fetchone()[0] == 1

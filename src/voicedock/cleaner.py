@@ -490,28 +490,21 @@ def withdraw_result(partkey: str, *, cfg: Config) -> int:
     return removed
 
 
-def outstanding_request_id(partkey: str, *, cfg: Config) -> str | None:
-    """その Part にいま出ている要求の `request_id`。無ければ `None`（#160）。
-
-    **キューが唯一の出所である。**DB に `request_id` の列を足さない —— 足すと
-    二重管理になり、**どちらが本当かを決める規則がまた 1 つ増える。**
-
-    **X-1 は維持している。**あれは「`request_id` を**解析**して Part を引かない」
-    （組み立て規則を変えたときに結果が迷子にならないようにする）という話であり、
-    **「その結果がこの要求のものか」を確かめない理由にはならない。**
-    """
-    directory = Path(cfg.cleanup.queue_root) / DELETE_DIRNAME
-    if not directory.is_dir():
-        return None
-    for path in sorted(directory.glob("*.json")):
-        try:
-            document = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(document, dict) and document.get("partkey") == partkey:
-            request_id = document.get("request_id")
-            return str(request_id) if request_id else None
-    return None
+# **`outstanding_request_id()` は v5.46 で削除した**（変更 BH-1）。
+#
+# あれは `queue/delete/*.json` を走査して「その Part にいま出ている要求」を求めていたが、
+# **「キューが唯一の出所である」という前提が偽だった** —— `queue/delete/<id>.json` は
+# **reaper が所有し、処理した瞬間に消す**（`voicedock-reaper` の `rm -f "$file"`）。
+# **結果が届くとき要求は必ず 0 件**なので、照合は常に失敗し、
+# **DELETED も SOURCE_IDENTITY_MISMATCH もすべて捨てていた。**Part は 1 時間後に
+# `DELETE_TIMEOUT` で保留へ落ち、**本当の理由が隠れた。**
+#
+# いまは `recordings.delete_request_id` を見る。**コンテナの事実はコンテナが持つ** ——
+# 二重管理を嫌ってキューを読みにいったが、あれはコンテナの台帳ではなかった。
+#
+# **X-1 は維持している。**あれは「`request_id` を**解析**して Part を引かない」
+# （組み立て規則を変えたときに結果が迷子にならないようにする）という話であり、
+# **「その結果がこの要求のものか」を確かめない理由にはならない。**
 
 
 def discard_result(result: DeleteResult, *, cfg: Config) -> None:

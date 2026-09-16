@@ -163,13 +163,24 @@ def _request_deletions(
         )
         if request is None:
             continue
-        database.record_transition(
-            db.EntityType.RECORDING,
-            partkey,
-            from_status=PartStatus.COMPLETED,
-            to_status=PartStatus.SOURCE_DELETING,
-            now=now,
-        )
+        # **要求 ID を先に記録する**（v5.45→v5.46 の変更 BH-1）。`pipeline` と同じ順序
+        database.update_recording(partkey, delete_request_id=request.request_id, now=now)
+        try:
+            database.record_transition(
+                db.EntityType.RECORDING,
+                partkey,
+                from_status=PartStatus.COMPLETED,
+                to_status=PartStatus.SOURCE_DELETING,
+                now=now,
+            )
+        except db.TransitionConflict:
+            # **計画を立てた後に状態が変わった**（変更 BH-3）。サービス稼働中に
+            # `cleanup --backlog` を流すと起きる。**残りの Part は処理する** ——
+            # ここで例外を上げると CLI がスタックトレースで止まり、
+            # **半分だけ適用された状態**が残る（`pipeline.py` の 3 箇所と同じ扱い）
+            # **イベント名を増やさない**（§16.4 の原則）。`reason=` で分ける
+            log.warning("source_delete_skipped", recording_key=partkey, reason="status_changed")
+            continue
         done += 1
     return done
 
@@ -190,25 +201,36 @@ def _mark_absent(
     """
     done = 0
     for partkey in plan.eligible:
-        database.record_transition(
-            db.EntityType.RECORDING,
-            partkey,
-            from_status=PartStatus.SOURCE_DELETE_PENDING,
-            to_status=PartStatus.SOURCE_DELETING,
-            detail="resolve_absent",
-            now=now,
-        )
-        database.record_transition(
-            db.EntityType.RECORDING,
-            partkey,
-            from_status=PartStatus.SOURCE_DELETING,
-            to_status=PartStatus.COMPLETED,
-            detail="already_absent",
-            now=now,
-        )
+        try:
+            database.record_transition(
+                db.EntityType.RECORDING,
+                partkey,
+                from_status=PartStatus.SOURCE_DELETE_PENDING,
+                to_status=PartStatus.SOURCE_DELETING,
+                detail="resolve_absent",
+                now=now,
+            )
+            database.record_transition(
+                db.EntityType.RECORDING,
+                partkey,
+                from_status=PartStatus.SOURCE_DELETING,
+                to_status=PartStatus.COMPLETED,
+                detail="already_absent",
+                now=now,
+            )
+        except db.TransitionConflict:
+            # **計画を立てた後に状態が変わった**（変更 BH-3）。サービス稼働中に
+            # `cleanup --resolve-absent` を流すと起きる。**残りの Part は処理する** ——
+            # ここで例外を上げると CLI がスタックトレースで止まり、
+            # **半分だけ適用された状態**が残る（`pipeline.py` の 3 箇所と同じ扱い）
+            # **イベント名を増やさない**（§16.4 の原則）。`reason=` で分ける
+            log.warning("source_delete_skipped", recording_key=partkey, reason="status_changed")
+            continue
         cleaner.withdraw_request(partkey, cfg=cfg)
         # **結果も取り下げる**（#160）。要求だけ消すと、対応する試行が無い結果が残る
         cleaner.withdraw_result(partkey, cfg=cfg)
+        # **要求 ID も外す**（変更 BH-1）。この Part はもう結果を待っていない
+        database.update_recording(partkey, delete_request_id=None, now=now)
         log.info("source_delete_skipped", recording_key=partkey, reason="already_absent")
         done += 1
     return done

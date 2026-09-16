@@ -80,6 +80,16 @@ def test_the_container_values_pass_the_reaper(tmp_path: Path) -> None:
     assert not target.exists(), f"削除されていない: {result.stdout}{result.stderr}"
     assert [r["status"] for r in _results(home)] == ["DELETED"]
 
+    # **reaper は結果を書いた直後に要求を消す**（v5.45→v5.46 の変更 BH-1）。
+    #
+    # だから**コンテナは `queue/delete/` を「いま出ている要求」の台帳にできない** ——
+    # 結果が届くとき要求は**必ず 0 件**である。v5.45 はそこを走査して照合しており、
+    # **DELETED も SOURCE_IDENTITY_MISMATCH もすべて捨てていた**（自動削除が完了しない）。
+    # 照合先は `recordings.delete_request_id` である。
+    assert list((home / "queue" / "delete").glob("*.json")) == [], (
+        "reaper が要求を残した。この前提が変わるなら pipeline の照合も見直すこと"
+    )
+
 
 def test_a_copy_timestamp_would_be_rejected(tmp_path: Path) -> None:
     """**陰性対照。**inbox コピーの `mtime` を使うと reaper が拒否すること。

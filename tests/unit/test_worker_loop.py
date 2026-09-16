@@ -192,6 +192,8 @@ def test_the_tick_follows_the_spec_order(
     runner.discover_parts = note("discover_parts")  # type: ignore[method-assign]
     runner.close_idle_sessions = note("close_idle_sessions")  # type: ignore[method-assign]
     runner.process_pending_parts = note("process_pending_parts")  # type: ignore[method-assign]
+    runner.process_ready_sessions = note("process_ready_sessions")  # type: ignore[method-assign]
+    runner.evaluate_deletions = note("evaluate_deletions")  # type: ignore[method-assign]
     runner.requeue_failed = note_requeue  # type: ignore[method-assign]
 
     runner.tick()
@@ -199,8 +201,75 @@ def test_the_tick_follows_the_spec_order(
         "discover_parts",
         "close_idle_sessions",
         "process_pending_parts",
+        "process_ready_sessions",
+        "evaluate_deletions",
         "requeue_failed",
     ]
+
+
+def test_a_stale_heartbeat_does_not_stop_the_stages_that_ignore_the_helper(
+    database: Database, cfg: Config, logger: tuple[Logger, io.StringIO], state_root: Path
+) -> None:
+    """**Helper が止まっても Helper に依存しない段は進む**（変更 BH-4）。
+
+    v5.45 はここで周回ごと打ち切っていたので、**LaunchAgent を止めるだけで
+    文字起こし・LLM・ノート生成が全部止まった。**どれも Helper に触れないのに、である。
+
+    §22 R-23 の根拠は「**Helper の死を検出せずに黙って待つな**」であって、
+    「Helper と無関係な処理まで凍らせろ」ではない。
+    """
+    runner = build(database, cfg, logger, state_root)  # heartbeat が無い
+    order: list[str] = []
+
+    def note(name: str) -> Callable[..., None]:
+        def inner() -> None:
+            order.append(name)
+
+        return inner
+
+    def note_requeue(*_args: object, **_kwargs: object) -> int:
+        order.append("requeue_failed")
+        return 0
+
+    runner.discover_parts = note("discover_parts")  # type: ignore[method-assign]
+    runner.close_idle_sessions = note("close_idle_sessions")  # type: ignore[method-assign]
+    runner.process_pending_parts = note("process_pending_parts")  # type: ignore[method-assign]
+    runner.process_ready_sessions = note("process_ready_sessions")  # type: ignore[method-assign]
+    runner.evaluate_deletions = note("evaluate_deletions")  # type: ignore[method-assign]
+    runner.requeue_failed = note_requeue  # type: ignore[method-assign]
+
+    assert runner.tick() is False, "取り込みを進めたと報告してはならない"
+    assert order == [
+        "close_idle_sessions",
+        "process_pending_parts",
+        "process_ready_sessions",
+    ], "Helper に依存する段だけを止めること"
+    assert "helper_heartbeat_stale" in logger[1].getvalue()
+
+
+def test_the_pipeline_is_told_whether_the_helper_is_fresh(
+    database: Database, cfg: Config, logger: tuple[Logger, io.StringIO], state_root: Path
+) -> None:
+    """**`helper_fresh` を `Pipeline` へ渡す**（変更 BH-4）。
+
+    `process_pending_parts()` を進めると `process_part()` → `ensure_raw_note()` →
+    `request_deletions()` に到達する。**あそこは `inventory.json` を読む**ので、
+    Helper が止まっているあいだは「デバイスに在る」と言っている根拠が無い（§7.5）。
+    要求を書かせないための歯止めである。
+    """
+    runner = build(database, cfg, logger, state_root)  # heartbeat が無い
+    seen: list[bool] = []
+    runner.close_idle_sessions = lambda: None  # type: ignore[method-assign]
+    runner.process_ready_sessions = lambda: None  # type: ignore[method-assign]
+    runner.process_pending_parts = lambda: seen.append(runner.helper_fresh)  # type: ignore[method-assign]
+
+    runner.tick()
+    assert seen == [False], "Helper が止まっているのに fresh と伝えた"
+
+    write_heartbeat(state_root, updated_at=NOW.isoformat())
+    seen.clear()
+    runner.tick()
+    assert seen == [True], "回復しても偽のままになっている"
 
 
 def test_pending_parts_are_ordered_by_started_at(
