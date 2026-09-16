@@ -378,7 +378,8 @@ def test_key_count_counts_leaves() -> None:
         return 1
 
     assert key_count(document) == leaves(document)
-    assert key_count(document) == 108
+    # v5.48 で `obsidian.raw.granularity` を廃止して 1 つ減った（変更 BJ-1）
+    assert key_count(document) == 107
 
 
 def test_config_is_frozen() -> None:
