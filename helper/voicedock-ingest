@@ -1,0 +1,895 @@
+#!/bin/bash
+#
+# voicedock-ingest — デバイスの検出・安定性判定・inbox へのコピー（SPEC §4.2, §10.1）
+#
+# **デバイスへ書き込まない。改名しない。移動しない。削除しない**（§14.4 N-11 / N-18）。
+# 行うのは読み取りと `diskutil` のマウント操作だけである。デバイス上のファイルを削除できる
+# プログラムは `voicedock-reaper` 1 本だけで（N-16）、それは既定で配置されない（ロック 2-A）。
+#
+# **bash 3.2 で書く**（macOS 同梱。Homebrew も Python も要求しない。§3.3）。
+# したがって次を使ってはならない:
+#   declare -A / mapfile / readarray / ${x^^} / ${x,,} / &>> / [[ -v ]]
+# また **空配列の "${ARR[@]}" は bash 3.2 の set -u で落ちる**ため、
+# 必ず [ ${#ARR[@]} -gt 0 ] で囲む（§5.4 の規範実装がそうしている）。
+#
+# **`jq` に依存しない**（macOS は同梱しない）。JSON は printf で組み立てる。
+#
+# `_stat_size` / `_stat_mtime` / `_sha256_stdin` は `voicedock-reaper` にも同じものが要るが、
+# **共有ライブラリにしない。**reaper はデバイス上のファイルを削除できる唯一のプログラムであり、
+# 自己完結を保つ価値が 15 行の重複より大きい（§17.4 が helper/ を 3 本と規定していることとも整合）。
+
+set -euo pipefail
+
+HELPER_VERSION="5.7.1"
+LOG_MAX_BYTES=5242880       # 5 MiB。超えたら .1 へ退避する（§10.1 手順 2）
+LOCK_STALE_SECONDS=21600    # 6 時間。PID の再利用とハングへの歯止め（§10.1 手順 1）
+META_SCHEMA=1
+HEARTBEAT_SCHEMA=1
+INVENTORY_SCHEMA=1
+
+# --- 移植性のラッパ（起動時に 1 回だけ判定する） -------------------------
+# macOS は BSD stat / shasum、テストコンテナと CI は GNU stat / sha256sum である。
+
+if stat -f %z . >/dev/null 2>&1; then
+    _stat_size()  { stat -f %z "$1"; }
+    _stat_mtime() { stat -f %m "$1"; }
+else
+    _stat_size()  { stat -c %s "$1"; }
+    _stat_mtime() { stat -c %Y "$1"; }
+fi
+
+if command -v shasum >/dev/null 2>&1; then
+    _sha256_stdin() { shasum -a 256 | awk '{print $1}'; }
+else
+    _sha256_stdin() { sha256sum | awk '{print $1}'; }
+fi
+
+# マウント点の空き容量（バイト）。**取れなければ何も出力しない**（呼び手が「不明」にする）。
+#
+# **列は先頭から数える。**`-P` 無しの BSD は `Available` の後ろに `iused` / `ifree` /
+# `%iused` の 3 列を挟むので、**末尾から数えると `ifree` を拾う**（実測で 10 倍の値に
+# なった）。`$4` は BSD / GNU のどちらでも `Available` である。
+#
+# **`-P` は保険である。**POSIX 出力形式は列を
+# `Filesystem / blocks / Used / Available / Capacity / Mounted on` の 6 つに固定し、
+# **1 行に収めることも保証する** — デバイス名が長いと `-P` 無しの df は行を折り返し、
+# そのとき `$4` は別の値になる。`-k` は 1024 バイト単位を保証する
+# （`-h` は人向けの丸め、`--output` は GNU 専用）。
+# **`printf "%.0f"` にするのは、awk の整数が 2^31 で飽和する実装があるため**
+# （4 GiB 超の空き容量を扱う）。
+_free_bytes() {
+    df -Pk "$1" 2>/dev/null |
+        awk 'NR>1 && $4 ~ /^[0-9]+$/ { printf "%.0f", $4 * 1024; exit }'
+}
+
+_now_iso() { date +%Y-%m-%dT%H:%M:%S%z | sed 's/\(..\)$/:\1/'; }
+_now_epoch() { date +%s; }
+
+# --- ログ ----------------------------------------------------------------
+# stdout / stderr は launchd が log/ingest.log へ流す（§4.1）。
+
+_log()  { printf '%s %-5s %s\n' "$(_now_iso)" "$1" "$2"; }
+info()  { _log INFO  "$1"; }
+warn()  { _log WARN  "$1" >&2; }
+error() { _log ERROR "$1" >&2; }
+
+# --- JSON ----------------------------------------------------------------
+
+_json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    printf '%s' "$s"
+}
+
+_json_string() { printf '"%s"' "$(_json_escape "$1")"; }
+
+# 配列を JSON のリストにする。**空配列でも壊れないこと**が要点である。
+_json_array() {
+    local first=1 item
+    printf '['
+    if [ "$#" -gt 0 ]; then
+        for item in "$@"; do
+            [ "$first" -eq 1 ] || printf ', '
+            first=0
+            _json_string "$item"
+        done
+    fi
+    printf ']'
+}
+
+# --- helper.conf ---------------------------------------------------------
+
+CONFIG_ERROR=""
+
+_fail_config() {
+    # 最初の違反だけを残す。config_error は 1 行の文字列である（§7.5）
+    [ -n "$CONFIG_ERROR" ] || CONFIG_ERROR="$1"
+}
+
+_is_array() {
+    # §7.4 検査 3 の規範実装。文字列で書かれた設定を無言で通さない
+    declare -p "$1" 2>/dev/null | grep -q '^declare -a'
+}
+
+_is_positive_int() {
+    case "$1" in
+        '' | *[!0-9]*) return 1 ;;
+        *) [ "$1" -ge "$2" ] ;;
+    esac
+}
+
+locate_conf() {
+    if [ -n "${VOICEDOCK_HELPER_CONF:-}" ]; then
+        printf '%s' "$VOICEDOCK_HELPER_CONF"
+        return 0
+    fi
+    local here
+    here="$(cd "$(dirname "$0")" && pwd)"
+    printf '%s' "$(dirname "$here")/helper.conf"
+}
+
+load_conf() {
+    local conf="$1"
+    if [ ! -f "$conf" ]; then
+        CONFIG_ERROR="helper.conf not found: $conf"
+        return 1
+    fi
+    # shellcheck source=/dev/null
+    . "$conf" || { CONFIG_ERROR="helper.conf could not be sourced: $conf"; return 1; }
+    return 0
+}
+
+# §7.4 の起動時検証 1〜7。**番号と件数を増やしてはならない**（DH-13 が参照する）
+validate_conf() {
+    # 1. VOLUMES_ROOT が存在するディレクトリである
+    [ -d "${VOLUMES_ROOT:-}" ] || _fail_config "1: VOLUMES_ROOT is not a directory: ${VOLUMES_ROOT:-<unset>}"
+
+    # 2. VOICEDOCK_HOME が存在する。Darwin では /Users 配下であること
+    #    （この条件は Docker Desktop for Mac の VirtioFS が理由であり、Linux には /Users も
+    #     VirtioFS も無い。根拠が無い環境で課すと検査そのものが動かせなくなる。§7.4）
+    if [ ! -d "${VOICEDOCK_HOME:-}" ]; then
+        _fail_config "2: VOICEDOCK_HOME is not a directory: ${VOICEDOCK_HOME:-<unset>}"
+    elif [ "$(uname -s)" = "Darwin" ]; then
+        case "$VOICEDOCK_HOME" in
+            /Users/*) ;;
+            *) _fail_config "2: VOICEDOCK_HOME must be under /Users on macOS: $VOICEDOCK_HOME" ;;
+        esac
+    fi
+
+    # 3. INCLUDE_VOLUMES / EXCLUDE_VOLUMES が配列として宣言されている
+    _is_array INCLUDE_VOLUMES || _fail_config "3: INCLUDE_VOLUMES must be a bash array, e.g. INCLUDE_VOLUMES=()"
+    _is_array EXCLUDE_VOLUMES || _fail_config "3: EXCLUDE_VOLUMES must be a bash array, e.g. EXCLUDE_VOLUMES=(\"Macintosh HD\")"
+
+    # 4. 両配列の各要素が空文字列でない（空文字は何にも一致せず全ボリュームが落ちる罠になる）
+    local pattern
+    if _is_array INCLUDE_VOLUMES && [ ${#INCLUDE_VOLUMES[@]} -gt 0 ]; then
+        for pattern in "${INCLUDE_VOLUMES[@]}"; do
+            [ -n "$pattern" ] || _fail_config "4: INCLUDE_VOLUMES contains an empty pattern"
+        done
+    fi
+    if _is_array EXCLUDE_VOLUMES && [ ${#EXCLUDE_VOLUMES[@]} -gt 0 ]; then
+        for pattern in "${EXCLUDE_VOLUMES[@]}"; do
+            [ -n "$pattern" ] || _fail_config "4: EXCLUDE_VOLUMES contains an empty pattern"
+        done
+    fi
+
+    # 5. MOUNT_MODE が ro / rw のいずれか
+    case "${MOUNT_MODE:-}" in
+        ro | rw) ;;
+        *) _fail_config "5: MOUNT_MODE must be ro or rw: ${MOUNT_MODE:-<unset>}" ;;
+    esac
+
+    # 6. DELETE_SOURCE_AUDIO が true / false のいずれか
+    case "${DELETE_SOURCE_AUDIO:-}" in
+        true | false) ;;
+        *) _fail_config "6: DELETE_SOURCE_AUDIO must be true or false: ${DELETE_SOURCE_AUDIO:-<unset>}" ;;
+    esac
+
+    # 7. STABILITY_CHECKS >= 1 かつ STABILITY_INTERVAL_SECONDS >= 1 かつ MAX_SCAN_DEPTH >= 1
+    _is_positive_int "${STABILITY_CHECKS:-}" 1 \
+        || _fail_config "7: STABILITY_CHECKS must be an integer >= 1: ${STABILITY_CHECKS:-<unset>}"
+    _is_positive_int "${STABILITY_INTERVAL_SECONDS:-}" 1 \
+        || _fail_config "7: STABILITY_INTERVAL_SECONDS must be an integer >= 1: ${STABILITY_INTERVAL_SECONDS:-<unset>}"
+    _is_positive_int "${MAX_SCAN_DEPTH:-}" 1 \
+        || _fail_config "7: MAX_SCAN_DEPTH must be an integer >= 1: ${MAX_SCAN_DEPTH:-<unset>}"
+    # STABILITY_FAST_PATH_SECONDS は検査 7 の対象ではない（§7.4）が、未設定・不正なら
+    # **SPEC §10.3 の既定値 60 へ倒す**（v5.45→v5.46 の変更 BH-5）。
+    #
+    # ★0 にしてはならない。`mtime <= now - 0` は**存在する全ファイルに真**なので、
+    #   即断経路が全件に当たり、**§10.3 のサンプリング確認が丸ごと消える。**
+    #   v5.45 まではここが 0 だった —— コメントは「即断しない」と書いてあったが、
+    #   コードは「**全件を即断する**」であり、意図の正反対だった。
+    #   その状態では書き込み途中の WAV をコピーし、墓標に途中のサイズと SHA を記録する。
+    #
+    # ★下限を 1 にしてある。0 を明示的に設定する運用上の意味が無い（判定の無効化である）
+    _is_positive_int "${STABILITY_FAST_PATH_SECONDS:-}" 1 || STABILITY_FAST_PATH_SECONDS=60
+
+    [ -z "$CONFIG_ERROR" ]
+}
+
+# --- §5.4 デバイス判定 ---------------------------------------------------
+# 規則 1〜2 は **readdir が返した名前だけ**で判定し、stat を 1 回も呼ばない。
+# #2 では 1 個のボリュームへ触れただけで Docker Desktop 全体が固まった（docs/POC.md §2.3）。
+# **触れないことが最大の防壁である。**
+
+matches_any() {                      # $1=名前, $2...=パターン
+  local name="$1"; shift
+  local pat
+  for pat in "$@"; do
+    case "$name" in ($pat) return 0 ;; esac
+  done
+  return 1
+}
+
+# 規則 5: RECORDING_FOLDER_RE に一致するサブディレクトリか RECORDING_FILENAME_RE に一致する
+# .wav が 1 個でもあるか。**glob で見て find を使わない**（深い走査をここで起こさない）。
+_is_recording_folder() {   # $1=basename
+    case "$1" in
+        TX_MIC[0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_is_recording_file() {     # $1=basename
+    case "$1" in
+        TX[0-9][0-9]_MIC[0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9].wav) return 0 ;;
+        TX[0-9][0-9]_MIC[0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9].WAV) return 0 ;;
+        TX[0-9][0-9]_MIC[0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]_orig.wav) return 0 ;;
+        TX[0-9][0-9]_MIC[0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]_orig.WAV) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_is_orig() {               # $1=basename。_orig を持つものだけ取り込む（§5.3）
+    case "$1" in
+        *_orig.wav | *_orig.WAV) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_has_recordings() {        # $1=volume path
+    local entry base
+    for entry in "$1"/*; do
+        [ -e "$entry" ] || continue
+        base="${entry##*/}"
+        case "$base" in .*) continue ;; esac
+        if [ -d "$entry" ] && _is_recording_folder "$base"; then return 0; fi
+        if [ -f "$entry" ] && _is_recording_file "$base"; then return 0; fi
+    done
+    return 1
+}
+
+skip() { info "volume_skipped name=$1 reason=$2"; }
+
+# 検出したデバイス名を DEVICES へ入れる（bash 3.2 に連想配列は無いので添字配列で持つ）
+DEVICES=()
+
+detect_devices() {
+    local path name
+    for path in "$VOLUMES_ROOT"/*; do
+        # glob が何にも一致しないと path はパターンそのままになる
+        [ -e "$path" ] || continue
+        name="${path##*/}"
+
+        # 1. 許可リスト（空なら素通り）
+        if [ ${#INCLUDE_VOLUMES[@]} -gt 0 ] && ! matches_any "$name" "${INCLUDE_VOLUMES[@]}"; then
+          skip "$name" "not in INCLUDE_VOLUMES"; continue
+        fi
+        # 2. 拒否リスト
+        if [ ${#EXCLUDE_VOLUMES[@]} -gt 0 ] && matches_any "$name" "${EXCLUDE_VOLUMES[@]}"; then
+          skip "$name" "in EXCLUDE_VOLUMES"; continue
+        fi
+        # 3. エントリ自身が symlink でない（/Volumes/Macintosh HD -> / が実在する。§22 R-19）
+        if [ -L "$path" ]; then skip "$name" "symlink"; continue; fi
+        # 4. ディレクトリであり読み取り可能である
+        if [ ! -d "$path" ] || [ ! -r "$path" ]; then skip "$name" "not a readable directory"; continue; fi
+        # 5. DJI 形式の録音が 1 件以上ある
+        #
+        # **「録音が無い」と「読めない」を区別する。**macOS の TCC はリムーバブル
+        # ボリュームへのアクセスをアプリ単位で拒否するが、**`[ -r ]`（規則 4）は
+        # それを見抜けない** — `access(2)` は成功し、`opendir(3)` で初めて EPERM になる。
+        # 区別しないと glob が空になるだけなので、**権限が無いのに「録音が無い」と
+        # 報告する。**初回セットアップで最も踏みやすい失敗であり、ログが逆方向を指す
+        # （2026-09-14 に実機で踏んだ。§3.4(7)）。
+        if ! _has_recordings "$path"; then
+            # **判定は変えない。**どちらにせよこのボリュームは飛ばす。理由だけを正す。
+            # `-maxdepth 1` は列挙できるかを見るだけで、§10.2 の走査は起こさない
+            if find "$path" -maxdepth 1 >/dev/null 2>&1; then
+                skip "$name" "no DJI recordings"
+            else
+                skip "$name" "volume not listable — macOS のプライバシー設定を確認してください（§3.4(7)）"
+            fi
+            continue
+        fi
+
+        DEVICES[${#DEVICES[@]}]="$name"
+        info "device_detected name=$name"
+    done
+}
+
+# --- 走査（§10.2。深さ上限 MAX_SCAN_DEPTH） ------------------------------
+# ALL_RELPATH: inventory 用の全件（denoised も含む。§7.5）
+# CAND_*     : コピー候補（_orig かつ墓標なし）の並列配列
+
+ALL_RELPATH=()
+CAND_RELPATH=(); CAND_SRC=(); CAND_SIZE=(); CAND_MTIME=(); CAND_OK=()
+
+_scan_dir() {              # $1=volume path, $2=relative prefix, $3=残り深さ, $4=device_id
+    local dir="$1" prefix="$2" depth="$3" device_id="$4"
+    local entry base rel
+    [ "$depth" -ge 1 ] || return 0
+    for entry in "$dir"/*; do
+        [ -e "$entry" ] || continue
+        base="${entry##*/}"
+        # `.` 始まりは黙って無視する。ログも出さない（§10.2。AppleDouble / .Trashes 等）
+        case "$base" in .*) continue ;; esac
+        if [ -n "$prefix" ]; then rel="$prefix/$base"; else rel="$base"; fi
+
+        if [ -d "$entry" ]; then
+            [ -L "$entry" ] && continue
+            _scan_dir "$entry" "$rel" "$((depth - 1))" "$device_id"
+            continue
+        fi
+        [ -f "$entry" ] || continue
+        _is_recording_file "$base" || continue
+
+        ALL_RELPATH[${#ALL_RELPATH[@]}]="$rel"
+        _is_orig "$base" || continue
+
+        # 墓標があるものは候補にしない。**stat すら呼ばない**（§10.2 / §10.3）
+        if [ -f "$VOICEDOCK_HOME/inbox/$device_id/$rel.meta.json" ]; then continue; fi
+
+        CAND_RELPATH[${#CAND_RELPATH[@]}]="$rel"
+        CAND_SRC[${#CAND_SRC[@]}]="$entry"
+        CAND_SIZE[${#CAND_SIZE[@]}]=""
+        CAND_MTIME[${#CAND_MTIME[@]}]=""
+        CAND_OK[${#CAND_OK[@]}]=0
+    done
+}
+
+# --- §10.3 安定性判定（バッチ） ------------------------------------------
+# 待機時間の合計は STABILITY_INTERVAL_SECONDS × STABILITY_CHECKS であり、
+# **ファイル数に比例しない。**ファイル単位で直列に待つと 64 ファイルで約 6 分止まる。
+
+_sample_all() {            # (size, mtime) を一括取得する
+    local i size mtime
+    i=0
+    while [ "$i" -lt ${#CAND_SRC[@]} ]; do
+        if size="$(_stat_size "${CAND_SRC[$i]}" 2>/dev/null)" \
+            && mtime="$(_stat_mtime "${CAND_SRC[$i]}" 2>/dev/null)"; then
+            CAND_SIZE[$i]="$size"
+            CAND_MTIME[$i]="$mtime"
+        else
+            CAND_SIZE[$i]=""
+            CAND_MTIME[$i]=""
+        fi
+        i=$((i + 1))
+    done
+}
+
+check_stability() {
+    [ ${#CAND_SRC[@]} -gt 0 ] || return 0
+    _sample_all
+
+    # 即断: mtime が STABILITY_FAST_PATH_SECONDS 以上前なら安定と確定する。
+    #
+    # **「新しい mtime ＝ 録音中」ではない。**DJI Mic 3 は **PC へ接続すると録音を自動停止する**
+    # ため、USB 経路では「録音中のファイル」は現れない（2026-09-14 実機。P0-11）。
+    # 実際に新しい mtime を持つのは**直前に録音を終えたファイル**であり、
+    # **停止直後は WAV のヘッダ確定（finalize）の途中でマウントされうる。**
+    # 即断から外して確認へ回す意味はそこにある
+    local now i pending
+    now="$(_now_epoch)"
+    pending=0
+    i=0
+    while [ "$i" -lt ${#CAND_SRC[@]} ]; do
+        if [ -n "${CAND_MTIME[$i]}" ] \
+            && [ "${CAND_MTIME[$i]}" -le "$((now - STABILITY_FAST_PATH_SECONDS))" ]; then
+            CAND_OK[$i]="$STABILITY_CHECKS"
+        else
+            pending=$((pending + 1))
+        fi
+        i=$((i + 1))
+    done
+    [ "$pending" -gt 0 ] || return 0
+    info "stability_pending count=$pending"
+
+    local round prev_size prev_mtime
+    round=0
+    while [ "$round" -lt "$STABILITY_CHECKS" ]; do
+        # 前回の値を控えてから待つ
+        local saved_size=() saved_mtime=()
+        i=0
+        while [ "$i" -lt ${#CAND_SRC[@]} ]; do
+            saved_size[$i]="${CAND_SIZE[$i]}"
+            saved_mtime[$i]="${CAND_MTIME[$i]}"
+            i=$((i + 1))
+        done
+        sleep "$STABILITY_INTERVAL_SECONDS"
+        _sample_all
+        i=0
+        while [ "$i" -lt ${#CAND_SRC[@]} ]; do
+            if [ "${CAND_OK[$i]}" -lt "$STABILITY_CHECKS" ]; then
+                prev_size="${saved_size[$i]}"
+                prev_mtime="${saved_mtime[$i]}"
+                if [ -n "${CAND_SIZE[$i]}" ] && [ "${CAND_SIZE[$i]}" = "$prev_size" ] \
+                    && [ "${CAND_MTIME[$i]}" = "$prev_mtime" ]; then
+                    CAND_OK[$i]=$((${CAND_OK[$i]} + 1))
+                else
+                    # 不一致が出たファイルは成立回数を 0 に戻す（§10.3）
+                    CAND_OK[$i]=0
+                fi
+            fi
+            i=$((i + 1))
+        done
+        round=$((round + 1))
+    done
+}
+
+# --- コピー（§10.3 の末尾） ----------------------------------------------
+# **rm / mv の対象は inbox 側だけである。**$src（デバイス上）に対して rm / mv /
+# リダイレクトを一切書かない（§14.4 N-11 / N-18）。
+
+copy_candidates() {        # $1=device_id
+    local device_id="$1"
+    local i rel src size mtime folder name dst_dir partial sumfile sha status
+    i=0
+    while [ "$i" -lt ${#CAND_SRC[@]} ]; do
+        if [ "${CAND_OK[$i]}" -lt "$STABILITY_CHECKS" ]; then
+            info "file_not_stable relpath=${CAND_RELPATH[$i]}"
+            i=$((i + 1)); continue
+        fi
+        rel="${CAND_RELPATH[$i]}"
+        src="${CAND_SRC[$i]}"
+        size="${CAND_SIZE[$i]}"
+        mtime="${CAND_MTIME[$i]}"
+        if [ -z "$size" ] || [ -z "$mtime" ]; then
+            warn "stat_failed relpath=$rel"
+            i=$((i + 1)); continue
+        fi
+        name="${rel##*/}"
+        folder="${rel%/*}"
+        [ "$folder" != "$rel" ] || folder=""
+
+        if [ -n "$folder" ]; then
+            dst_dir="$VOICEDOCK_HOME/inbox/$device_id/$folder"
+        else
+            dst_dir="$VOICEDOCK_HOME/inbox/$device_id"
+        fi
+        mkdir -p "$dst_dir"
+        partial="$dst_dir/$name.partial"
+        sumfile="$dst_dir/$name.partial.sha"
+
+        # 1 回の読み取りで本体のコピーと SHA-256 を同時に行う。
+        # USB 越しに 2 回読むと 1 日分 16 GB が倍になる。
+        set +e
+        cat "$src" | tee "$partial" | _sha256_stdin > "$sumfile"
+        status="${PIPESTATUS[*]}"
+        set -e
+        if [ "$status" != "0 0 0" ]; then
+            rm -f "$partial" "$sumfile"
+            warn "copy_failed relpath=$rel pipestatus=$status"
+            i=$((i + 1)); continue
+        fi
+        # コピー途中で切れていないことを確認する
+        if [ "$(_stat_size "$partial")" != "$size" ]; then
+            rm -f "$partial" "$sumfile"
+            warn "copy_size_mismatch relpath=$rel expected=$size"
+            i=$((i + 1)); continue
+        fi
+        sha="$(cat "$sumfile")"
+        rm -f "$sumfile"
+
+        # (1) 本体を確定 → (2) 墓標を後に置く。**この順序を変えてはならない**（§10.2）
+        mv "$partial" "$dst_dir/$name"
+        write_meta "$device_id" "$rel" "$size" "$mtime" "$sha" > "$dst_dir/$name.meta.json.tmp"
+        mv "$dst_dir/$name.meta.json.tmp" "$dst_dir/$name.meta.json"
+        info "copied relpath=$rel bytes=$size"
+        # **コピー 1 件ごとに heartbeat を更新する**（#117）。1 日分の取り込みは約 11 分
+        # かかり、**`helper_heartbeat_max_age_seconds`（900）− `StartInterval`（300）
+        # ＝ 600 秒**を超える。最後にしか書かないと、**動いている helper をコンテナが
+        # 死んだと判定し、パイプライン全体を止める**（`worker.py` の `_helper_is_stale`）。
+        #
+        # **`inventory.json` は書かない。**あれは「デバイスに何があるか」の一覧であり、
+        # 途中経過に意味が無い（判断 4）
+        write_heartbeat
+        i=$((i + 1))
+    done
+}
+
+write_meta() {             # $1=device_id $2=relpath $3=size $4=mtime $5=sha256
+    printf '{\n'
+    printf '  "schema": %s,\n' "$META_SCHEMA"
+    printf '  "device_id": %s,\n' "$(_json_string "$1")"
+    printf '  "relpath": %s,\n' "$(_json_string "$2")"
+    printf '  "size": %s,\n' "$3"
+    printf '  "mtime": %s.0,\n' "$4"
+    printf '  "sha256": %s,\n' "$(_json_string "$5")"
+    printf '  "copied_at": %s,\n' "$(_json_string "$(_now_iso)")"
+    printf '  "helper_version": %s\n' "$(_json_string "$HELPER_VERSION")"
+    printf '}\n'
+}
+
+# --- ロック 2-B: 読み取り専用での再マウント（§14.2） ---------------------
+# 失敗しても取り込みは続行し、mount_readonly: false を書く。
+# **失敗は安全側へ倒れる** — reaper は検証 2 で削除を拒否する（§14.1.1）。
+
+_is_mounted_readonly() {   # $1=volume path
+    # **diskutil の終了コードを信用しない。**実際のマウント状態を独立に確認する
+    # （「DB の status を信用せず実ファイルを読み直す」と同じ方針。§14.1）
+    mount 2>/dev/null | grep -F " on $1 " | grep -q "read-only"
+}
+
+_device_node() {           # $1=volume path
+    command -v plutil >/dev/null 2>&1 || return 1
+    diskutil info -plist "$1" 2>/dev/null \
+        | plutil -extract DeviceNode raw - -o - 2>/dev/null
+}
+
+remount_readonly() {       # $1=volume path。成功なら 0、失敗なら理由語を stdout へ
+    local node
+    # **既に目的の状態なら何もしない。**読み取り専用のボリュームは unmount を拒否され
+    # （DiskArbitration の dissent 0xF8DA0008）、**成功した直後の実行が必ず「失敗」を
+    # 報告することになる。**加えて、5 分ごとに unmount し直すこと自体が EBUSY の機会を
+    # 作る（2026-09-14 に実機で 34 サイクル中 3 回踏んだ。#107）
+    _is_mounted_readonly "$1" && return 0
+    command -v diskutil >/dev/null 2>&1 || { printf 'no_diskutil'; return 1; }
+    node="$(_device_node "$1")" || { printf 'no_device_node'; return 1; }
+    [ -n "$node" ] || { printf 'no_device_node'; return 1; }
+    diskutil unmount "$1" >/dev/null 2>&1 || { printf 'unmount_failed'; return 1; }
+    diskutil mount readOnly "$node" >/dev/null 2>&1 || { printf 'mount_failed'; return 1; }
+    # **理由語は固定文字列にする。**diskutil のメッセージはロケールで変わる
+    _is_mounted_readonly "$1" || { printf 'still_writable'; return 1; }
+}
+
+# --- state の書き出し（§7.5。どちらも .tmp → mv） -----------------------
+
+MOUNT_READONLY="false"
+
+# 設定値を JSON の真偽値へ正規化する。
+# **`true` 以外はすべて `false` にする。**検証 6 に違反した値（例: `yes`）をそのまま
+# 書くと **JSON が壊れ、`config_error` を読ませたい場面でコンテナが読めなくなる。**
+# 「不明は安全側へ倒す」（§7.5）に従い、削除は許可しない側へ寄せる。
+_json_bool() { [ "$1" = "true" ] && printf 'true' || printf 'false'; }
+
+write_heartbeat() {
+    local dest="$VOICEDOCK_HOME/state/heartbeat.json"
+    local reaper="false" error_json="null" include_json exclude_json
+    mkdir -p "$VOICEDOCK_HOME/state" 2>/dev/null || return 0
+    [ -x "$VOICEDOCK_HOME/bin/voicedock-reaper" ] && reaper="true"
+    [ -z "$CONFIG_ERROR" ] || error_json="$(_json_string "$CONFIG_ERROR")"
+
+    if _is_array INCLUDE_VOLUMES && [ ${#INCLUDE_VOLUMES[@]} -gt 0 ]; then
+        include_json="$(_json_array "${INCLUDE_VOLUMES[@]}")"
+    else
+        include_json="$(_json_array)"
+    fi
+    if _is_array EXCLUDE_VOLUMES && [ ${#EXCLUDE_VOLUMES[@]} -gt 0 ]; then
+        exclude_json="$(_json_array "${EXCLUDE_VOLUMES[@]}")"
+    else
+        exclude_json="$(_json_array)"
+    fi
+
+    {
+        printf '{\n'
+        printf '  "schema": %s,\n' "$HEARTBEAT_SCHEMA"
+        printf '  "updated_at": %s,\n' "$(_json_string "$(_now_iso)")"
+        printf '  "helper_version": %s,\n' "$(_json_string "$HELPER_VERSION")"
+        printf '  "mount_mode": %s,\n' "$(_json_string "${MOUNT_MODE:-ro}")"
+        printf '  "mount_readonly": %s,\n' "$MOUNT_READONLY"
+        printf '  "delete_source_audio": %s,\n' "$(_json_bool "${DELETE_SOURCE_AUDIO:-false}")"
+        printf '  "reaper_installed": %s,\n' "$reaper"
+        printf '  "include_volumes": %s,\n' "$include_json"
+        printf '  "exclude_volumes": %s,\n' "$exclude_json"
+        printf '  "config_error": %s\n' "$error_json"
+        printf '}\n'
+    } > "$dest.tmp"
+    mv "$dest.tmp" "$dest"
+}
+
+# inventory は全デバイス分をまとめて 1 回書く。device_id ごとの relpath リストを
+# 一時ファイルへ溜めておく（bash 3.2 に連想配列が無いため）。
+INVENTORY_WORK=""
+
+# 空き容量は device_id と並列の 2 本の配列で持つ。**bash 3.2 に連想配列は無い**（§3.2）。
+FREE_DEVICE=()
+FREE_BYTES=()
+
+inventory_free_add() {     # $1=device_id, $2=bytes（空なら載せない）
+    [ -n "${2:-}" ] || return 0
+    FREE_DEVICE+=("$1")
+    FREE_BYTES+=("$2")
+}
+
+inventory_add() {          # $1=device_id, $2...=relpath
+    local device_id="$1"; shift
+    local rel
+    [ -n "$INVENTORY_WORK" ] || return 0
+    if [ "$#" -gt 0 ]; then
+        for rel in "$@"; do
+            printf '%s\t%s\n' "$device_id" "$rel" >> "$INVENTORY_WORK"
+        done
+    else
+        # **録音 0 件のデバイスはここへ来る**（変更 BO-1）。§5.4 規則 5 は「録音が
+        # 1 件以上ある」を**検出**の条件にしているが、**検出した後に最後の 1 本を
+        # 削除すれば 0 件になる** —— それはこの系の定常状態そのものである。
+        # v5.52 までコメントは「通常ここへ来ない」と書いてあり、`write_inventory()` が
+        # その前提で壊れていた。
+        printf '%s\t\n' "$device_id" >> "$INVENTORY_WORK"
+    fi
+}
+
+write_inventory() {
+    local dest="$VOICEDOCK_HOME/state/inventory.json"
+    mkdir -p "$VOICEDOCK_HOME/state" 2>/dev/null || return 0
+    {
+        printf '{\n'
+        printf '  "schema": %s,\n' "$INVENTORY_SCHEMA"
+        printf '  "generated_at": %s,\n' "$(_json_string "$(_now_iso)")"
+        printf '  "mount_readonly": %s,\n' "$MOUNT_READONLY"
+        printf '  "device_free_bytes": {'
+        local first_free=1 fi_idx=0
+        while [ "$fi_idx" -lt ${#FREE_DEVICE[@]} ]; do
+            [ "$first_free" -eq 1 ] || printf ','
+            first_free=0
+            printf '\n    %s: %s' \
+                "$(_json_string "${FREE_DEVICE[$fi_idx]}")" "${FREE_BYTES[$fi_idx]}"
+            fi_idx=$((fi_idx + 1))
+        done
+        if [ "$first_free" -eq 1 ]; then
+            printf '},\n'
+        else
+            printf '\n  },\n'
+        fi
+        printf '  "devices": {'
+        local first_device=1 device prev_device="" line rel
+        # device_id, relpath の両方でソートする。**出力が決定的でないとテストが書けない**
+        if [ -s "$INVENTORY_WORK" ]; then
+            LC_ALL=C sort "$INVENTORY_WORK" | while IFS="$(printf '\t')" read -r device rel; do
+                if [ "$device" != "$prev_device" ]; then
+                    [ "$first_device" -eq 1 ] || printf '\n    ],'
+                    first_device=0
+                    printf '\n    %s: [' "$(_json_string "$device")"
+                    prev_device="$device"
+                    # ★`[ -n "$rel" ] && printf ...` と書いてはならない（変更 BO-1）。
+                    #   **録音 0 件のデバイスでは `rel` が空**であり、それがループ本体の
+                    #   最後のコマンドになると while が 1 を返す。`sort | while` の
+                    #   パイプラインも 1 になり、`set -euo pipefail` が
+                    #   **`{ ... }` ブロックごと中断する** —— tmp が途中で切れ、
+                    #   `mv` も `run_reaper` も実行されない。`if` なら偽でも 0 を返す
+                    if [ -n "$rel" ]; then
+                        printf '\n      %s' "$(_json_string "$rel")"
+                    fi
+                else
+                    if [ -n "$rel" ]; then
+                        printf ',\n      %s' "$(_json_string "$rel")"
+                    fi
+                fi
+            done
+            printf '\n    ]\n  }\n'
+        else
+            printf '}\n'
+        fi
+        printf '}\n'
+    } > "$dest.tmp"
+    mv "$dest.tmp" "$dest"
+}
+
+# --- ログの退避（§10.1 手順 2） ------------------------------------------
+
+rotate_log() {
+    local log="$VOICEDOCK_HOME/log/ingest.log" size
+    [ -f "$log" ] || return 0
+    size="$(_stat_size "$log" 2>/dev/null)" || return 0
+    [ "$size" -gt "$LOG_MAX_BYTES" ] || return 0
+    mv "$log" "$log.1"
+    info "log_rotated bytes=$size"
+}
+
+# --- 排他（§10.1 手順 1） ------------------------------------------------
+
+LOCK_DIR=""
+LOCK_HELD=0
+
+release_lock() {
+    [ "$LOCK_HELD" -eq 1 ] || return 0
+    rm -f "$LOCK_DIR/pid"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    LOCK_HELD=0
+}
+
+_steal_lock() {            # $1=理由
+    warn "lock_stolen reason=$1"
+    rm -f "$LOCK_DIR/pid"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
+acquire_lock() {
+    LOCK_DIR="$VOICEDOCK_HOME/state/.ingest.lock"
+    mkdir -p "$VOICEDOCK_HOME/state"
+    local other age now
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        LOCK_HELD=1
+        printf '%s\n' "$$" > "$LOCK_DIR/pid"
+        return 0
+    fi
+    other="$(cat "$LOCK_DIR/pid" 2>/dev/null || printf '')"
+    # 生きていない PID なら即座に奪う。**この規則が無いと、ingest が途中で落ちた時点から
+    # 永久に 1 本も取り込まれない**（§22 R-23。症状は「何も起きない」なので気づけない）
+    if [ -z "$other" ] || ! kill -0 "$other" 2>/dev/null; then
+        _steal_lock "holder pid=${other:-<none>} is not alive"
+    else
+        now="$(_now_epoch)"
+        age=$((now - $(_stat_mtime "$LOCK_DIR" 2>/dev/null || printf '%s' "$now")))
+        if [ "$age" -gt "$LOCK_STALE_SECONDS" ]; then
+            # PID の再利用とハングしたプロセスへの歯止め
+            _steal_lock "lock is ${age}s old (pid=$other)"
+        else
+            info "already_running pid=$other"
+            return 1
+        fi
+    fi
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        LOCK_HELD=1
+        printf '%s\n' "$$" > "$LOCK_DIR/pid"
+        return 0
+    fi
+    warn "lock_unavailable dir=$LOCK_DIR"
+    return 1
+}
+
+# --- main ----------------------------------------------------------------
+
+usage() {
+    cat <<'USAGE'
+usage: voicedock-ingest [--check-config]
+
+  (no args)       デバイスを検出し、安定したファイルを inbox へコピーする（SPEC §10.1）
+  --check-config  helper.conf の起動時検証 1〜7 だけを行う（§7.4）。取り込みはしない
+  --help          この表示
+
+helper.conf の場所は $(dirname "$0")/../helper.conf。
+環境変数 VOICEDOCK_HELPER_CONF で上書きできる。
+USAGE
+}
+
+main() {
+    local check_only=0
+    case "${1:-}" in
+        --check-config) check_only=1 ;;
+        --help | -h) usage; return 0 ;;
+        "") ;;
+        *) usage >&2; return 2 ;;
+    esac
+
+    local conf
+    conf="$(locate_conf)"
+    # **事前に空配列を入れてはならない。**bash では既存の配列変数へスカラーを代入すると
+    # 要素 0 への代入になるため、`declare -p` は `declare -a` のままになり、
+    # **§7.4 検査 3（文字列で書かれた設定の拒否）が効かなくなる。**
+    # 環境から継承した値も同じ理由で消す。
+    unset INCLUDE_VOLUMES EXCLUDE_VOLUMES 2>/dev/null || true
+    if load_conf "$conf"; then
+        validate_conf || true
+    fi
+
+    if [ -n "$CONFIG_ERROR" ]; then
+        error "config_error $CONFIG_ERROR"
+        # 取り込みは一切しない。**設定ミスで無言のまま 1 本も取り込まれない状態を作らない**
+        # （§7.4 / §22 R-23）。heartbeat へ書ければコンテナの H-8 / D-18 が拾う
+        [ -d "${VOICEDOCK_HOME:-}" ] && write_heartbeat
+        return 1
+    fi
+    [ "$check_only" -eq 0 ] || { info "config_ok conf=$conf"; return 0; }
+
+    acquire_lock || return 0
+    trap release_lock EXIT INT TERM
+
+    rotate_log
+
+    INVENTORY_WORK="$VOICEDOCK_HOME/state/.inventory.$$"
+    : > "$INVENTORY_WORK"
+
+    detect_devices
+
+    if [ ${#DEVICES[@]} -eq 0 ]; then
+        info "no_device_detected root=$VOLUMES_ROOT"
+    fi
+
+    local device_id path all_readonly=1 i reason
+    i=0
+    while [ "$i" -lt ${#DEVICES[@]} ]; do
+        device_id="${DEVICES[$i]}"
+        path="$VOLUMES_ROOT/$device_id"
+
+        if [ "${MOUNT_MODE}" = "ro" ]; then
+            if reason="$(remount_readonly "$path")"; then
+                info "remounted_readonly name=$device_id"
+            else
+                # 取り込みは続行する（記録を優先。§1.3）。**理由語を残す** — 5 つの
+                # 失敗経路が 1 行に潰れていると、ログだけでは原因を切り分けられない
+                warn "remount_readonly_failed name=$device_id reason=${reason:-unknown}"
+            fi
+        fi
+
+        # **観測して決める。試行の成否からではない**（§14.2 のロック 2-B が読む値である）。
+        # 読み取り専用で再マウントされた後は unmount が拒否されるため、**成功の直後の実行が
+        # 「失敗」を報告する。**それを信じると、デバイスが保護されているのに
+        # `mount_readonly: false` を書く（2026-09-14 に実機で 10 分間そうなった。#107）。
+        #
+        # **`MOUNT_MODE=rw` でも観測する。**利用者が手で読み取り専用にしている場合があり、
+        # そのとき削除を許すと書き込みに失敗する。`_is_mounted_readonly()` 自身が
+        # 「diskutil の終了コードを信用しない」と書いているのと同じ理由である
+        _is_mounted_readonly "$path" || all_readonly=0
+
+        # **途中経過でも heartbeat を書けるようにする**（#117）。ここまでに観測した
+        # デバイスの論理積であり、**残りが書き込み可能なら後で `false` に戻る。**
+        # 途中で `true` に見えるのは**削除を止める側**なので安全である
+        # （§14.2 のロック 2-B は `mount_readonly == false` で開く）
+        if [ "$all_readonly" -eq 1 ]; then
+            MOUNT_READONLY="true"
+        else
+            MOUNT_READONLY="false"
+        fi
+        write_heartbeat
+
+        # **空き容量は remount の後に測る。**読み取り専用での再マウントは
+        # 空き容量を変えないが、失敗して別の扱いになった場合に実際の状態を映す
+        inventory_free_add "$device_id" "$(_free_bytes "$path")"
+
+        ALL_RELPATH=()
+        CAND_RELPATH=(); CAND_SRC=(); CAND_SIZE=(); CAND_MTIME=(); CAND_OK=()
+        _scan_dir "$path" "" "$MAX_SCAN_DEPTH" "$device_id"
+        info "scanned name=$device_id files=${#ALL_RELPATH[@]} candidates=${#CAND_SRC[@]}"
+
+        if [ ${#ALL_RELPATH[@]} -gt 0 ]; then
+            inventory_add "$device_id" "${ALL_RELPATH[@]}"
+        else
+            inventory_add "$device_id"
+        fi
+
+        check_stability
+        copy_candidates "$device_id"
+        i=$((i + 1))
+    done
+
+    # **デバイスが 0 個なら `MOUNT_READONLY` は初期値の `false` のままである。**
+    # ループ内で更新するようになった（#117）ので、ここは最終確認だけを行う
+    if [ ${#DEVICES[@]} -gt 0 ] && [ "$all_readonly" -eq 1 ]; then
+        MOUNT_READONLY="true"
+    fi
+
+    write_inventory
+    write_heartbeat
+    rm -f "$INVENTORY_WORK"
+    run_reaper
+    info "ingest_finished devices=${#DEVICES[@]}"
+}
+
+# 削除要求の処理（§10.1 手順 7 / §14.3。v5.40→v5.41 の変更 BC-2）。
+#
+# **reaper を起動するのはここだけである。**LaunchAgent を 2 つにしない。
+#
+#   1. **TCC。**launchd から起動したプロセスがリムーバブルボリュームを読むには
+#      ad-hoc 署名したラッパが要る（§3.4(7)）。**子プロセスなら ingest の TCC を継承する。**
+#      2 つ目の LaunchAgent には 2 つ目のラッパが要る
+#   2. **契機が同じ。**reaper が仕事をできるのはデバイスが挿さっているときだけであり、
+#      それは ingest が走る条件そのものである
+#
+# **配置されていなければ何もしない**（安全ロック 2-A はそのまま。§14.2）。
+# **失敗しても取り込みを落とさない** —— 取り込みは記録の保全、削除は容量の解放であり、
+# 優先順位が違う（§1.3）。ただし**黙って握りつぶさない。**
+run_reaper() {
+    local reaper="$VOICEDOCK_HOME/bin/voicedock-reaper" status=0
+    [ -x "$reaper" ] || return 0
+    # **終了コードを先に捕まえる。**`if ! "$reaper"; then warn "exit=$?"` は
+    # `!` の結果（常に 0）を見てしまう
+    "$reaper" || status=$?
+    [ "$status" -eq 0 ] || warn "reaper_failed exit=$status"
+}
+
+main "$@"

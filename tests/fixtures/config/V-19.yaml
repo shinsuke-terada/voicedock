@@ -1,0 +1,10 @@
+# SPEC §7.3 V-19 の違反。config.example.yaml へ patch を深くマージして使う。
+# '#' で始まらない
+rule: V-19
+code: CONFIG_INVALID_VALUE
+key: llm.analysis.sections.summary.heading
+patch:
+  llm:
+    analysis:
+      sections:
+        summary: {enabled: true, heading: "Summary"}

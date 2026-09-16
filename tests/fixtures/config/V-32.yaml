@@ -1,0 +1,6 @@
+# SPEC §7.3 V-32 の違反。config.example.yaml へ patch を深くマージして使う。
+rule: V-32
+code: CONFIG_INVALID_VALUE
+key: timezone
+patch:
+  timezone: Asia/Nowhere

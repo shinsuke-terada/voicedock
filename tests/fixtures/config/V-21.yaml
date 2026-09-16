@@ -1,0 +1,7 @@
+# SPEC §7.3 V-21 の違反。config.example.yaml へ patch を深くマージして使う。
+rule: V-21
+code: CONFIG_INVALID_VALUE
+key: cleanup.retain_transcript_days
+patch:
+  cleanup:
+    retain_transcript_days: 7

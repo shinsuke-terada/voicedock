@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  # feat/** も対象にする。**積み上げた PR（stacked PR）で CI が走らないのを避けるため。**
+  # develop へ直接向けられない PR（マージ前の別ブランチを base にするもの）は
+  # base が main / develop でないため、この行が無いと 1 度も検証されないまま
+  # マージ可能な状態に見える。base が先にマージされれば GitHub が自動で
+  # develop へ張り替えるので、そのときは通常の経路で再度走る。
+  pull_request:
+    branches: [main, develop, "feat/**", "docs/**"]
+
+permissions:
+  contents: read
+
+# CI はプロジェクトイメージをビルドしない。
+# #5 以降 Dockerfile は whisper.cpp をソースからビルドするため、PR ごとに回すには重すぎる。
+# §20.2 の統合テストが実 ffmpeg を要求するようになったら、ここで apt-get install ffmpeg を足す
+# （イメージ全体のビルドはしない）。
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # setup-uv は v8 以降 浮動メジャータグ（vN）を打っていないため完全な版へピンする。
+      # §18.5「latest / master への無条件依存を禁止する」にも沿う。
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: "0.12.13"   # Makefile の UV_IMAGE と同じ版に揃える（SPEC §18.5）
+          enable-cache: true
+
+      - run: uv sync --frozen
+
+      - name: ruff (lint)
+        run: uv run ruff check --output-format=github .
+
+      - name: ruff (format)
+        run: uv run ruff format --check .
+
+      - name: mypy --strict
+        run: uv run mypy
+
+      - name: pytest
+        run: uv run pytest -q
+
+  # **削除禁止テストを独立した job にする**（SPEC §20.4 / #37）。
+  # §20.4 は「このテスト群は CI で必ず実行し、1 件でも失敗したらリリースしない」と
+  # 規定している。`check` に混ぜると、他の失敗に紛れて**どれが落ちたのか一目で
+  # 分からない。**`main` の required check にするのもこの job である。
+  #
+  # **正の対照を同じ job で回す。**コンテナ層は
+  # `test_deletion_actually_happens_when_everything_is_valid`、reaper 層は
+  # `test_a_valid_request_actually_deletes` である。これが落ちれば
+  # 「ND が緑なのは何も検証していないから」だと分かる。
+  no-delete:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: "0.12.13"
+          enable-cache: true
+
+      - run: uv sync --frozen
+
+      - name: ND (削除禁止テスト)
+        run: >
+          uv run pytest -q
+          tests/unit/test_no_delete.py
+          tests/unit/test_reaper.py
+          tests/unit/test_no_device_delete.py

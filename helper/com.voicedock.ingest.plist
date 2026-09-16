@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.voicedock.ingest — 取り込みの起動契機（SPEC §10.1）
+
+  **起動契機は 2 つだけで、ポーリングループを持たない。**
+    StartOnMount   : macOS が任意のボリュームをマウントするたびに起動される
+    StartInterval  : 取りこぼしの回収、heartbeat.json の更新、削除の再試行契機（既定 300 秒）
+
+  v3.x の「5 秒ポーリング」は不要になった。launchd がマウントを通知するため常駐ループを
+  持たずに済み、**未接続時の CPU は文字通り 0% になる**（§21.2 Phase 1 の要件）。
+
+  **KeepAlive を書いてはならない。**ingest は 1 回走って終わるプログラムであり、
+  常駐させると上記の「ポーリングループを持たない」に反する。
+
+  @VOICEDOCK_HOME@ と @PROGRAM_ARGUMENTS@ は install.sh が置換する。
+
+  **ProgramArguments はラッパ経由になる**（§3.4(7)）。launchd がシェルスクリプトを
+  直接起動すると TCC の許可が届かず、デバイスを読めない（2026-09-14 に実機で確認）。
+  `cc` が無い環境ではスクリプト直接に退避するが、その場合は録音を取り込めないため
+  doctor の DH-16 が警告する。
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.voicedock.ingest</string>
+
+    <key>ProgramArguments</key>
+    <array>
+@PROGRAM_ARGUMENTS@
+    </array>
+
+    <key>StartOnMount</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>@VOICEDOCK_HOME@/log/ingest.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>@VOICEDOCK_HOME@/log/ingest.log</string>
+</dict>
+</plist>

@@ -1,0 +1,90 @@
+name: voicedock
+
+services:
+  voicedock:
+    build:
+      context: .
+      target: runtime          # dev ステージ（§18.3）を本番イメージに含めないため必須
+      args:
+        WHISPER_CPP_REF: v1.9.4
+
+    restart: unless-stopped
+
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+      VOICEDOCK_CONFIG: /app/config/config.yaml
+
+    volumes:
+      # ★v4.0: /Volumes はマウントしない（§5.6, §14.4 N-3）
+      #   VirtioFS は物理 USB を読めず、読もうとすると Docker 全体が固まりうる
+      #   （docs/POC.md §2）。デバイスへ到達できるのはホストの Helper だけである。
+
+      # Helper と共有する作業領域（§4.1）。/Users 配下なので VirtioFS で動く
+      - ${VOICEDOCK_HOME:?VOICEDOCK_HOME is required}/inbox:/inbox:rw
+      - ${VOICEDOCK_HOME:?VOICEDOCK_HOME is required}/queue:/queue:rw
+      # state は Helper の報告。コンテナから改変させない（§18.2）
+      - ${VOICEDOCK_HOME:?VOICEDOCK_HOME is required}/state:/state:ro
+
+      # Obsidian Vault
+      - ${OBSIDIAN_VAULT:?OBSIDIAN_VAULT is required}:/obsidian:rw
+
+      # SQLite / staging / transcript / analysis
+      - voicedock-data:/data
+
+      # Whisper モデル・VAD モデル
+      - voicedock-models:/models/whisper
+
+      # 設定とプロンプト
+      - ./config:/app/config:ro
+      - ./prompts:/app/prompts:ro
+
+    # LLM への接続（§18.2 / §12.1）。**変数名は config.yaml の endpoint_env /
+    # model_env と一致させる** — 片方だけ変えると D-11 が「未設定」と言い続ける。
+    #
+    # **前提: `docker desktop enable model-runner` とモデルの取得（約 18.6 GB）。**
+    # `scripts/fetch-models.sh` は Whisper と VAD だけで、LLM は `docker model pull` である
+    # （§18.6）。未取得のまま `make up` すると Compose がここで取得を始めうる。
+    models:
+      summarizer:
+        endpoint_var: VOICEDOCK_LLM_URL
+        model_var: VOICEDOCK_LLM_MODEL
+
+    # health は #12 まで未実装のため、それまでコンテナは (unhealthy) と表示される。
+    # 偽の成功を返すスタブを置くより、実態どおり unhealthy と出るほうが正しい。
+    healthcheck:
+      test: ["CMD", "python", "-m", "voicedock.main", "health"]
+      interval: 120s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    # ports: は書かない（§14.4 N-13）。公開ポート 0。
+
+models:
+  summarizer:
+    # 要約用。2026-09-12 に Docker Hub のタグ一覧で実在を確認（約 18.6 GB）
+    model: ai/qwen3:30b-a3b-instruct-2507-q4_K_M
+    context_size: 32768
+
+volumes:
+  # **`name:` を明示する。**書かないと Compose がプロジェクト名を前置して
+  # `voicedock_voicedock-models` になり、**`scripts/fetch-models.sh` が書き込む
+  # `voicedock-models` とは別の volume をマウントする**（§18.6 の `docker run -v` も同じ名前）。
+  # 症状は「574 MB を取得したのに D-8 がモデルを見つけない」であり、
+  # 取得の失敗と区別がつかない（2026-09-14 に実機で踏んだ。#95）。
+  voicedock-data:
+    name: voicedock-data
+  voicedock-models:
+    name: voicedock-models

@@ -1,0 +1,8 @@
+# SPEC §7.3 V-10 の違反。config.example.yaml へ patch を深くマージして使う。
+# max_chars_per_request（20000）が overlap の 2 倍を超えなくなる
+rule: V-10
+code: CONFIG_INVALID_VALUE
+key: llm.max_chars_per_request
+patch:
+  llm:
+    chunk_overlap_chars: 10000

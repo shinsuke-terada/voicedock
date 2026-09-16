@@ -1,0 +1,436 @@
+"""`voicedock.config` が SPEC §7 と一致することを固定する。
+
+§7.2 の全キーと §7.3 の規則表は `docs/SPEC.md` から parse して突き合わせる。SPEC に
+キーや規則を足して実装を忘れる事故、実装だけ増やして SPEC に書き忘れる事故が即座に落ちる。
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import pytest
+import yaml
+from pydantic import ValidationError
+
+from tests.helpers import (
+    EXAMPLE_PATH,
+    REPO_ROOT,
+    complete_tree,
+    example_document,
+    merge,
+    parsed,
+    write_heartbeat,
+)
+from tests.spec_sync import spec_config_example, spec_validation_rules
+from voicedock import config as config_module
+from voicedock.config import (
+    IMPLEMENTED_RULES,
+    NO_RULE,
+    RULES,
+    Config,
+    ConfigError,
+    ConfigUnreadable,
+    Violation,
+    check_files,
+    check_locks,
+    config_path,
+    key_count,
+    load_config,
+    logger_for,
+    parse_config,
+    startup_notices,
+)
+from voicedock.errors import ErrorCode
+
+FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures" / "config"
+
+# 専用のテスト関数で扱う規則（fixture を置かないもの）
+FILE_RULES = frozenset({"V-20", "V-23", "V-24", "V-25"})
+LOCK_RULES = frozenset({"V-26", "V-30", "V-33"})
+
+NOW = datetime(2026, 8, 30, 7, 0, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+
+
+# --- ヘルパ --------------------------------------------------------------
+
+
+def fixtures() -> list[dict[str, Any]]:
+    loaded = []
+    for path in sorted(FIXTURE_DIR.glob("*.yaml")):
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert isinstance(data, dict), path
+        data["__name__"] = path.stem
+        loaded.append(data)
+    assert loaded, f"fixture が見つかりません: {FIXTURE_DIR}"
+    return loaded
+
+
+# --- SPEC 整合 -----------------------------------------------------------
+
+
+def test_example_matches_spec() -> None:
+    """`config.example.yaml` が §7.2 の YAML ブロックと完全一致すること。"""
+    assert example_document() == spec_config_example()
+
+
+def test_example_has_no_violations() -> None:
+    """例そのものが §7.3 を通ること（ファイル実在検査は除く）。"""
+    cfg, violations = parse_config(example_document())
+    assert violations == []
+    assert cfg is not None
+
+
+def test_implemented_rules_match_spec() -> None:
+    """§7.3 の非廃止規則と `RULES` が 1 対 1 であること。"""
+    assert frozenset(spec_validation_rules()) == IMPLEMENTED_RULES
+
+
+def test_rules_follow_spec_order() -> None:
+    assert [r.id for r in RULES] == list(spec_validation_rules())
+
+
+def test_fixtures_cover_every_rule() -> None:
+    """全規則にテストがあること。SPEC に規則を足すと落ちる。"""
+    covered = {f["rule"] for f in fixtures()} | FILE_RULES | LOCK_RULES
+    assert covered == IMPLEMENTED_RULES
+
+
+# --- 個別の規則 ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("fixture", fixtures(), ids=lambda f: str(f["__name__"]))
+def test_fixture_yields_expected_violation(fixture: dict[str, Any]) -> None:
+    document = merge(example_document(), fixture["patch"])
+    cfg, violations = parse_config(document)
+    assert cfg is None
+    assert len(violations) == 1, violations
+    found = violations[0]
+    assert found.rule == fixture["rule"]
+    assert found.code == ErrorCode(fixture["code"])
+    assert found.key == fixture["key"]
+    assert found.message
+
+
+def test_missing_key_is_reported() -> None:
+    """§7.3 に規則が無いキーの欠落は `NO_RULE` として報告し、起動は中止する。
+
+    §7.2 の形をしていない設定では処理を続けられない。全フィールドを必須にしているのは、
+    既定値をコードへ置くと §7.2 と二重管理になるからである（§7.4 の注記）。
+    """
+    document = example_document()
+    del document["database"]["path"]
+    _cfg, violations = parse_config(document)
+    assert len(violations) == 1
+    assert violations[0].rule == NO_RULE
+    assert violations[0].code is ErrorCode.CONFIG_INVALID_VALUE
+    assert violations[0].key == "database.path"
+
+
+def test_missing_key_with_a_rule_is_reported_as_that_rule() -> None:
+    """V 規則が付いているキーの欠落は、その規則違反として報告する。
+
+    `audio.target_codec` が無いことは V-3（`pcm_s16le` であること）の違反そのものである。
+    """
+    document = example_document()
+    del document["audio"]["target_codec"]
+    _cfg, violations = parse_config(document)
+    assert [(v.rule, v.key) for v in violations] == [("V-3", "audio.target_codec")]
+
+
+def test_wrong_subtree_type_is_reported() -> None:
+    document = merge(example_document(), {"audio": 5})
+    _cfg, violations = parse_config(document)
+    assert len(violations) == 1
+    assert violations[0].rule == NO_RULE
+    assert violations[0].key == "audio"
+
+
+def test_import_key_is_reported_by_alias() -> None:
+    """`import` は予約語なので属性名は `import_` だが、**報告は `import.` で行う**。"""
+    document = merge(example_document(), {"import": {"inbox_retain": "both"}})
+    _cfg, violations = parse_config(document)
+    assert [v.key for v in violations] == ["import.inbox_retain"]
+
+
+def test_unknown_top_level_key() -> None:
+    document = merge(example_document(), {"unknown_key": 1})
+    _cfg, violations = parse_config(document)
+    assert len(violations) == 1
+    assert violations[0].rule == "V-1"
+    assert violations[0].code is ErrorCode.CONFIG_UNKNOWN_KEY
+    assert violations[0].key == "unknown_key"
+
+
+# --- ファイル実在検査 ----------------------------------------------------
+
+
+def test_complete_tree_passes_file_checks(tmp_path: Path) -> None:
+    assert check_files(parsed(complete_tree(tmp_path))) == []
+
+
+@pytest.mark.parametrize(
+    ("rule", "key", "code"),
+    [
+        ("V-20", "llm.prompts.analyze", ErrorCode.CONFIG_INVALID_VALUE),
+        ("V-20", "llm.prompts.repair", ErrorCode.CONFIG_INVALID_VALUE),
+        ("V-23", "transcription.model", ErrorCode.WHISPER_MODEL_MISSING),
+        ("V-24", "transcription.executable", ErrorCode.WHISPER_EXEC_MISSING),
+        ("V-25", "transcription.vad.model", ErrorCode.WHISPER_MODEL_MISSING),
+    ],
+)
+def test_file_rules(tmp_path: Path, rule: str, key: str, code: ErrorCode) -> None:
+    """**対象のキーだけを存在しないパスへ向ける。**
+
+    以前は `complete_tree()` が `tmp_path` へ置いた偽ファイルを `unlink()` していたが、
+    #25 で `llm.prompts.*` が**リポジトリの本物**を指すようになった。消す方式のままだと
+    `prompts/analyze_ja.txt` をテストが削除することになる（§20.2 が禁じている形）。
+    """
+    document = _redirect(complete_tree(tmp_path), key, tmp_path / "absent-on-purpose")
+    violations = check_files(parsed(document))
+    assert [(v.rule, v.key, v.code) for v in violations] == [(rule, key, code)]
+
+
+def _redirect(document: dict[str, Any], dotted: str, target: Path) -> dict[str, Any]:
+    """`"llm.prompts.analyze"` のようなキーを `target` へ差し替えた写しを返す。"""
+    *head, leaf = dotted.split(".")
+    patch: dict[str, Any] = {leaf: str(target)}
+    for name in reversed(head):
+        patch = {name: patch}
+    return merge(document, patch)
+
+
+def test_v24_requires_the_executable_bit(tmp_path: Path) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root では os.access(X_OK) が常に真になるため、この検査は成立しない")
+    document = complete_tree(tmp_path)
+    (tmp_path / "whisper-cli").chmod(0o644)
+    violations = check_files(parsed(document))
+    assert [(v.rule, v.code) for v in violations] == [("V-24", ErrorCode.WHISPER_EXEC_MISSING)]
+    assert "実行できません" in violations[0].message
+
+
+def test_v25_is_skipped_when_vad_is_disabled(tmp_path: Path) -> None:
+    document = complete_tree(tmp_path)
+    (tmp_path / "vad.bin").unlink()
+    document = merge(document, {"transcription": {"vad": {"enabled": False}}})
+    assert check_files(parsed(document)) == []
+
+
+# --- 削除ロック（V-26 / V-30） -------------------------------------------
+
+
+def enabled(tmp_path: Path) -> Config:
+    return parsed(merge(complete_tree(tmp_path), {"cleanup": {"delete_source_audio": True}}))
+
+
+def test_no_notice_when_deletion_is_disabled(tmp_path: Path) -> None:
+    cfg = parsed(complete_tree(tmp_path))
+    state = tmp_path / "state"
+    assert startup_notices(cfg, state_root=state, now=NOW) == []
+    assert check_locks(cfg, state_root=state, now=NOW) == []
+
+
+def test_v26_notice_when_enabled(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    write_heartbeat(state, updated_at=NOW.isoformat(), delete_source_audio=True)
+    notices = startup_notices(enabled(tmp_path), state_root=state, now=NOW)
+    # V-33 も出る（MOUNT_MODE を報告していないため不明。§7.3）
+    assert [n.rule for n in notices] == ["V-26", "V-33"]
+
+
+def test_v30_confirmed_mismatch_is_a_violation(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    write_heartbeat(state, updated_at=NOW.isoformat(), delete_source_audio=False)
+    violations = check_locks(enabled(tmp_path), state_root=state, now=NOW)
+    assert [(v.rule, v.code, v.key) for v in violations] == [
+        ("V-30", ErrorCode.CONFIG_LOCK_MISMATCH, "cleanup.delete_source_audio")
+    ]
+
+
+def test_v30_agrees(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    write_heartbeat(state, updated_at=NOW.isoformat(), delete_source_audio=True)
+    assert check_locks(enabled(tmp_path), state_root=state, now=NOW) == []
+
+
+@pytest.mark.parametrize("case", ["missing", "stale", "field_absent", "broken"])
+def test_v30_unknown_warns_but_does_not_block(tmp_path: Path, case: str) -> None:
+    """不明は起動を止めない。**Helper 未実装の間にクラッシュループさせない**（§7.3）。"""
+    state = tmp_path / "state"
+    if case == "stale":
+        old = NOW - timedelta(seconds=3600)
+        write_heartbeat(state, updated_at=old.isoformat(), delete_source_audio=True)
+    elif case == "field_absent":
+        write_heartbeat(state, updated_at=NOW.isoformat())
+    elif case == "broken":
+        state.mkdir(parents=True)
+        (state / "heartbeat.json").write_text("{ not json", encoding="utf-8")
+
+    cfg = enabled(tmp_path)
+    assert check_locks(cfg, state_root=state, now=NOW) == []
+    assert [n.rule for n in startup_notices(cfg, state_root=state, now=NOW)] == [
+        "V-26",
+        "V-30",
+        "V-33",
+    ]
+
+
+def test_v33_a_read_only_mount_mode_is_a_violation(tmp_path: Path) -> None:
+    """V-33: **ロック 2-B が掛かったまま解除すると、何も進まない**（#145）。
+
+    削除は 1 件も行われず、**セッションも `SAVED` のまま止まる**（`cleanup_staging()` が
+    呼ばれないので staging が溜まり続ける）。**安全側ではあるが進まない。**
+    """
+    state = tmp_path / "state"
+    write_heartbeat(state, updated_at=NOW.isoformat(), delete_source_audio=True, mount_mode="ro")
+    violations = check_locks(enabled(tmp_path), state_root=state, now=NOW)
+    assert [(v.rule, v.code, v.key) for v in violations] == [
+        ("V-33", ErrorCode.CONFIG_LOCK_MISMATCH, "cleanup.delete_source_audio")
+    ]
+
+
+def test_v33_accepts_rw(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    write_heartbeat(state, updated_at=NOW.isoformat(), delete_source_audio=True, mount_mode="rw")
+    assert check_locks(enabled(tmp_path), state_root=state, now=NOW) == []
+
+
+def test_v33_unknown_warns_but_does_not_block(tmp_path: Path) -> None:
+    """**不明は止めない**（§7.3。V-30 と同じ規則）。"""
+    state = tmp_path / "state"
+    write_heartbeat(state, updated_at=NOW.isoformat(), delete_source_audio=True)
+    cfg = enabled(tmp_path)
+    assert check_locks(cfg, state_root=state, now=NOW) == []
+    assert "V-33" in {n.rule for n in startup_notices(cfg, state_root=state, now=NOW)}
+
+
+def test_v30_and_v33_are_reported_together(tmp_path: Path) -> None:
+    """**両方落ちているなら両方出す。**1 つ直して再起動、を繰り返させない。"""
+    state = tmp_path / "state"
+    write_heartbeat(state, updated_at=NOW.isoformat(), delete_source_audio=False, mount_mode="ro")
+    violations = check_locks(enabled(tmp_path), state_root=state, now=NOW)
+    assert [v.rule for v in violations] == ["V-30", "V-33"]
+
+
+# --- 読み込み API --------------------------------------------------------
+
+
+def test_load_config_succeeds_on_complete_tree(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(complete_tree(tmp_path)), encoding="utf-8")
+    cfg = load_config(path, state_root=tmp_path / "state", now=NOW)
+    assert cfg.timezone == "Asia/Tokyo"
+
+
+def test_load_config_raises_with_all_violations(tmp_path: Path) -> None:
+    document = merge(example_document(), {"audio": {"target_sample_rate": 44100}})
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path, state_root=tmp_path / "state", now=NOW)
+    assert excinfo.value.path == path
+    assert [v.rule for v in excinfo.value.violations] == ["V-3"]
+
+
+def test_load_config_reports_missing_file(tmp_path: Path) -> None:
+    with pytest.raises(ConfigUnreadable) as excinfo:
+        load_config(tmp_path / "nope.yaml")
+    assert "設定ファイルがありません" in excinfo.value.violations[0].message
+
+
+def test_load_config_reports_broken_yaml(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("a: [1,\n", encoding="utf-8")
+    with pytest.raises(ConfigUnreadable) as excinfo:
+        load_config(path)
+    assert "YAML" in excinfo.value.violations[0].message
+
+
+def test_load_config_reports_non_mapping(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("- 1\n", encoding="utf-8")
+    with pytest.raises(ConfigUnreadable):
+        load_config(path)
+
+
+def test_check_filesystem_can_be_skipped(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(EXAMPLE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+    cfg = load_config(path, state_root=tmp_path / "state", check_filesystem=False)
+    assert cfg.transcription.language == "ja"
+
+
+# --- その他 --------------------------------------------------------------
+
+
+def test_key_count_counts_leaves() -> None:
+    document = example_document()
+
+    def leaves(node: Any) -> int:
+        if isinstance(node, dict):
+            return sum(leaves(v) for v in node.values())
+        return 1
+
+    assert key_count(document) == leaves(document)
+    # v5.48 で `obsidian.raw.granularity`（BJ-1）、v5.52 で
+    # `obsidian.wiki.include_transcript` / `link_raw`（BN-1）を廃止して 3 つ減った
+    assert key_count(document) == 105
+
+
+def test_config_is_frozen() -> None:
+    cfg = parsed(example_document())
+    with pytest.raises(ValidationError):
+        cfg.timezone = "UTC"
+
+
+def test_tz_property() -> None:
+    assert parsed(example_document()).tz == ZoneInfo("Asia/Tokyo")
+
+
+def test_config_path_uses_the_env_var(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    elsewhere = tmp_path / "elsewhere.yaml"
+    monkeypatch.setenv("VOICEDOCK_CONFIG", str(elsewhere))
+    assert config_path() == elsewhere
+    monkeypatch.delenv("VOICEDOCK_CONFIG")
+    assert config_path() == config_module.DEFAULT_CONFIG_PATH
+
+
+def test_no_env_override_mechanism() -> None:
+    """§7 の「環境変数による個別キーの上書き機構は提供しない」をコードで固定する。
+
+    `config.py` が触る環境変数は `VOICEDOCK_CONFIG` の 1 つだけでなければならない。
+    キーごとの env 上書きが入ると、設定の出所が二重になって追えなくなる。
+    """
+    source = (REPO_ROOT / "src" / "voicedock" / "config.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    reads = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr in ("environ", "getenv")
+    ]
+    assert len(reads) == 1, f"os.environ / os.getenv の参照は 1 箇所だけにする: {len(reads)}"
+    assert config_module.CONFIG_PATH_ENV == "VOICEDOCK_CONFIG"
+
+
+def test_logger_for_uses_the_config(capsys: pytest.CaptureFixture[str]) -> None:
+    """format / level / timezone が設定どおりにロガーへ渡ること。"""
+    document = merge(
+        example_document(),
+        {"timezone": "UTC", "logging": {"format": "json", "level": "DEBUG"}},
+    )
+    logger_for(parsed(document)).debug("service_started", version="0.1.0")
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["level"] == "DEBUG"
+    assert payload["event"] == "service_started"
+    assert payload["ts"].endswith("+00:00")
+
+
+def test_violation_render() -> None:
+    violation = Violation("V-3", ErrorCode.CONFIG_INVALID_VALUE, "audio.x", "だめ")
+    assert violation.render() == "V-3  CONFIG_INVALID_VALUE  audio.x: だめ"

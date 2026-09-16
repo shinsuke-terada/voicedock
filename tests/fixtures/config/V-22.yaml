@@ -1,0 +1,8 @@
+# SPEC §7.3 V-22 の違反。config.example.yaml へ patch を深くマージして使う。
+# free_space_margin_bytes（2 GiB）以下になる
+rule: V-22
+code: CONFIG_INVALID_VALUE
+key: import.staging_max_bytes
+patch:
+  import:
+    staging_max_bytes: 1000

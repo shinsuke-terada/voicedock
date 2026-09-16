@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "voicedock"
+description = "DJI Mic 3 の録音をローカル完結で文字起こし・要約し Obsidian へ保存する"
+requires-python = ">=3.12,<3.13"
+dynamic = ["version"]
+# SPEC §11.4。これ以外を足さない（SQLite は標準ライブラリ、CLI は argparse）
+dependencies = [
+    "PyYAML>=6,<7",
+    "httpx>=0.28,<0.29",
+    "pydantic>=2.9,<3",
+]
+
+[project.scripts]
+voicedock = "voicedock.main:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9,<10",
+    "ruff>=0.16,<0.17",
+    "mypy>=2.3,<3",
+    # PyYAML は型スタブを同梱しない。mypy --strict が通らなくなるため dev に入れる
+    "types-PyYAML>=6,<7",
+]
+
+# 版の出所を 1 つにする。__init__.py と pyproject.toml の二重管理は必ずどちらかが古くなる
+[tool.hatch.version]
+path = "src/voicedock/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/voicedock"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+# ruff は Markdown 内の Python コードブロックも整形対象にする。
+# docs/ は SPEC と保管済みの方針書であり、例示コードを機械的に書き換えてはならない。
+#
+# poc/ は Phase 0 の計測用スクリプトで、**イメージへ COPY されない**（§18.3 は src/ だけを入れる）。
+# 除外するのは怠慢ではなく、**計測の意図と lint 規則が衝突するため**である。
+# poc/store_bench.py は `open()` と `os.scandir()` を測っているので、PTH123 / PTH208 の
+# 指示どおり `Path.open()` / `Path.iterdir()` に直すと**測る対象が変わる**。
+# src/ と tests/ は strict のままである。
+extend-exclude = ["docs", "poc"]
+
+[tool.ruff.lint]
+# S（bandit）は SPEC §14.4 の N-5（shell=True 禁止）/ N-6（コマンド文字列の連結禁止）を
+# 機械的に検出するために入れている（S602 / S604 / S605）。規範を目視で守らずに済む。
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "S", "PTH", "RUF"]
+# RUF001/002/003 は全角記号を「曖昧な文字」として咎める。
+# 本プロジェクトは SPEC もコメントも日本語で書く方針であり、全角括弧・全角コロンは正しい表記。
+# 有効にすると日本語を書くたびに落ちるため、この 3 つだけ外す。
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+# 外部の道具が要るテストの印。tests/conftest.py が利用可能性を見て自動 skip する。
+# CI は uv イメージで走るため ffmpeg も whisper-cli も無い（§18.5）。
+markers = [
+    "needs_ffmpeg: ffmpeg / ffprobe が要る（CI には無い。make test で走る）",
+    "needs_whisper: whisper-cli の実体が要る",
+    "needs_llm: LLM への実リクエストが要る（VOICEDOCK_LLM_URL が必要）",
+]

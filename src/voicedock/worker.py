@@ -1,0 +1,399 @@
+"""常駐 worker のループ（SPEC §10.0, §9.4, §15.2）。
+
+**単一 Worker・並列処理なし**（§10.0）。並列化しない理由は CPU 負荷管理、whisper の
+同時実行の回避、状態管理の単純化、**削除事故の回避**、LLM 競合の回避である。
+
+**v4.0 以降、このループはデバイスを一切見ない。**見るのは `/inbox`（Helper が原本を置く
+場所）と `/state`（Helper の報告）だけである。デバイスの検出・走査・安定性判定は
+Helper が行う（§10.1）。
+
+**Helper のハートビートが古ければ取り込みを進めない**（§10.0 / §22 R-23）。Helper が
+止まっているのに「新しい録音が無い」と解釈して静かに待ち続ける状態を作らない。
+
+`cli.py` から分けてあるのは、**`argparse` を通さずにループをテストできるようにする**ため
+である（`cli.py` は §17.1 のパーサとディスパッチだけを持つ層）。
+"""
+
+from __future__ import annotations
+
+import signal
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from types import FrameType
+from typing import Final
+
+from voicedock import __version__, db, device, discover, pipeline, session, wiki
+from voicedock.config import Config
+from voicedock.device import DeviceInventory
+from voicedock.heartbeat import DEFAULT_STATE_ROOT, read_heartbeat
+from voicedock.log import Logger
+from voicedock.paths import PartKey, SessionKey
+from voicedock.states import PART_TERMINAL
+
+STOP_SIGNALS: Final[tuple[signal.Signals, ...]] = (signal.SIGTERM, signal.SIGINT)
+"""`tini` が転送する停止シグナル（§18.3）。"""
+
+
+@dataclass
+class Stopper:
+    """シグナルで立つ停止フラグ。
+
+    **ハンドラの中で何もしない。**DB を触ったりログを書いたりすると、シグナルが
+    トランザクションの途中で届いたときに壊れる。**フラグを立てて、ループの区切りで止まる。**
+    """
+
+    requested: bool = False
+
+    def request(self, _signum: int = 0, _frame: FrameType | None = None) -> None:
+        self.requested = True
+
+    def should_stop(self) -> bool:
+        """フラグを読む。**属性を直接見ない。**
+
+        シグナルハンドラが非同期に書き換えるので、`while not self.stopper.requested`
+        のように属性を見ると**型検査器が「常に偽」と推論して以降を到達不能と判断する。**
+        """
+        return self.requested
+
+    def install(self) -> None:
+        for number in STOP_SIGNALS:
+            signal.signal(number, self.request)
+
+
+@dataclass
+class Worker:
+    """1 つのループ。**状態は `last_inventory_empty` だけ**（§15.2 の立ち上がり判定）。"""
+
+    cfg: Config
+    log: Logger
+    database: db.Database
+    state_root: Path = DEFAULT_STATE_ROOT
+    stopper: Stopper = field(default_factory=Stopper)
+    sleep: Callable[[float], None] = time.sleep
+    clock: Callable[[], datetime] | None = None
+
+    last_inventory_empty: bool | None = None
+    """前回の周回で `inventory.devices` が空だったか。**起動直後は `None`（不明）。**"""
+
+    vault_index: wiki.VaultIndex | None = None
+    """Vault の索引（§13.8）。**周回をまたいで持つ**（変更 BK-3）。
+
+    `obsidian.wiki.vault_index_cache_seconds`（既定 300 秒）の TTL は**保持する者が
+    要る。**v5.48 までキャッシュを持つ者が居らず、`Pipeline` は tick ごとに作り直される
+    ので、**Daily ノートを書くたびに Vault 全体を `scandir` で走査していた** ——
+    1 万ノートの Vault で、再オープンを含めると 1 日 32 回になる（§10.7）。
+
+    `link_tags: false` なら `None` のままである（索引そのものが要らない）。
+    """
+
+    helper_fresh: bool = True
+    """直近の周回で Helper のハートビートが新しかったか（§10.0 / 変更 BH-4）。
+
+    **`Pipeline` へ渡す。**古いときは**新しい削除要求を書かない** —— `inventory.json` も
+    同じだけ古く、**デバイスが在ると言っている根拠が無い**（§7.5）。
+    """
+
+    def now(self) -> datetime:
+        return self.clock() if self.clock is not None else datetime.now(self.cfg.tz)
+
+    # --- 起動時（§9.4） --------------------------------------------------
+
+    def start(self) -> None:
+        """§10.0 のループに入る前の 1 回だけの処理。"""
+        self.log.info(
+            "service_started",
+            version=__version__,
+            schema_version=self.database.schema_version(),
+        )
+        pipeline.recover_interrupted(self.database, cfg=self.cfg, log=self.log)
+        pipeline.close_stale_open_sessions(self.database, cfg=self.cfg, now=self.now())
+        # **起動は §15.2 の再投入の契機である。**`last_inventory_empty` を `None` のまま
+        # 1 周目へ入ることで、最初の周回で必ず再投入が走る
+        self.requeue_failed(None, startup=True)
+
+    # --- 1 周（§10.0） ---------------------------------------------------
+
+    def tick(self) -> bool:
+        """1 周回す。取り込みを進めたら真（テストと `run()` の判定に使う）。
+
+        **順序は §10.0 の擬似コードのままである。**並べ替えてはならない — たとえば
+        `discover_parts` より先に `process_pending_parts` を呼ぶと、**その周回で
+        見つかった Part が 1 周遅れる。**
+
+        **ハートビートが古いときに止めるのは「Helper の報告に依存する段」だけである**
+        （v5.45→v5.46 の変更 BH-4）。§22 R-23 の根拠は「**Helper の死を検出せずに
+        静かに待つな**」であって、「Helper と無関係な処理まで凍らせろ」ではない。
+        v5.45 まではここで即 `return` していたため、**LaunchAgent を止めるだけで
+        文字起こし・LLM・ノート生成・削除評価がすべて止まった** —— どれも Helper に
+        触れないのに、である。
+
+        止めるのは `discover_parts`（`/inbox`）と、`evaluate_deletions` /
+        `requeue_failed`（`inventory.json`）の 3 つ。
+        """
+        inventory = device.read_inventory(self.state_root)
+        self.helper_fresh = not self._helper_is_stale()
+        if self.helper_fresh:
+            self.discover_parts()
+        else:
+            # **取り込みを進めない**（§10.0 / §22 R-23）。`inventory` が読めない場合も
+            # 同じ扱いにする（不明は安全側へ倒す。§7.5）
+            self.log.warning("helper_heartbeat_stale", reason="取り込みを見送る")
+
+        # **ここから 3 段は Helper に一切触れない。**止める理由が無い
+        self.close_idle_sessions()
+        self.process_pending_parts()
+        self.refresh_vault_index()
+        self.process_ready_sessions()
+
+        if self.helper_fresh:
+            # **`inventory.json` に依存する段**（変更 BH-4）。ハートビートが古ければ
+            # inventory も同じだけ古く、**デバイスの在・書込可否について何も言えない**（§7.5）
+            self.evaluate_deletions()
+            self.requeue_failed(inventory)
+        return self.helper_fresh
+
+    def run(self) -> None:
+        """停止が要求されるまで回す。"""
+        self.stopper.install()
+        self.start()
+        while not self.stopper.should_stop():
+            self.tick()
+            if self.stopper.should_stop():
+                break
+            self.sleep(self.cfg.device.poll_interval_seconds)
+        self.log.info("service_stopping", version=__version__)
+
+    def _pipeline(self) -> pipeline.Pipeline:
+        """その周回の `Pipeline`。**生成を 1 か所に寄せてある**（変更 BK-1）。
+
+        v5.48 まで 3 か所で組み立てており、**`state_root` を 1 つも渡していなかった。**
+        `Worker` が `/alt/state` を見ていても `Pipeline` は既定の `/state` を読むので、
+        **同じ周回の中で 2 つが別のデバイス視界を持った** —— `request_deletions()` と
+        `delete_sources_if_safe()` が `inventory` を読めず、**書き込み可能なデバイスを
+        読み取り専用と判断して削除を黙って見送る。**
+
+        **`now` は注入されたときだけ渡す**（変更 BK-2）。v5.48 までは周回の先頭で
+        `self.now()` を固定して渡しており、**32 Part の日は tick が数時間走る**ので
+        （whisper が 1 本 30 分）、最後の Part の `updated_at` が**数時間前の時刻**になった。
+        `Pipeline._moment()` も同じ値を返すため、`_expire_delete_requests()` の経過時間が
+        実際より短く出る一方、`deletable_session_keys()` は `self.now()` を呼び直していて
+        **両者が tick の長さぶん食い違っていた。**
+
+        本番では `None` を渡す —— `Pipeline._moment()` と `db._now()` が**呼ばれた時点の
+        時刻**を使う。`clock` を注入したテストだけが固定される。
+        """
+        return pipeline.Pipeline(
+            database=self.database,
+            cfg=self.cfg,
+            log=self.log,
+            now=self.clock() if self.clock is not None else None,
+            state_root=self.state_root,
+            helper_fresh=self.helper_fresh,
+            vault_index=self.vault_index,
+        )
+
+    # --- 各段 ------------------------------------------------------------
+
+    def _helper_is_stale(self) -> bool:
+        """§19.1 H-8 と同じ判定。**`health.py` と論理を共有しない。**
+
+        あちらは「いま unhealthy か」を Docker へ返し、こちらは「取り込みを進めるか」を
+        決める。**同じ 1 行の条件を 2 箇所に書くのは避けたいが、`health.py` は
+        `Result` を組み立てる都合で結果の形が違う。**条件そのものは
+        `Heartbeat.is_stale()` に閉じてあり、ここはそれを呼ぶだけである。
+        """
+        beat = read_heartbeat(self.state_root)
+        if beat is None:
+            return True
+        return beat.is_stale(self.now(), self.cfg.import_.helper_heartbeat_max_age_seconds)
+
+    def discover_parts(self) -> None:
+        """§10.2: `/inbox` を走査して新規 Part を登録する。"""
+        discover.discover(self.database, cfg=self.cfg, log=self.log, now=self.now())
+        session.group_parts(self.database, cfg=self.cfg, now=self.now())
+
+    def close_idle_sessions(self) -> None:
+        """§10.4: `OPEN` を閉じる 3 条件。"""
+        session.close_open_sessions(self.database, cfg=self.cfg, now=self.now())
+
+    def process_pending_parts(self) -> None:
+        """§10.5〜§10.7 を 1 件ずつ直列に（**古い順**。§10.0）。
+
+        **1 周で 1 件だけにしない。**`poll_interval_seconds` が 5 秒なので、1 件ずつだと
+        32 Part の日が 160 秒以上かかる。**停止要求は 1 件ごとに見る** — 30 分の
+        文字起こしの途中では止まれないが、次の Part へ進む前には止まれる。
+        """
+        runner = self._pipeline()
+        for partkey in self.pending_partkeys():
+            if self.stopper.should_stop():
+                return
+            self._with_in_process_retry(
+                lambda key=partkey: runner.process_part(PartKey(key)),  # type: ignore[misc]
+                db.EntityType.RECORDING,
+                partkey,
+            )
+
+    def _with_in_process_retry(
+        self, run: Callable[[], object], entity: db.EntityType, key: str
+    ) -> None:
+        """工程内リトライ（§15.2）。`max_attempts` 回、`backoff_seconds` 間隔。
+
+        **待つのはここである。**`pipeline` は時間を持たない（`sleep` を差し替えて
+        テストできるようにするため）。
+
+        **停止要求は待機の前後で見る。**30 秒の backoff の途中では止まれないが、
+        次の試行へ進む前には止まれる。
+        """
+        while True:
+            run()
+            delay = pipeline.in_process_retry(self.database, entity, key, cfg=self.cfg)
+            if delay is None or self.stopper.should_stop():
+                return
+            self.sleep(delay)
+            if self.stopper.should_stop():
+                return
+            if not pipeline.resume_failed(
+                self.database, entity, key, log=self.log, reset_retry=False, now=self.now()
+            ):
+                return
+
+    def pending_partkeys(self) -> list[PartKey]:
+        """終端でない Part を `started_at` 昇順で（§10.0）。
+
+        **一覧を先に確定させる。**処理の途中で足された Part を同じ周回で拾うと、
+        **停止要求が効かないまま走り続けうる。**
+        """
+        return self.database.pending_partkeys([status.value for status in PART_TERMINAL])
+
+    def should_requeue(self, inventory: DeviceInventory | None, *, startup: bool = False) -> bool:
+        """§15.2: **立ち上がりのエッジ**か。**この判定だけを独立させてある。**
+
+        契機は 2 つだけである。
+
+        | 契機 | 判定 |
+        |---|---|
+        | デバイスの再接続 | `devices` が**前回は空で今回は非空** |
+        | サービスの起動 | §9.4 の復帰処理の一部として 1 回 |
+
+        **`inventory` が非空のまま続く周回では偽になる。**毎周回の空回りを防ぐ
+        （1 日 17,280 周で 32 件を引き直すことになる）。
+
+        **`requeue_failed()` から分けてあるのは、中身が #32 待ちでも判定をテストできる
+        ようにするため**である。まとめていると「毎周回走らせる」壊し方をしても
+        戻り値が変わらず、テストが通ってしまう（実際に通った）。
+
+        **`inventory` が読めない（`None`）ときは「空」として扱う。**不明は安全側へ倒す
+        （§7.5）— 再投入しないほうが安全である。
+        """
+        empty = inventory is None or inventory.is_empty
+        rising_edge = self.last_inventory_empty is not False and not empty
+        self.last_inventory_empty = empty
+        return startup or rising_edge
+
+    def requeue_failed(self, inventory: DeviceInventory | None, *, startup: bool = False) -> int:
+        """`FAILED` を直前の進行中状態へ戻す（§15.2）。戻り値は再投入した件数。
+
+        契機の判定は `should_requeue()` が持つ。**分けてあるのは、判定そのものを
+        テストできるようにするため**である。
+
+        **戻し方の規則は `pipeline` が持つ。**ここは契機を見て呼ぶだけである。
+        """
+        if not self.should_requeue(inventory, startup=startup):
+            return 0
+        return pipeline.requeue_failed(self.database, log=self.log, now=self.now())
+
+    def refresh_vault_index(self) -> None:
+        """Vault の索引を TTL に従って作り直す（§13.8 / 変更 BK-3）。
+
+        **周回ごとに 1 回だけ呼ぶ。**`Pipeline` は tick ごとに作り直される dataclass で
+        キャッシュを持てないので、**保持する者をここに置く。**
+        `obsidian.wiki.vault_index_cache_seconds` はこれで初めて効く。
+
+        **失敗しても止めない**（§13.8）。索引はリンクの見栄えのためであり、
+        ノートの保存検証の合否には影響しない。
+        """
+        try:
+            self.vault_index = wiki.index_for(
+                self.cfg, Path(self.cfg.obsidian.root), cached=self.vault_index
+            )
+        except OSError as exc:
+            self.log.debug("obsidian_saved", reason=f"vault_index: {exc}")
+
+    def process_ready_sessions(self) -> None:
+        """§10.8〜§10.9 を 1 件ずつ（**Part と同じく直列**。§10.0）。
+
+        **停止要求は 1 件ごとに見る。**LLM の 1 回が最大 1800 秒（§7.2）なので途中では
+        止まれないが、次のセッションへ進む前には止まれる。
+        """
+        runner = self._pipeline()
+        for session_key in self.ready_session_keys():
+            if self.stopper.should_stop():
+                return
+            self._with_in_process_retry(
+                lambda key=session_key: runner.process_session(SessionKey(key)),  # type: ignore[misc]
+                db.EntityType.SESSION,
+                session_key,
+            )
+
+    def evaluate_deletions(self) -> None:
+        """`SAVED` 以降のセッションの §14.1 を再評価する（§10.0 / §14.3）。
+
+        **`process_ready_sessions()` では拾えない。**あちらの走査対象は
+        `pipeline.PROCESSABLE`（統合・解析・書き込み）であり、**`SAVED` は入っていない。**
+        一度 `SAVED` に座ったセッションは、**新しい Part が届いて再オープンされない
+        かぎり誰も触らなかった**（v5.41→v5.42 の変更 BD-1。実機で判明）。
+
+        **`PROCESSABLE` を広げてはならない。**あれは「Daily ノートを書き直す」経路の
+        入口であり、`SAVED` を入れると**書き終えたノートを毎周回作り直す。**
+
+        **`delete_evaluation_delay()` に従う。**5 秒ごとに実ファイル検証を繰り返す
+        ビジーループを避ける（§15.2）。**この関数は v5.41 までテストからしか
+        呼ばれていなかった。**
+        """
+        runner = self._pipeline()
+        for session_key in self.deletable_session_keys():
+            if self.stopper.should_stop():
+                return
+            runner.delete_sources_if_safe(SessionKey(session_key))
+
+    def deletable_session_keys(self) -> list[str]:
+        """再評価の時期が来た `DELETE_EVALUATED` のセッション（§14.3）。
+
+        **`updated_at` からの経過が `delete_evaluation_delay()` を超えたものだけ。**
+        """
+        moment = self.now()
+        found: list[str] = []
+        for key, status, attempts, updated in self.database.sessions_for_delete_evaluation():
+            if status not in pipeline.DELETE_EVALUATED:
+                continue
+            delay = pipeline.delete_evaluation_delay(attempts, self.cfg)
+            if (moment - updated).total_seconds() < delay:
+                continue
+            found.append(key)
+        return found
+
+    def ready_session_keys(self) -> list[str]:
+        """`process_session()` に渡すセッション（§9.3）。
+
+        **走査対象は `pipeline.PROCESSABLE` である。**ここはセッションの唯一の入口なので、
+        **この集合から漏れた状態に座った行は誰にも拾われない。**
+
+        v5.13 までは `{READY, MERGING}` だけを見ていた。`resume_failed()` は `FAILED` を
+        **落ちた工程へ**戻すので（§15.2）、LLM で落ちた行は `ANALYZING` に戻ってくるが
+        走査されない。**再起動しても直らない** — §9.4 の巻き戻しは `ANALYZING → MERGED`
+        へ移すだけで、`MERGED` もまた走査対象外だったからである。
+        LLM が一度落ちると、その日のセッションは二度と進まなかった（#97）。
+
+        **ガード条件「全 Part が終端状態」は変えない。**取り違えると**進行中の Part を
+        含むセッションを統合して本文が欠けたノートを書く**（§14.1 の削除根拠になる）。
+        """
+        ready: list[str] = []
+        for status in sorted(pipeline.PROCESSABLE):
+            for row in self.database.sessions_with_status(status):
+                parts = self.database.recordings_for_session(row.session_key)
+                if parts and all(part.status in PART_TERMINAL for part in parts):
+                    ready.append(row.session_key)
+        return sorted(ready)

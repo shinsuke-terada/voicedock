@@ -1,0 +1,360 @@
+#!/bin/bash
+#
+# voicedock-reaper — デバイス上の元音声を削除する唯一のプログラム（SPEC §14.1.1, §14.3）
+#
+# **このプログラムは既定でインストールされない**（安全ロック 2-A。§14.2）。
+# 存在しないプログラムは実行できない。Phase 7 で `install.sh --with-reaper` を実行して
+# 初めて配置される。
+#
+# **コンテナの判断を一切信用しない。**コンテナは `queue/delete/<request_id>.json` を
+# 書くだけで（§10.12）、ここでは §14.1.1 の **12 項目を独立に再検証する。**
+# 1 つでも偽なら削除せず、結果に `SOURCE_IDENTITY_MISMATCH` を書く。
+# **二重に検証することが v4.0 の設計である。**
+#
+# **マウント操作を一切行わない**（§14.4 N-19）。再マウントは ingest の責務に閉じる。
+# これにより Linux のテストコンテナからそのまま実行でき、`make test` 1 コマンドで
+# §20.4 の ND 群が回り、CI の必須ゲートに載る。
+#
+# **ディレクトリの再帰削除を一切行わない**（N-16）。要求に書かれたファイルだけを
+# `unlink` する。再帰削除のオプションはこのファイルに 1 つも書かない。
+#
+# **bash 3.2 で書く**（macOS 同梱。§3.3）。`voicedock-ingest` と同じ制約に従う。
+# `jq` に依存しない（macOS は同梱しない）。
+#
+# `_stat_size` / `_stat_mtime` は ingest にも同じものがあるが、**共有ライブラリにしない。**
+# 削除できる唯一のプログラムであり、自己完結を保つ価値が 10 行の重複より大きい（§17.4）。
+
+set -euo pipefail
+
+REAPER_VERSION="5.9.0"
+RESULT_SCHEMA=1
+MTIME_TOLERANCE=2           # 秒。§14.1.1 検証 10。**コンテナ側と同じ値であること**
+
+# --- 移植性のラッパ（起動時に 1 回だけ判定する） -------------------------
+# macOS は BSD stat、テストコンテナと CI は GNU stat である。
+
+if stat -f %z . >/dev/null 2>&1; then
+    _stat_size()  { stat -f %z "$1"; }
+    _stat_mtime() { stat -f %m "$1"; }
+else
+    _stat_size()  { stat -c %s "$1"; }
+    _stat_mtime() { stat -c %Y "$1"; }
+fi
+
+_now_iso() { date +%Y-%m-%dT%H:%M:%S%z | sed 's/\(..\)$/:\1/'; }
+_log()  { printf '%s %-5s %s\n' "$(_now_iso)" "$1" "$2"; }
+info()  { _log INFO  "$1"; }
+warn()  { _log WARN  "$1" >&2; }
+
+locate_conf() {
+    if [ -n "${VOICEDOCK_HELPER_CONF:-}" ]; then
+        printf '%s' "$VOICEDOCK_HELPER_CONF"
+        return 0
+    fi
+    local here
+    here="$(cd "$(dirname "$0")" && pwd)"
+    printf '%s' "$(dirname "$here")/helper.conf"
+}
+
+# --- JSON の読み取り（`jq` を使わない） ----------------------------------
+# 要求は `cleaner.write_request()` が `json.dumps(indent=2)` で書くので形が定まっている。
+# **値に `"` や `\` を含むものは受け付けない**（検証 4 の制御文字と同じ扱い）。
+
+json_string() {             # $1=file $2=key
+    sed -n "s/^[[:space:]]*\"$2\":[[:space:]]*\"\\(.*\\)\",\\{0,1\\}$/\\1/p" "$1" | head -1
+}
+
+json_number() {             # $1=file $2=key
+    sed -n "s/^[[:space:]]*\"$2\":[[:space:]]*\\([0-9.]*\\),\\{0,1\\}$/\\1/p" "$1" | head -1
+}
+
+# --- §14.1.1 の 12 項目 --------------------------------------------------
+
+# 検証 4 / 9: relpath の健全性。**絶対パス・`..`・空要素・制御文字・`.` 始まりを拒む。**
+# `.Trashes` / `.Spotlight-V100` / `.fseventsd` を守るのが検証 9 である（§22 R-22）。
+relpath_is_safe() {         # $1=relpath
+    local rel="$1" element rest
+    case "$rel" in
+        ""|/*) return 1 ;;
+        *[\"\\]*) return 1 ;;          # 引用符とバックスラッシュは受け付けない
+    esac
+    # 制御文字（改行・タブ等）。`tr -d` で消えたら含まれていた
+    if [ "$(printf '%s' "$rel" | tr -d '[:cntrl:]')" != "$rel" ]; then
+        return 1
+    fi
+    rest="$rel"
+    while [ -n "$rest" ]; do
+        element="${rest%%/*}"
+        case "$element" in
+            ""|.|..) return 1 ;;
+            .*) return 1 ;;            # 検証 9
+        esac
+        if [ "$element" = "$rest" ]; then
+            rest=""
+        else
+            rest="${rest#*/}"
+        fi
+    done
+    return 0
+}
+
+# 検証 7: ファイル名が RECORDING_FILENAME_RE に一致する
+_is_recording_file() {      # $1=basename
+    case "$1" in
+        TX[0-9][0-9]_MIC[0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9].wav) return 0 ;;
+        TX[0-9][0-9]_MIC[0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9].WAV) return 0 ;;
+        TX[0-9][0-9]_MIC[0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]_orig.wav) return 0 ;;
+        TX[0-9][0-9]_MIC[0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]_orig.WAV) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 検証 8: 親ディレクトリ名が RECORDING_FOLDER_RE に一致する。**v3.x に無かった防壁**
+_is_recording_folder() {    # $1=basename
+    case "$1" in
+        TX_MIC[0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 検証 5: realpath 解決後にボリュームルート配下であること。
+#
+# **`Path.parents` 相当の字句判定では足りない。**macOS には `/Volumes/Macintosh HD` が
+# `/` への symlink として実在し、字句判定だけでは「デバイス配下」と偽装されたパスを
+# 拒否できない（§22 R-19。`docs/POC.md` §5.1 で実証済み）。
+_realpath() {               # $1=path。存在しなければ何も出力しない
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$1" 2>/dev/null || return 1
+    else
+        # BSD には realpath(1) が無い版がある。python も前提にしない（§3.3）ので
+        # cd + pwd -P で解決する（**シンボリックリンクを辿った実体を返す**）
+        local dir base
+        dir="$(dirname "$1")"
+        base="$(basename "$1")"
+        ( cd "$dir" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$base" ) || return 1
+    fi
+}
+
+target_is_identical() {     # $1=volume_root $2=relpath $3=size $4=mtime
+    local root="$1" rel="$2" want_size="$3" want_mtime="$4"
+
+    relpath_is_safe "$rel" || { REASON="relpath_unsafe"; return 1; }
+
+    local target="$root/$rel"
+
+    # 検証 6: 対象自身が symlink でなく、通常ファイルである
+    if [ -L "$target" ]; then REASON="target_is_symlink"; return 1; fi
+    if [ ! -f "$target" ]; then REASON="target_missing"; return 1; fi
+
+    # 検証 5: 経路上の symlink をすべて解決してから封じ込めを判定する
+    local resolved root_real
+    resolved="$(_realpath "$target")" || { REASON="realpath_failed"; return 1; }
+    root_real="$(_realpath "$root")" || { REASON="realpath_failed"; return 1; }
+    case "$resolved" in
+        "$root_real"/*) ;;
+        *) REASON="outside_volume"; return 1 ;;
+    esac
+    if [ "$resolved" != "$target" ]; then REASON="path_contains_symlink"; return 1; fi
+
+    # 検証 7 / 8: 名前の規則。ファイルと親フォルダの両方を見る
+    _is_recording_file "$(basename "$target")" || { REASON="filename_rule"; return 1; }
+    _is_recording_folder "$(basename "$(dirname "$target")")" || { REASON="folder_rule"; return 1; }
+
+    # 検証 10: サイズと更新時刻が記録と一致する
+    local have_size have_mtime diff
+    have_size="$(_stat_size "$target")" || { REASON="stat_failed"; return 1; }
+    have_mtime="$(_stat_mtime "$target")" || { REASON="stat_failed"; return 1; }
+    if [ "$have_size" != "$want_size" ]; then REASON="size_mismatch"; return 1; fi
+    diff=$(( have_mtime - ${want_mtime%%.*} ))
+    [ "$diff" -lt 0 ] && diff=$(( -diff ))
+    if [ "$diff" -ge "$MTIME_TOLERANCE" ]; then REASON="mtime_mismatch"; return 1; fi
+
+    return 0
+}
+
+# --- 結果の書き出し（§10.12） --------------------------------------------
+
+# **`partkey` を必ず載せる**（§14.1.1 の結果の形式。v5.9→v5.10 の変更 X-1）。
+# コンテナは `request_id` を解析せずに対応する Part を引けなければならない —
+# **`request_id` の組み立て規則に依存させると、規則を変えた瞬間に結果が迷子になる。**
+write_result() {            # $1=request_id $2=status $3=detail
+    local dir="$VOICEDOCK_HOME/queue/result"
+    mkdir -p "$dir"
+    local tmp="$dir/.$1.json.tmp"
+    {
+        printf '{\n'
+        printf '  "schema": %s,\n' "$RESULT_SCHEMA"
+        printf '  "request_id": "%s",\n' "$1"
+        printf '  "completed_at": "%s",\n' "$(_now_iso)"
+        printf '  "reaper_version": "%s",\n' "$REAPER_VERSION"
+        printf '  "device_id": "%s",\n' "${RESULT_DEVICE_ID:-}"
+        printf '  "partkey": "%s",\n' "${RESULT_PARTKEY:-}"
+        printf '  "status": "%s",\n' "$2"
+        printf '  "detail": "%s"\n' "$3"
+        printf '}\n'
+    } > "$tmp"
+    mv "$tmp" "$dir/$1.json"
+}
+
+mark_processed() {          # $1=request_id。検証 11 のリプレイ防止
+    mkdir -p "$VOICEDOCK_HOME/state"
+    printf '%s\n' "$1" >> "$VOICEDOCK_HOME/state/processed.log"
+}
+
+already_processed() {       # $1=request_id
+    local log="$VOICEDOCK_HOME/state/processed.log"
+    [ -f "$log" ] || return 1
+    grep -q -x -F "$1" "$log"
+}
+
+# --- 1 件の要求 ----------------------------------------------------------
+
+process_request() {         # $1=path
+    local file="$1" request_id device_id partkey rel size mtime volume
+    RESULT_DEVICE_ID=""
+    RESULT_PARTKEY=""
+    request_id="$(json_string "$file" request_id)"
+    if [ -z "$request_id" ]; then
+        warn "request_invalid file=$file reason=no_request_id"
+        return 0
+    fi
+
+    RESULT_DEVICE_ID="$(json_string "$file" device_id)"
+    RESULT_PARTKEY="$(json_string "$file" partkey)"
+
+    # 検証 11: リプレイ。**既に削除済みの ID で別のファイルを消せない**
+    if already_processed "$request_id"; then
+        warn "request_replayed request_id=$request_id"
+        write_result "$request_id" "SOURCE_IDENTITY_MISMATCH" "replayed"
+        rm -f "$file"
+        return 0
+    fi
+
+    device_id="$(json_string "$file" device_id)"
+    partkey="$(json_string "$file" partkey)"
+    RESULT_DEVICE_ID="$device_id"
+    RESULT_PARTKEY="$partkey"
+    rel="$(json_string "$file" relpath)"
+    size="$(json_number "$file" size)"
+    mtime="$(json_number "$file" mtime)"
+    if [ -z "$device_id" ] || [ -z "$rel" ] || [ -z "$size" ] || [ -z "$mtime" ]; then
+        reject "$request_id" "$file" "malformed_request"
+        return 0
+    fi
+
+    # 検証 12: `<device_id>/<relpath>` が要求の partkey と文字列一致する。
+    # **一致していなければ「ノートで確認したファイル」と「消すファイル」が別物である**
+    if [ "$device_id/$rel" != "$partkey" ]; then
+        reject "$request_id" "$file" "partkey_mismatch"
+        return 0
+    fi
+
+    # 検証 3: device_id と同名のボリュームが現在マウントされている
+    volume="$VOLUMES_ROOT/$device_id"
+    if [ ! -d "$volume" ]; then
+        # **要求は消さない。**デバイスを繋ぎ直せば次回処理できる（§10.12）
+        warn "device_absent request_id=$request_id device=$device_id"
+        return 0
+    fi
+
+    REASON=""
+    if ! target_is_identical "$volume" "$rel" "$size" "$mtime"; then
+        reject "$request_id" "$file" "$REASON"
+        return 0
+    fi
+
+    # **ここまで来て初めて削除する。**要求に書かれた 1 ファイルだけを unlink する（N-16）
+    if ! rm -f "$volume/$rel"; then
+        reject "$request_id" "$file" "unlink_failed"
+        return 0
+    fi
+    # 削除検証: ファイルが存在しないこと（§14.3）
+    if [ -e "$volume/$rel" ]; then
+        reject "$request_id" "$file" "still_present"
+        return 0
+    fi
+
+    mark_processed "$request_id"
+    write_result "$request_id" "DELETED" "$rel"
+    rm -f "$file"
+    info "source_deleted request_id=$request_id recording_key=$partkey"
+}
+
+reject() {                  # $1=request_id $2=file $3=reason
+    warn "source_delete_rejected request_id=$1 reason=$3"
+    mark_processed "$1"
+    write_result "$1" "SOURCE_IDENTITY_MISMATCH" "$3"
+    rm -f "$2"
+}
+
+# --- 三重ロック（§14.2） -------------------------------------------------
+
+locks_are_released() {
+    # ロック 1: helper.conf の DELETE_SOURCE_AUDIO=true
+    if [ "${DELETE_SOURCE_AUDIO:-false}" != "true" ]; then
+        info "reaper_disabled reason=delete_source_audio_false"
+        return 1
+    fi
+    # ロック 2-B: helper.conf の MOUNT_MODE=rw かつ heartbeat の mount_readonly が偽
+    if [ "${MOUNT_MODE:-ro}" != "rw" ]; then
+        info "reaper_disabled reason=mount_mode_ro"
+        return 1
+    fi
+    local beat="$VOICEDOCK_HOME/state/heartbeat.json"
+    if [ -f "$beat" ]; then
+        case "$(json_string_bool "$beat" mount_readonly)" in
+            true)
+                info "reaper_disabled reason=mount_readonly"
+                return 1
+                ;;
+        esac
+    fi
+    # **ロック 2-A はこのプログラムが存在すること自体である**（§14.2）
+    return 0
+}
+
+json_string_bool() {        # $1=file $2=key
+    sed -n "s/^[[:space:]]*\"$2\":[[:space:]]*\\(true\\|false\\),\\{0,1\\}$/\\1/p" "$1" | head -1
+}
+
+main() {
+    case "${1:-}" in
+        --help | -h)
+            cat <<'USAGE'
+usage: voicedock-reaper
+
+  引数を取らない。<VOICEDOCK_HOME>/queue/delete/*.json を処理する（SPEC §14.1.1）。
+  **コンテナの判断を信用せず 12 項目を独立に再検証する。**
+  三重ロックがすべて解除されていなければ何もしない（§14.2）。
+
+helper.conf の場所は $(dirname "$0")/../helper.conf。
+環境変数 VOICEDOCK_HELPER_CONF で上書きできる。
+USAGE
+            return 0
+            ;;
+        "") ;;
+        *) printf 'unknown argument: %s\n' "$1" >&2; return 2 ;;
+    esac
+
+    local conf
+    conf="$(locate_conf)"
+    [ -f "$conf" ] || { warn "helper.conf not found: $conf"; return 2; }
+    # shellcheck source=/dev/null
+    . "$conf"
+    [ -d "${VOICEDOCK_HOME:-}" ] || { warn "VOICEDOCK_HOME is not a directory"; return 2; }
+    VOLUMES_ROOT="${VOLUMES_ROOT:-/Volumes}"
+
+    locks_are_released || return 0
+
+    local queue file count=0
+    queue="$VOICEDOCK_HOME/queue/delete"
+    [ -d "$queue" ] || return 0
+    for file in "$queue"/*.json; do
+        [ -f "$file" ] || continue
+        process_request "$file"
+        count=$((count + 1))
+    done
+    [ "$count" -eq 0 ] || info "reaper_completed requests=$count"
+}
+
+main "$@"

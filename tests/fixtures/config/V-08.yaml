@@ -1,0 +1,7 @@
+# SPEC §7.3 V-8 の違反。config.example.yaml へ patch を深くマージして使う。
+rule: V-8
+code: CONFIG_INVALID_VALUE
+key: session.block_gap_seconds
+patch:
+  session:
+    block_gap_seconds: -1
