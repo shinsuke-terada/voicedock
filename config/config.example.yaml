@@ -144,9 +144,7 @@ obsidian:
   wiki:
     folder_template: "Daily/Voice/Wiki/{yyyymmdd}"
     filename_template: "{date} Voice"   # {title} を入れてはならない（§13.5）
-    include_transcript: false    # true にすると全文も埋め込む
     timeline: true
-    link_raw: true
     link_daily_note: true
     link_adjacent_days: true
     link_tags: true              # false なら Vault インデックスを作らない

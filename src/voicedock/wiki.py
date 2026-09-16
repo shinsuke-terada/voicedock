@@ -286,7 +286,9 @@ def plan_links(
             dropped.append(candidate)
         rendered.append(tag(candidate))
 
-    raw = tuple(link(name) for name in raw_names if wiki.link_raw and is_linkable(name))
+    # **Raw へのリンクは必ず付ける**（変更 BN-1）。W-9 が常に要求するので、
+    # 付けない選択肢は「その日の Daily ノートが二度と `SAVED` にならない」に等しい
+    raw = tuple(link(name) for name in raw_names if is_linkable(name))
     return LinkPlan(
         daily_note=daily,
         adjacent=tuple(adjacent),
