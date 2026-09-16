@@ -356,3 +356,29 @@ RETRY_RESET_STATUSES: Final[frozenset[str]] = frozenset(
 
 FAILED_STATUS: Final = PartStatus.FAILED.value
 """`"FAILED"`。Part と Session で同じ綴りである。"""
+
+
+# --- Raw ノートに載る Part（§13.3 / §13.7 R-6） -------------------------
+
+RAW_NOTE_MEMBERS: Final[frozenset[PartStatus]] = frozenset(
+    {
+        PartStatus.TRANSCRIBED,
+        PartStatus.RAW_WRITING,
+        PartStatus.RAW_SAVED,
+        PartStatus.SOURCE_DELETING,
+        PartStatus.SOURCE_DELETE_PENDING,
+        PartStatus.COMPLETED,
+    }
+)
+"""Raw ノートに載る Part の状態（§13.3）。**`FAILED` と `SKIPPED` は載らない。**
+
+**書き手と検証側がこれを共有する**（v5.46→v5.47 の変更 BI-1）。
+`pipeline._raw_parts()` が載せる集合と、`cleaner.verify_raw_note()` が
+R-6（包含）で要求する集合が**別々に書かれていたため食い違っていた** ——
+書き手は `FAILED` を落とし、検証側は `transcript_path` があれば `FAILED` でも
+要求していた。結果として、**文字起こしまで進んで Raw ノートの書き込みで失敗した
+Part が 1 本あると、同じ日の他の Part がすべて削除不可になった**（§14.1）。
+
+「1 本詰まるとその日ぶん丸ごと解放されない」は `can_delete_source()` の docstring が
+**避けると書いている**形そのものである（#131 / #133 と同じ）。
+"""
