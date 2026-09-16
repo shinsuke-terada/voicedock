@@ -426,3 +426,59 @@ def test_granularity_is_no_longer_a_key(tmp_path: Path) -> None:
     cfg, violations = parse_config(document)
     assert cfg is None, "granularity がまだ受理されている"
     assert any(v.rule == "V-1" for v in violations), violations
+
+
+# --- 段落のまとまり（§13.3 / 変更 BM-1） --------------------------------
+
+
+def dense_part() -> RawPart:
+    """**同じ見出しの下に入る 3 セグメント**。whisper は発話の切れ目で切る。"""
+    return RawPart(
+        partkey=KEY_A,
+        started_at=at(7, 12, 4),
+        ended_at=at(7, 42, 4),
+        segments=(
+            segment(at(7, 12, 4), "まあ、そこをどこまで個人商店に近づけるかなって、"),
+            segment(at(7, 12, 9), "やれば、まだ大丈夫っていう感じです。"),
+            segment(at(7, 13, 2), "ハーネス整備が追いついていないかなって。"),
+        ),
+    )
+
+
+def test_segments_under_one_heading_form_a_single_paragraph() -> None:
+    """**`###` の見出しごとに 1 段落にまとめる**（§13.3 / 変更 BM-1）。
+
+    v5.50 までは `lines += [text, ""]` で**セグメント 1 つごとに空行**を入れていた。
+    whisper は発話の切れ目で切るので、**1 発話 = 1 段落**になり、
+    Obsidian で読むと 1 文ずつ離れて**文脈が切れる**（実機で指摘された）。
+
+    **セグメント境界は失われない。**`/data/transcripts/parts/*.json` に
+    `retain_transcript_days: 0`（無期限）で残る。
+    """
+    body = render([dense_part()], timestamp_interval_seconds=300)
+
+    assert (
+        "まあ、そこをどこまで個人商店に近づけるかなって、 "
+        "やれば、まだ大丈夫っていう感じです。 "
+        "ハーネス整備が追いついていないかなって。"
+    ) in body, body
+
+    # **空行で割れていないこと。**割れていると 1 発話 1 段落に戻っている
+    assert "やれば、まだ大丈夫っていう感じです。\n\n" not in body, body
+
+
+def test_a_new_timestamp_heading_starts_a_new_paragraph() -> None:
+    """**見出しをまたいだら段落を切る。**全部を 1 段落にしてしまわないこと。"""
+    body = render([part_a()], timestamp_interval_seconds=60)
+
+    expected = "### 07:12:04\n\nおはようございます。\n\n### 07:17:04\n\n削除条件を整理します。"
+    assert expected in body, body
+
+
+def test_the_whole_part_is_one_paragraph_without_headings() -> None:
+    """**`timestamp_interval_seconds: 0` なら Part 全体が 1 段落**（§13.3 の `0` で無効）。"""
+    body = render([dense_part()], timestamp_interval_seconds=0)
+
+    assert "###" not in body
+    assert body.count("ハーネス整備") == 1
+    assert "近づけるかなって、 やれば、" in body, body
