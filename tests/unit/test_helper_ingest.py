@@ -1171,3 +1171,37 @@ def test_the_reaper_runs_after_the_copy(tmp_path: Path, volumes: Path) -> None:
 
     assert marker.is_file(), "reaper が呼ばれていない"
     assert int(marker.read_text().strip()) > 0, "コピーより前に reaper を呼んでいる"
+
+
+def test_a_missing_fast_path_key_does_not_disable_the_stability_check(
+    tmp_path: Path, volumes: Path
+) -> None:
+    """**`STABILITY_FAST_PATH_SECONDS` が無ければ既定の 60 へ倒す**（変更 BH-5）。
+
+    v5.45 は `0` へ倒していた。§10.3 手順 2 の条件は
+    `mtime <= now - STABILITY_FAST_PATH_SECONDS` なので、**`0` は
+    「即断しない」ではなく「存在する全ファイルを即断する」**である ——
+    手順 3〜4 のサンプリングが丸ごと消え、**書き込み途中の WAV をコピーして
+    墓標に途中のサイズと SHA-256 を記録する。**
+    コメントは「即断しない」と書いてあったが、コードは正反対だった。
+
+    **その鍵より古い `helper.conf` を持つ環境で実際に起きる** ——
+    `install.sh` は鍵の欠落を警告するだけで、起動は止めない。
+    """
+    target = next(volumes.rglob("*_orig.wav"))
+    os.utime(target, None)  # mtime を「いま」にする。60 秒の即断からは外れる
+
+    conf = write_conf(tmp_path, STABILITY_CHECKS="2", STABILITY_INTERVAL_SECONDS="1")
+    kept = [
+        line
+        for line in conf.read_text(encoding="utf-8").splitlines(keepends=True)
+        if not line.startswith("STABILITY_FAST_PATH_SECONDS=")
+    ]
+    conf.write_text("".join(kept), encoding="utf-8")
+
+    result = run_ingest(conf)
+
+    assert result.returncode == 0, result.stderr
+    assert "stability_pending" in result.stdout, (
+        "即断経路が全件に当たっている。**§10.3 の確認が丸ごと消えている**\n" + result.stdout
+    )

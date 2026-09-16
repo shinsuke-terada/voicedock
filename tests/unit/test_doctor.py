@@ -295,7 +295,7 @@ def _section_19_2() -> str:
 def test_database_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     out, code = run(healthy(tmp_path, monkeypatch), tmp_path / "state")
     assert "[✓] Database" in out
-    assert "(schema v1, 0 recordings, 0 sessions, 0 events," in out
+    assert f"(schema v{db.SCHEMA_VERSION}, 0 recordings, 0 sessions, 0 events," in out
     assert code == EXIT_OK
 
 
@@ -318,7 +318,13 @@ def test_database_row_when_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 def test_database_row_on_version_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = healthy(tmp_path, monkeypatch)
     with db.connect(tmp_path / "data" / "voicedock.db", migrate=False) as opened:
-        opened.conn.execute("UPDATE schema_version SET version = 99")
+        # **行ごと入れ替える。**`UPDATE` だと適用済みの版が複数行あるとき
+        # 全部が 99 になり、PRIMARY KEY に当たる
+        opened.conn.execute("DELETE FROM schema_version")
+        opened.conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (99, ?)",
+            ("2026-09-13T09:00:00+00:00",),
+        )
         opened.conn.commit()
     out, code = run(path, tmp_path / "state")
     assert "[✗] Database" in out
