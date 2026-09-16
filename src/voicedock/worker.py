@@ -78,6 +78,13 @@ class Worker:
     last_inventory_empty: bool | None = None
     """前回の周回で `inventory.devices` が空だったか。**起動直後は `None`（不明）。**"""
 
+    helper_fresh: bool = True
+    """直近の周回で Helper のハートビートが新しかったか（§10.0 / 変更 BH-4）。
+
+    **`Pipeline` へ渡す。**古いときは**新しい削除要求を書かない** —— `inventory.json` も
+    同じだけ古く、**デバイスが在ると言っている根拠が無い**（§7.5）。
+    """
+
     def now(self) -> datetime:
         return self.clock() if self.clock is not None else datetime.now(self.cfg.tz)
 
@@ -104,21 +111,37 @@ class Worker:
         **順序は §10.0 の擬似コードのままである。**並べ替えてはならない — たとえば
         `discover_parts` より先に `process_pending_parts` を呼ぶと、**その周回で
         見つかった Part が 1 周遅れる。**
+
+        **ハートビートが古いときに止めるのは「Helper の報告に依存する段」だけである**
+        （v5.45→v5.46 の変更 BH-4）。§22 R-23 の根拠は「**Helper の死を検出せずに
+        静かに待つな**」であって、「Helper と無関係な処理まで凍らせろ」ではない。
+        v5.45 まではここで即 `return` していたため、**LaunchAgent を止めるだけで
+        文字起こし・LLM・ノート生成・削除評価がすべて止まった** —— どれも Helper に
+        触れないのに、である。
+
+        止めるのは `discover_parts`（`/inbox`）と、`evaluate_deletions` /
+        `requeue_failed`（`inventory.json`）の 3 つ。
         """
         inventory = device.read_inventory(self.state_root)
-        if self._helper_is_stale():
+        self.helper_fresh = not self._helper_is_stale()
+        if self.helper_fresh:
+            self.discover_parts()
+        else:
             # **取り込みを進めない**（§10.0 / §22 R-23）。`inventory` が読めない場合も
             # 同じ扱いにする（不明は安全側へ倒す。§7.5）
             self.log.warning("helper_heartbeat_stale", reason="取り込みを見送る")
-            return False
 
-        self.discover_parts()
+        # **ここから 3 段は Helper に一切触れない。**止める理由が無い
         self.close_idle_sessions()
         self.process_pending_parts()
         self.process_ready_sessions()
-        self.evaluate_deletions()
-        self.requeue_failed(inventory)
-        return True
+
+        if self.helper_fresh:
+            # **`inventory.json` に依存する段**（変更 BH-4）。ハートビートが古ければ
+            # inventory も同じだけ古く、**デバイスの在・書込可否について何も言えない**（§7.5）
+            self.evaluate_deletions()
+            self.requeue_failed(inventory)
+        return self.helper_fresh
 
     def run(self) -> None:
         """停止が要求されるまで回す。"""
@@ -163,7 +186,14 @@ class Worker:
         文字起こしの途中では止まれないが、次の Part へ進む前には止まれる。
         """
         runner = pipeline.Pipeline(
-            database=self.database, cfg=self.cfg, log=self.log, now=self.now()
+            database=self.database,
+            cfg=self.cfg,
+            log=self.log,
+            now=self.now(),
+            # **Helper が止まっていれば新しい削除要求を書かせない**（変更 BH-4）。
+            # `process_part()` は `ensure_raw_note()` の直後に `request_deletions()` を
+            # 呼ぶので、**古い `inventory` で要求が出てしまう**
+            helper_fresh=self.helper_fresh,
         )
         for partkey in self.pending_partkeys():
             if self.stopper.should_stop():
@@ -257,7 +287,11 @@ class Worker:
         止まれないが、次のセッションへ進む前には止まれる。
         """
         runner = pipeline.Pipeline(
-            database=self.database, cfg=self.cfg, log=self.log, now=self.now()
+            database=self.database,
+            cfg=self.cfg,
+            log=self.log,
+            now=self.now(),
+            helper_fresh=self.helper_fresh,
         )
         for session_key in self.ready_session_keys():
             if self.stopper.should_stop():
@@ -284,7 +318,11 @@ class Worker:
         呼ばれていなかった。**
         """
         runner = pipeline.Pipeline(
-            database=self.database, cfg=self.cfg, log=self.log, now=self.now()
+            database=self.database,
+            cfg=self.cfg,
+            log=self.log,
+            now=self.now(),
+            helper_fresh=self.helper_fresh,
         )
         for session_key in self.deletable_session_keys():
             if self.stopper.should_stop():
