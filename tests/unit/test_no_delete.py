@@ -776,6 +776,42 @@ def test_the_watchdog_terms_are_present_in_the_formula() -> None:
     assert "analysis" not in source, "解析結果を条件に戻している（AY-1）"
 
 
+# --- 待つものが無ければ完了する（#160）----------------------------------
+
+
+@pytest.mark.parametrize("status", [PartStatus.COMPLETED, PartStatus.SKIPPED, PartStatus.FAILED])
+def test_a_session_with_nothing_to_delete_completes(scene: Scene, status: str) -> None:
+    """**削除を待っている Part が 1 つも無ければ完了する**（#160）。
+
+    v5.44 まで `delete_attempts` だけが際限なく増え、**セッションが
+    `SOURCE_DELETE_PENDING` から永久に出られなかった**（2026-09-16 実機）。
+    「いずれ真になる」前提の待ちが、**待つものが無いときに成立しない。**
+    """
+    scene.rearm()
+    scene.set_part(status=status)
+
+    scene.evaluate()
+
+    assert scene.session().status == SessionStatus.COMPLETED, "止まっている"
+    assert scene.requests() == [], "何も待っていないのに要求を書いた"
+
+
+def test_a_session_still_waiting_does_not_complete(scene: Scene) -> None:
+    """**待てば真になりうる場合は待つ。**`RAW_SAVED` で §14.1 が偽なら完了させない。
+
+    ノートの検証が通れば真になりうる。**塞ぎすぎない。**
+    """
+    scene.rearm()
+    _rewrite_keys(
+        scene, scene.raw_path(), f"{DEVICE_ID}/other/other.wav", column="raw_output_sha256"
+    )
+
+    scene.evaluate()
+
+    assert scene.session().status != SessionStatus.COMPLETED, "待つべきものを畳んだ"
+    assert scene.part().status == PartStatus.RAW_SAVED
+
+
 # --- 再試行の経路（#154）------------------------------------------------
 
 
@@ -1093,7 +1129,10 @@ def write_result(scene: Scene, *, status: str = "DELETED", detail: str = "", **e
     """reaper が書いた体の結果を置く（§14.1.1 の結果の形式。v5.9→v5.10 の変更 X-1）。"""
     directory = scene.queue / cleaner.RESULT_DIRNAME
     directory.mkdir(parents=True, exist_ok=True)
-    request_id = extra.pop("request_id", "20260913T090000-slug-a1b2c3")
+    # **いま出ている要求の `request_id` を既定にする。**reaper は要求の ID を
+    # そのまま返すので、そのほうが実態に近い。**食い違う結果は捨てられる**（#160）
+    outstanding = cleaner.outstanding_request_id(PARTKEY, cfg=scene.cfg)
+    request_id = extra.pop("request_id", outstanding or "20260913T090000-slug-a1b2c3")
     payload = {
         "schema": 1,
         "request_id": request_id,
@@ -1201,15 +1240,17 @@ def test_a_part_just_moved_to_pending_is_not_requested_again(scene: Scene) -> No
     実機では回収で保留へ落とした直後に**同じ周回でもう一度要求を書き**、
     reaper が `target_missing` で拒否して**また保留へ落ちた。**
     """
-    scene.rearm()
-    scene.set_part(status=PartStatus.SOURCE_DELETING)
+    # **`rearm()` しない。**要求を残したまま結果を置く —— reaper が結果を書いた
+    # 直後の姿である。要求が無い状態で結果だけ置くと、それは #160 の「対応する
+    # 試行が存在しない結果」であり、この試験が見たいものではない
+    assert scene.part().status == PartStatus.SOURCE_DELETING
     write_result(scene, status="SOURCE_IDENTITY_MISMATCH", detail="size_mismatch")
-    for path in scene.requests():
-        path.unlink()
+    before = {path.name for path in scene.requests()}
 
     scene.evaluate()
 
-    assert scene.requests() == [], "保留へ落とした直後に再要求した"
+    after = {path.name for path in scene.requests()}
+    assert after <= before, f"保留へ落とした直後に再要求した: {sorted(after - before)}"
     assert scene.part().status == PartStatus.SOURCE_DELETE_PENDING
 
 
@@ -1278,9 +1319,54 @@ def test_a_result_for_a_part_that_moved_on_is_left_alone(scene: Scene) -> None:
     pending = scene.runner.collect_delete_results([scene.part()], gone(scene))
 
     assert pending == set()
-    assert result.exists(), "別の周回で回収されるべき結果を捨てている"
+    assert not result.exists(), "**二度と回収されない結果を残している**（#160）"
     assert scene.part().status == PartStatus.COMPLETED
     assert scene.part().source_deleted_at is None
+
+
+def test_a_result_for_another_session_is_kept(scene: Scene) -> None:
+    """**DB に無い Part の結果は残す**（#160）。別のセッションのものかもしれない。
+
+    **`part is None` と「Part は在るが待っていない」を一緒にしない。**前者は
+    まだ回収の余地があり、後者は**二度と回収されない。**
+    """
+    result = write_result(scene, partkey=f"{DEVICE_ID}/other/other.wav")
+
+    scene.runner.collect_delete_results([scene.part()], gone(scene))
+
+    assert result.exists(), "別セッションの結果を捨てた"
+
+
+def test_a_result_from_an_older_attempt_is_discarded(scene: Scene) -> None:
+    """**古い試行の結果を新しい要求に適用しない**（#160）。
+
+    照合が `partkey` だけだと、**`DELETED` の古い結果が新しい要求の判定として
+    使われる** —— **まだ消えていないものを「消えた」と判定する側の誤り**であり、
+    §14.1 の根拠が崩れる。
+    """
+    assert scene.part().status == PartStatus.SOURCE_DELETING
+    result = write_result(scene, request_id="20260101T000000-old-000000")
+
+    scene.runner.collect_delete_results([scene.part()], gone(scene))
+
+    assert not result.exists(), "古い結果を残した"
+    assert scene.part().status == PartStatus.SOURCE_DELETING, "古い結果で COMPLETED にした"
+    assert scene.part().source_deleted_at is None
+
+
+def test_a_result_without_an_outstanding_request_is_discarded(scene: Scene) -> None:
+    """**要求を取り下げたあとに届いた結果は捨てる**（#160）。
+
+    対応する試行が存在しない。**残すと `awaiting result` が実態と食い違う。**
+    """
+    result = write_result(scene)
+    for path in scene.requests():
+        path.unlink()
+
+    scene.runner.collect_delete_results([scene.part()], gone(scene))
+
+    assert not result.exists()
+    assert scene.part().status == PartStatus.SOURCE_DELETING, "要求が無いのに進めた"
 
 
 def test_a_missing_result_expires_and_withdraws_the_request(scene: Scene) -> None:

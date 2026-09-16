@@ -117,6 +117,27 @@ inbox の原本が正規化直後に消えているため、**ここで消すと
 （あちらは元音声、こちらは変換後の作業ファイル）。
 """
 
+AWAITING_DELETION: Final[frozenset[PartStatus]] = PART_DELETABLE - {PartStatus.COMPLETED}
+"""**まだ削除を待っている** Part の状態（3 件。§14.3）。
+
+**`PART_DELETABLE` から `COMPLETED` を除いたもの。**`COMPLETED` は後追い削除
+（§17.1 の `cleanup --backlog`）の対象ではあるが、**通常の待ちの対象ではない。**
+
+この集合が空なら、**そのセッションで待つものは何も無い** —— `delete_attempts` を
+増やし続けても何も変わらないので、**完了させる**（v5.44→v5.45 の変更 BG-3）。
+
+**手で並べない。**`PART_DELETABLE` から引く。
+"""
+
+CLEANUP_FROM: Final[frozenset[SessionStatus]] = frozenset(
+    {SessionStatus.SAVED, SessionStatus.SOURCE_DELETING, SessionStatus.SOURCE_DELETE_PENDING}
+)
+"""`CLEANUP` へ進めるセッションの状態（§9.3）。
+
+**`_complete_without_deleting()` が遷移元に使う。**`SAVED` の決め打ちだと、
+**`SOURCE_DELETE_PENDING` に座ったセッションが畳めない**（変更 BG-3）。
+"""
+
 SESSION_TERMINAL: Final[frozenset[SessionStatus]] = frozenset(
     {SessionStatus.COMPLETED, SessionStatus.FAILED}
 )
@@ -184,6 +205,8 @@ SESSION_TRANSITIONS: Final[frozenset[tuple[SessionStatus, SessionStatus]]] = fro
         (SessionStatus.SOURCE_DELETING, SessionStatus.CLEANUP),
         (SessionStatus.SOURCE_DELETING, SessionStatus.SOURCE_DELETE_PENDING),
         (SessionStatus.SOURCE_DELETE_PENDING, SessionStatus.SOURCE_DELETING),
+        # **待つものが無くなったら畳む**（v5.44→v5.45 の変更 BG-3）
+        (SessionStatus.SOURCE_DELETE_PENDING, SessionStatus.CLEANUP),
         (SessionStatus.CLEANUP, SessionStatus.COMPLETED),
         (SessionStatus.FAILED, SessionStatus.MERGING),
         (SessionStatus.FAILED, SessionStatus.ANALYZING),

@@ -261,3 +261,29 @@ def test_resolve_absent_never_touches_the_queue(
 
     directory = Path(cfg.cleanup.queue_root) / cleaner.DELETE_DIRNAME
     assert not directory.is_dir() or list(directory.glob("*.json")) == []
+
+
+def test_resolve_absent_withdraws_the_result_too(
+    database: Database, cfg: Config, log: Logger, tmp_path: Path
+) -> None:
+    """**結果も取り下げる**（#160）。要求だけ消すと、対応する試行が無い結果が残る。"""
+    add(database, status=PartStatus.SOURCE_DELETE_PENDING)
+    results = Path(cfg.cleanup.queue_root) / cleaner.RESULT_DIRNAME
+    results.mkdir(parents=True, exist_ok=True)
+    stale = results / "20260101T000000-old-000000.json"
+    stale.write_text(
+        json.dumps({"schema": 1, "request_id": "x", "partkey": PARTKEY, "status": "DELETED"}),
+        encoding="utf-8",
+    )
+
+    backlog.run(
+        backlog=False,
+        resolve_absent=True,
+        dry_run=False,
+        cfg=cfg,
+        log=log,
+        state_root=state_with(tmp_path / "state", absent()),
+        now=NOW,
+    )
+
+    assert not stale.exists(), "結果を残した"
