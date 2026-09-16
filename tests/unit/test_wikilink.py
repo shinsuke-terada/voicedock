@@ -409,14 +409,14 @@ def test_raw_notes_are_linked(cfg: Config) -> None:
     assert result.raw == ("[[2026-09-12 raw]]",)
 
 
-def test_link_raw_false(make_config: Callable[..., Config]) -> None:
-    """**`include_transcript: true` と組にする**（V-34 / 変更 BJ-2）。
+def test_the_raw_link_cannot_be_turned_off(make_config: Callable[..., Config]) -> None:
+    """**Raw へのリンクは設定で外せない**（変更 BN-1）。
 
-    両方 false は起動時に弾かれる —— Daily ノートに本文もリンクも残らず、
-    **§13.7 W-9 が永久に満たせない**からである。
+    `link_raw` は v5.52 で廃止した。**W-9 を常に要求するなら `false` は選べない** ——
+    リンクが 1 本も作られず、**その日の Daily ノートが二度と `SAVED` にならない。**
     """
-    cfg = make_config({"obsidian": {"wiki": {"link_raw": False, "include_transcript": True}}})
-    assert plan(cfg, raw_names=("2026-09-12 raw",)).raw == ()
+    cfg = make_config()
+    assert plan(cfg, raw_names=("2026-09-12 raw",)).raw == ("[[2026-09-12 raw]]",)
 
 
 # --- max_links（§13.8） -------------------------------------------------

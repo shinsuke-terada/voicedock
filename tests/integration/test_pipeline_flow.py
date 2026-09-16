@@ -301,7 +301,6 @@ def test_the_daily_note_passes_every_save_check(flow: Flow) -> None:
         session_key=SESSION_KEY,
         expected_sha=session.output_sha256,  # type: ignore[attr-defined]
         expected_keys=[r.partkey() for r in ORIG_RECORDINGS],
-        require_raw_link=flow.cfg.obsidian.wiki.link_raw,
     )
     assert notes.all_passed(results), notes.failed_rules(results)
 

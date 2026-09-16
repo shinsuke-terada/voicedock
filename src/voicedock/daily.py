@@ -281,7 +281,8 @@ def _task(task: object) -> str:
 def _sources(links: wiki.LinkPlan) -> list[str]:
     """`## Sources` から Raw ノートへ辿る（§13.4 / §13.8）。
 
-    **全文は載せない**（`wiki.include_transcript` 既定 false）。W-9 がこのリンクを見る。
+    **全文は載せない。**W-9 がこのリンクを見る（§13.7）。**必ず出る** ——
+    出ない設定を v5.52 で廃止した（変更 BN-1）。
     """
     if not links.raw:
         return []
@@ -413,7 +414,6 @@ def write_daily_note(
         expected_sha=sha256,
         expected_keys=list(recording_keys),
         summary_heading=_summary_heading(cfg),
-        require_raw_link=not cfg.obsidian.wiki.include_transcript,
     )
     return DailyNoteResult(path=path, sha256=sha256, verification=verification)
 

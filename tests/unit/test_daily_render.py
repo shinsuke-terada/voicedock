@@ -438,7 +438,7 @@ def test_the_reason_order_does_not_depend_on_part_order(cfg: Config) -> None:
 
 
 def test_sources_links_to_the_raw_note(cfg: Config) -> None:
-    """**全文は載せない**（`wiki.include_transcript` 既定 false）。W-9 がこのリンクを見る。"""
+    """**全文は載せない。**W-9 がこのリンクを見る（§13.7 / 変更 BN-1）。"""
     text = render(cfg)
     assert "## Sources" in text
     assert "- [[2026-08-29 raw]]" in text
@@ -575,29 +575,35 @@ def test_saving_a_timeline_never_raises(tmp_path: Path) -> None:
     daily.save_timeline(blocked, [], fingerprint=FINGERPRINT)  # 例外を投げない
 
 
-def test_w9_is_satisfiable_under_every_accepted_config() -> None:
-    """**W-9 が満たせない設定を受理しない**（V-34 / 変更 BJ-2）。
+def test_the_transcript_switches_are_gone() -> None:
+    """**`include_transcript` と `link_raw` は設定から消えている**（変更 BN-1）。
 
-    `write_daily_note()` は `require_raw_link=not include_transcript` で検証する。
-    一方 `wiki.plan_links()` は **`link_raw` が偽なら Raw へのリンクを 1 本も作らない。**
+    `include_transcript` は「true にすると全文も埋め込む」と謳っていたが、
+    **全文を埋め込むコードは存在しなかった。**唯一の使用箇所は
+    `write_daily_note()` の `require_raw_link=not include_transcript` であり、
+    実際にやっていたのは **W-9 の免除**だけである ——
+    **`true` にすると「本文も無くリンクも無い Daily ノート」が検証を通った。**
 
-    つまり `include_transcript: false`（既定）＋ `link_raw: false` では、
-    ノートに `[[...]]` が 1 つも現れず、**W-9 が構造的に満たせない** ——
-    `ensure_daily_note()` は毎回 `OBSIDIAN_VERIFY_FAILED` で落ち、
-    **その日の Daily ノートは二度と `SAVED` にならない。**
-
-    v5.47 まで V 規則が 1 つも無く、**この設定は起動時に通っていた。**
+    `link_raw` はそれと対だった。**W-9 を常に要求するなら `false` は選べない**
+    （`plan_links()` がリンクを 1 本も作らず、W-9 が構造的に落ちる）。
+    **選べない選択肢を設定に残さない。**
     """
-    document = merge(example_document(), {"obsidian": {"wiki": {"link_raw": False}}})
-    parsed, violations = parse_config(document)
+    for key in ("include_transcript", "link_raw"):
+        document = merge(example_document(), {"obsidian": {"wiki": {key: True}}})
+        parsed, violations = parse_config(document)
+        assert parsed is None, f"{key} がまだ受理されている"
+        assert any(v.rule == "V-1" for v in violations), (key, violations)
 
-    assert parsed is None, "W-9 を満たせない設定が受理された"
-    assert [v.rule for v in violations] == ["V-34"], violations
 
-    # **対照**: 全文を埋め込むなら W-9 は要求されないので、`link_raw: false` は通る
-    both = merge(
-        example_document(),
-        {"obsidian": {"wiki": {"link_raw": False, "include_transcript": True}}},
+def test_the_sources_section_is_always_written(cfg: Config) -> None:
+    """**Raw へのリンクは設定で外せない**（変更 BN-1）。W-9 がこれを見る。"""
+    links = wiki.plan_links(
+        cfg=cfg,
+        day=DAY,
+        tags=[],
+        index=None,
+        self_name="2026-08-29 Voice",
+        name_for_day=lambda other: other.isoformat(),
+        raw_names=("2026-08-29 raw",),
     )
-    parsed_both, violations_both = parse_config(both)
-    assert parsed_both is not None, violations_both
+    assert links.raw == ("[[2026-08-29 raw]]",)

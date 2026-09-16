@@ -324,7 +324,6 @@ def verify_note(
     expected_sha: str,
     expected_keys: Collection[str],
     summary_heading: str = DEFAULT_SUMMARY_HEADING,
-    require_raw_link: bool = False,
 ) -> tuple[CheckResult, ...]:
     """§13.7 の R-1〜R-6（Raw）または W-1〜W-9（Daily）を評価する。
 
@@ -392,7 +391,7 @@ def verify_note(
         add(key_field, False, "frontmatter is not parseable YAML")
         add(key_field + 1, False, f"{RECORDING_KEYS_FIELD} unavailable")
         if kind is NoteKind.DAILY:
-            _add_daily_body_checks(results, text, summary_heading, require_raw_link)
+            _add_daily_body_checks(results, text, summary_heading)
         return tuple(results)
 
     # R-5 / W-6: `voicedock_session_key` が一致する
@@ -420,20 +419,24 @@ def verify_note(
         )
 
     if kind is NoteKind.DAILY:
-        _add_daily_body_checks(results, text, summary_heading, require_raw_link)
+        _add_daily_body_checks(results, text, summary_heading)
     return tuple(results)
 
 
-def _add_daily_body_checks(
-    results: list[CheckResult], text: str, summary_heading: str, require_raw_link: bool
-) -> None:
-    """W-8 / W-9。"""
+def _add_daily_body_checks(results: list[CheckResult], text: str, summary_heading: str) -> None:
+    """W-8 / W-9。
+
+    **W-9 は常に要求する**（v5.51→v5.52 の変更 BN-1）。v5.51 までは
+    `require_raw_link` で免除でき、それを渡していたのは
+    `require_raw_link=not cfg.obsidian.wiki.include_transcript` の 1 か所だけだった。
+    しかし **`include_transcript` は全文を埋め込まない**（そういうコードが無い）ので、
+    **`true` は「本文も無くリンクも無い Daily ノートを検証で通す」スイッチ**でしかなかった。
+
+    **免除の口そのものを塞いだ。**Daily ノートから本文へ辿る道は**必ず在る。**
+    """
     results.append(CheckResult("W-8", _has_content_under(text, summary_heading), summary_heading))
-    if require_raw_link:
-        found = bool(re.search(r"\[\[[^\]]+\]\]", text))
-        results.append(CheckResult("W-9", found, "raw link" if found else "no [[link]] found"))
-    else:
-        results.append(CheckResult("W-9", True, "not required (include_transcript is true)"))
+    found = bool(re.search(r"\[\[[^\]]+\]\]", text))
+    results.append(CheckResult("W-9", found, "raw link" if found else "no [[link]] found"))
 
 
 def _has_content_under(text: str, heading: str) -> bool:
