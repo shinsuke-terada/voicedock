@@ -468,6 +468,52 @@ def withdraw_request(partkey: str, *, cfg: Config) -> int:
     return removed
 
 
+def withdraw_result(partkey: str, *, cfg: Config) -> int:
+    """その Part 宛の結果をキューから取り下げる（§10.12 / #160）。
+
+    **`withdraw_request()` の対である。**要求だけ取り下げて結果を残すと、
+    **対応する試行が存在しない結果が溜まり続け**、`status` の `awaiting result` が
+    実態と食い違う。
+    """
+    directory = Path(cfg.cleanup.queue_root) / RESULT_DIRNAME
+    if not directory.is_dir():
+        return 0
+    removed = 0
+    for path in sorted(directory.glob("*.json")):
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(document, dict) and document.get("partkey") == partkey:
+            paths.safe_unlink_queue(QueuePath(path), root=Path(cfg.cleanup.queue_root))
+            removed += 1
+    return removed
+
+
+def outstanding_request_id(partkey: str, *, cfg: Config) -> str | None:
+    """その Part にいま出ている要求の `request_id`。無ければ `None`（#160）。
+
+    **キューが唯一の出所である。**DB に `request_id` の列を足さない —— 足すと
+    二重管理になり、**どちらが本当かを決める規則がまた 1 つ増える。**
+
+    **X-1 は維持している。**あれは「`request_id` を**解析**して Part を引かない」
+    （組み立て規則を変えたときに結果が迷子にならないようにする）という話であり、
+    **「その結果がこの要求のものか」を確かめない理由にはならない。**
+    """
+    directory = Path(cfg.cleanup.queue_root) / DELETE_DIRNAME
+    if not directory.is_dir():
+        return None
+    for path in sorted(directory.glob("*.json")):
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(document, dict) and document.get("partkey") == partkey:
+            request_id = document.get("request_id")
+            return str(request_id) if request_id else None
+    return None
+
+
 def discard_result(result: DeleteResult, *, cfg: Config) -> None:
     """回収済みの結果を捨てる。**`queue/` はコンテナが rw で持つ**（§18.2）。"""
     paths.safe_unlink_queue(QueuePath(result.path), root=Path(cfg.cleanup.queue_root))

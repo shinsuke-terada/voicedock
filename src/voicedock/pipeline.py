@@ -44,6 +44,8 @@ from voicedock.heartbeat import DEFAULT_STATE_ROOT
 from voicedock.log import Logger
 from voicedock.paths import InboxPath, PartKey, SessionKey, StagingPath
 from voicedock.states import (
+    AWAITING_DELETION,
+    CLEANUP_FROM,
     PART_DELETABLE,
     PART_RECOVERY,
     PART_RETRYABLE_FROM_FAILED,
@@ -731,9 +733,20 @@ class Pipeline:
             )
             return self._complete_without_deleting(row, parts)
 
+        if not any(part.status in AWAITING_DELETION for part in parts):
+            # **削除を待っている Part が 1 つも無い**（v5.44→v5.45 の変更 BG-3）。
+            # **「いずれ真になる」前提の待ちが成立しない** —— `COMPLETED` / `SKIPPED` /
+            # `FAILED` はもう削除の対象にならないので、待っても何も変わらない。
+            # v5.44 まで `delete_attempts` だけが際限なく増え、**セッションが
+            # `SOURCE_DELETE_PENDING` から永久に出られなかった**（実機で踏んだ）
+            return self._complete_without_deleting(row, parts)
+
         if requested == 0 and not any(part.status == PartStatus.SOURCE_DELETING for part in parts):
             # §9.3 の「`SAVED` のまま」。**`delete_attempts += 1` で backoff を進める**
             # （ビジーループ防止。§15.2）。**遷移ではないので `events` を書かない**
+            #
+            # **ここへ来るのは「待てば真になりうる」場合だけである** —— `RAW_SAVED` の
+            # Part が居て §14.1 が偽（ノートの検証が通っていない等）、など
             self.database.update_session(
                 session_key, delete_attempts=row.delete_attempts + 1, now=self.now
             )
@@ -768,9 +781,21 @@ class Pipeline:
         pending: set[str] = set()
         for result in cleaner.read_results(self.cfg):
             part = by_key.get(result.partkey)
-            if part is None or part.status != PartStatus.SOURCE_DELETING:
-                # 別のセッションのもの、または既に片付いたもの。**捨てない** —
-                # そのセッションを処理する周回で回収される
+            if part is None:
+                # **DB に無い。**別のセッションのものかもしれないので**捨てない**
+                # （そのセッションを処理する周回で回収される）
+                continue
+            if part.status != PartStatus.SOURCE_DELETING:
+                # **Part は在るが、もう待っていない**（v5.44→v5.45 の変更 BG-1）。
+                # **二度と `SOURCE_DELETING` に戻らないので回収されない。**残すと
+                # `status` の `awaiting result` が実態と食い違い、ファイルも溜まり続ける
+                cleaner.discard_result(result, cfg=self.cfg)
+                continue
+            if result.request_id != cleaner.outstanding_request_id(part.partkey, cfg=self.cfg):
+                # **古い試行の結果である**（変更 BG-2）。`partkey` だけで照合すると、
+                # **`DELETED` の古い結果が新しい要求に適用されうる** ——
+                # まだ消えていないものを「消えた」と判定する側の誤りである
+                cleaner.discard_result(result, cfg=self.cfg)
                 continue
             if result.deleted and cleaner.inventory_is_newer(inventory, result) is False:
                 # **inventory が追いつくまで待つ。**`SOURCE_DELETING` のまま残し、
@@ -841,8 +866,10 @@ class Pipeline:
         for part in parts:
             if part.status == PartStatus.RAW_SAVED:
                 self._transition(PartKey(part.partkey), PartStatus.RAW_SAVED, PartStatus.COMPLETED)
-        if row.status == SessionStatus.SAVED:
-            self._session_transition(row.session_key, SessionStatus.SAVED, SessionStatus.CLEANUP)
+        if row.status in CLEANUP_FROM:
+            # **遷移元は現在の状態である**（変更 BG-3）。`SAVED` の決め打ちだと、
+            # **`SOURCE_DELETE_PENDING` に座ったセッションが畳めない**
+            self._session_transition(row.session_key, row.status, SessionStatus.CLEANUP)
         fresh = self.database.get_session(SessionKey(row.session_key))
         if fresh is None or fresh.status != SessionStatus.CLEANUP:
             return False
