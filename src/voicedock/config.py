@@ -132,7 +132,6 @@ RULES: Final[tuple[Rule, ...]] = (
     Rule("V-31", "import.helper_heartbeat_max_age_seconds", _IV),
     Rule("V-32", "timezone", _IV),
     Rule("V-33", "cleanup.delete_source_audio", ErrorCode.CONFIG_LOCK_MISMATCH),
-    Rule("V-34", "obsidian.wiki.link_raw", _IV),
 )
 
 RULE_BY_ID: Final[Mapping[str, Rule]] = {r.id: r for r in RULES}
@@ -331,11 +330,24 @@ class RawConfig(_Section):
 
 
 class WikiConfig(_Section):
+    """Daily ノートの出力設定（§13.4 / §13.8）。
+
+    **`include_transcript` と `link_raw` は v5.52 で廃止した**（変更 BN-1）。
+
+    `include_transcript` は「true にすると全文も埋め込む」と謳っていたが、
+    **全文を埋め込むコードは存在しなかった。**唯一の使用箇所は
+    `daily.write_daily_note()` の `require_raw_link=not include_transcript` であり、
+    実際にやっていたのは **W-9 の免除**だけである ——
+    **`true` にすると「本文も無くリンクも無い Daily ノート」が検証を通った。**
+
+    `link_raw` はそれと対になっていた。**W-9 を常に要求するなら `false` は選べない**
+    （`plan_links()` が Raw へのリンクを 1 本も作らなくなり、W-9 が構造的に落ちる）。
+    **選べない選択肢を設定に残さない。**V-34 は欠番にした。
+    """
+
     folder_template: str
     filename_template: str
-    include_transcript: bool
     timeline: bool
-    link_raw: bool
     link_daily_note: bool
     link_adjacent_days: bool
     link_tags: bool
@@ -353,11 +365,6 @@ class WikiConfig(_Section):
                 f"V-14: {key}: {{title}} を含んではならない（再生成のたびにファイルが増殖する）"
             )
         _check_placeholders(key, self.filename_template)  # V-13
-        if not self.include_transcript and not self.link_raw:
-            raise ValueError(
-                "V-34: obsidian.wiki.link_raw: include_transcript が false なら true にすること"
-                "（Daily ノートに本文もリンクも残らず、§13.7 W-9 が永久に満たせない）"
-            )
         return self
 
 

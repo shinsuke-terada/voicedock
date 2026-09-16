@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 import pytest
@@ -64,7 +65,6 @@ def check(path: Path, kind: NoteKind, **overrides: object) -> dict[str, CheckRes
         "session_key": SESSION_KEY,
         "expected_sha": sha256_bytes(text),
         "expected_keys": (KEY_A, KEY_B),
-        "require_raw_link": kind is NoteKind.DAILY,
     }
     kwargs.update(overrides)
     return {r.rule: r for r in verify_note(path, **kwargs)}  # type: ignore[arg-type]
@@ -403,27 +403,35 @@ def test_w8_stops_at_the_next_heading(tmp_path: Path) -> None:
 # --- W-9 Raw へのリンク --------------------------------------------------
 
 
-def test_w9_requires_a_link_when_transcript_is_excluded(tmp_path: Path) -> None:
-    """`wiki.include_transcript` が false なら Raw へのリンクが要る（§13.7）。
+def test_w9_requires_a_link(tmp_path: Path) -> None:
+    """**Raw へのリンクは常に要る**（§13.7 / 変更 BN-1）。
 
-    本文を Daily に入れないなら、**元の文字起こしへ辿れる経路が無いと記録が迷子になる。**
+    Daily に全文を入れないので、**元の文字起こしへ辿れる経路が無いと記録が迷子になる。**
     """
     body = "\n## Summary\n\n打ち合わせをした。\n"
-    results = check(write(tmp_path, build_note(body=body)), NoteKind.DAILY, require_raw_link=True)
+    results = check(write(tmp_path, build_note(body=body)), NoteKind.DAILY)
     assert not results["W-9"].ok
 
 
 def test_w9_is_satisfied_by_a_wikilink(tmp_path: Path) -> None:
     body = "\n## Summary\n\nx\n\n[[2026-08-29 raw]]\n"
-    results = check(write(tmp_path, build_note(body=body)), NoteKind.DAILY, require_raw_link=True)
+    results = check(write(tmp_path, build_note(body=body)), NoteKind.DAILY)
     assert results["W-9"].ok
 
 
-def test_w9_passes_when_not_required(tmp_path: Path) -> None:
-    """`include_transcript` が true ならリンクは要らない。"""
+def test_w9_cannot_be_waived(tmp_path: Path) -> None:
+    """**免除の口が無いこと**（変更 BN-1）。
+
+    v5.51 までは `require_raw_link=False` で W-9 を素通しできた。渡していたのは
+    `require_raw_link=not cfg.obsidian.wiki.include_transcript` の 1 か所だけだが、
+    **`include_transcript` は全文を埋め込まない**（そういうコードが無い）ので、
+    **`true` は「本文も無くリンクも無い Daily ノートを通す」スイッチ**でしかなかった。
+    """
+    assert "require_raw_link" not in inspect.signature(verify_note).parameters
+
     body = "\n## Summary\n\nx\n"
-    results = check(write(tmp_path, build_note(body=body)), NoteKind.DAILY, require_raw_link=False)
-    assert results["W-9"].ok
+    results = check(write(tmp_path, build_note(body=body)), NoteKind.DAILY)
+    assert not results["W-9"].ok, "リンクが無いのに通った"
 
 
 # --- 補助 ----------------------------------------------------------------
