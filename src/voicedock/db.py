@@ -456,6 +456,13 @@ class Database:
         ).fetchall()
         return [_from_row(Session, row) for row in rows]
 
+    def recordings_with_status(self, status: str) -> list[Recording]:
+        """`status` の Part を `partkey` 昇順で返す（§17.1 の `cleanup` が使う）。"""
+        rows = self.conn.execute(
+            "SELECT * FROM recordings WHERE status = ? ORDER BY partkey", (status,)
+        ).fetchall()
+        return [_from_row(Recording, row) for row in rows]
+
     def failed_from(self, entity: EntityType, entity_key: str) -> str | None:
         """**直前にどの進行中状態から `FAILED` へ落ちたか**（§9.3 / §15.2）。
 
