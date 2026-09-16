@@ -642,7 +642,7 @@ class Pipeline:
         # **先に結果を回収する。**`SOURCE_DELETING` のまま残った行を片付けてから
         # 新しい要求を評価しないと、同じ Part の要求が二重に並ぶ（§10.12）
         inventory = device.read_inventory(self.state_root)
-        self.collect_delete_results(parts, inventory)
+        just_pending = self.collect_delete_results(parts, inventory)
         parts = self.database.recordings_for_session(session_key)
 
         if not self.cfg.cleanup.delete_source_audio:
@@ -656,6 +656,10 @@ class Pipeline:
             if part.status == PartStatus.SOURCE_DELETING:
                 # **要求が既に出ている。**自己遷移は `PART_TRANSITIONS` に無く、
                 # 二重に要求を並べることにもなる（§10.12）
+                continue
+            if part.partkey in just_pending:
+                # **同じ周回で保留へ落とした Part を再要求しない**（BE-2）。
+                # backoff はセッション単位で効くが、**同じ周回の中では何度でも回る**
                 continue
             if part.status == PartStatus.COMPLETED:
                 # **通常運用の経路から `COMPLETED` を消しにいかない。**
@@ -741,7 +745,7 @@ class Pipeline:
 
     def collect_delete_results(
         self, parts: list[Recording], inventory: DeviceInventory | None
-    ) -> int:
+    ) -> set[str]:
         """reaper の結果を回収し、`SOURCE_DELETING` を進める（§10.12 / §9.3）。
 
         **結果を 2 系統で確認する。**`queue/result/` は reaper の自己申告であり、
@@ -752,21 +756,33 @@ class Pipeline:
         `SOURCE_DELETE_PENDING` にする。**reaper が存在しない場合もここへ落ちる** —
         それは Phase 7 前の正常な状態である。
 
-        戻り値は状態を進めた件数。
+        **`inventory` が結果より古いときは何もしない**（v5.42→v5.43 の変更 BE-1）。
+        `inventory.json` は ingest が 5 分ごとに書き、reaper は ingest の最後に走るので、
+        **削除の直後は必ず inventory のほうが古い。**古い inventory はその削除について
+        **何も言えない** —— それを「まだ在る＝失敗」と読むと、**成功した削除が毎回
+        ちょうど 1 度失敗として記録される。**
+
+        戻り値は**保留へ落とした Part の鍵**。呼び手が同じ周回で再要求しないために使う。
         """
         by_key = {part.partkey: part for part in parts}
-        moved = 0
+        pending: set[str] = set()
         for result in cleaner.read_results(self.cfg):
             part = by_key.get(result.partkey)
             if part is None or part.status != PartStatus.SOURCE_DELETING:
                 # 別のセッションのもの、または既に片付いたもの。**捨てない** —
                 # そのセッションを処理する周回で回収される
                 continue
+            if result.deleted and cleaner.inventory_is_newer(inventory, result) is False:
+                # **inventory が追いつくまで待つ。**`SOURCE_DELETING` のまま残し、
+                # **結果ファイルも消さない。**歯止めは `_expire_delete_requests()` である
+                continue
             if not result.deleted:
                 self._delete_pending(part, ErrorCode.SOURCE_IDENTITY_MISMATCH, result.detail)
+                pending.add(part.partkey)
             elif not cleaner.source_is_gone(part, inventory):
                 # **reaper は消したと言うが `inventory.json` にまだ在る**（§10.12）
                 self._delete_pending(part, ErrorCode.SOURCE_DELETE_FAILED, "still_in_inventory")
+                pending.add(part.partkey)
             else:
                 self.database.update_recording(
                     PartKey(part.partkey),
@@ -780,10 +796,9 @@ class Pipeline:
                     "source_deleted", recording_key=part.partkey, request_id=result.request_id
                 )
             cleaner.discard_result(result, cfg=self.cfg)
-            moved += 1
 
-        moved += self._expire_delete_requests(parts)
-        return moved
+        self._expire_delete_requests(parts)
+        return pending
 
     def _expire_delete_requests(self, parts: list[Recording]) -> int:
         """結果が来ないまま `delete_result_timeout_seconds` を過ぎた要求を取り下げる。

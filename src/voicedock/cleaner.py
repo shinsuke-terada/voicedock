@@ -365,6 +365,8 @@ class DeleteResult:
     partkey: str
     status: str
     detail: str
+    completed_at: datetime | None = None
+    """reaper が結果を書いた時刻。**`inventory.json` の新旧を判定するのに使う**（#156）。"""
 
     @property
     def deleted(self) -> bool:
@@ -399,9 +401,36 @@ def read_results(cfg: Config) -> list[DeleteResult]:
                 partkey=partkey,
                 status=str(document.get("status", "")),
                 detail=str(document.get("detail", "")),
+                completed_at=_parse_time(document.get("completed_at")),
             )
         )
     return found
+
+
+def _parse_time(value: object) -> datetime | None:
+    """ISO 8601 を `datetime` へ。**読めなければ `None`**（不明は安全側。§7.5）。"""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def inventory_is_newer(inventory: DeviceInventory | None, result: DeleteResult) -> bool | None:
+    """`inventory.json` が結果より新しいか。**判定できなければ `None`**（#156）。
+
+    **`inventory` は ingest が 5 分ごとに書き、reaper は ingest の最後に走る。**
+    したがって**削除の直後は必ず inventory のほうが古い。**古い inventory は
+    その削除について**何も言えない** —— それを「まだ在る＝失敗」と読むと、
+    **成功した削除が毎回ちょうど 1 度失敗として記録される。**
+
+    #148 / #107 と同じ型である —— **「まだ観測していない」と「そうでない」を
+    区別しない。**
+    """
+    if inventory is None or inventory.generated_at is None or result.completed_at is None:
+        return None
+    return inventory.generated_at >= result.completed_at
 
 
 def source_is_gone(part: Recording, inventory: DeviceInventory | None) -> bool:
