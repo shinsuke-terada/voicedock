@@ -1475,7 +1475,9 @@ def test_collect_delete_results_runs_before_the_session_is_saved(scene: Scene) -
             {
                 "schema": 1,
                 "request_id": request["request_id"],
-                "completed_at": NOW.isoformat(),
+                # **inventory（`NOW`）より前の秒に削除した**体にする。同じ秒の inventory は
+                # 削除の前に走査したものなので、判定に使わない（v5.54→v5.55）
+                "completed_at": (NOW - timedelta(minutes=5)).isoformat(),
                 "reaper_version": "5.9.0",
                 "device_id": DEVICE_ID,
                 "partkey": PARTKEY,
@@ -1643,8 +1645,17 @@ def write_result(scene: Scene, *, status: str = "DELETED", detail: str = "", **e
 
 
 def gone(scene: Scene) -> DeviceInventory:
-    """デバイス上からそのファイルが消えた状態の `inventory.json`。"""
-    return DeviceInventory(generated_at=NOW, mount_readonly=False, devices={DEVICE_ID: frozenset()})
+    """デバイス上からそのファイルが消えた状態の `inventory.json`。**結果より後の秒に書かれた。**
+
+    **v5.54 まで `generated_at=NOW` で、`write_result()` の `completed_at` の既定と同じ秒だった。**
+    その形を「新しい」と読む実装（`>=`）を**このヘルパ自身が固定していた**ので、
+    同じ秒の inventory を削除前のものと区別しない欠陥が、どのテストにも引っかからなかった。
+    """
+    return DeviceInventory(
+        generated_at=NOW + timedelta(minutes=5),
+        mount_readonly=False,
+        devices={DEVICE_ID: frozenset()},
+    )
 
 
 def stale(scene: Scene) -> DeviceInventory:
@@ -1687,6 +1698,29 @@ def test_the_deletion_completes_once_the_inventory_catches_up(scene: Scene) -> N
 
     assert scene.part().status == PartStatus.COMPLETED
     assert scene.part().source_deleted_at is not None
+
+
+def test_an_inventory_from_the_same_second_says_nothing(scene: Scene) -> None:
+    """**同じ秒の inventory は結果より「新しい」と読まない**（v5.54→v5.55）。
+
+    ingest は**同じ走行の中で inventory を書いてから reaper を走らせる。**削除が 1 本だと
+    reaper は同じ秒に終わるので、`generated_at == completed_at` の inventory は
+    **削除の前に走査したもの**である。それを判定に使うと、**消えたファイルを
+    「まだ在る」＝失敗として記録する**（2026-09-17 21:28:37 の実機がこの形）。
+    """
+    result = write_result(scene, completed_at=NOW.isoformat())
+    same_second = DeviceInventory(
+        generated_at=NOW,
+        mount_readonly=False,
+        devices={DEVICE_ID: frozenset({DevicePath(PurePosixPath(RELPATH))})},
+    )
+
+    pending = scene.runner.collect_delete_results([scene.part()], same_second)
+
+    assert pending == set(), "削除前の走査で失敗と記録した"
+    assert scene.part().status == PartStatus.SOURCE_DELETING, "待たずに進めた"
+    assert scene.part().error_code is None
+    assert result.exists(), "結果を捨てると、次の周回で回収できない"
 
 
 def test_a_fresh_inventory_that_still_has_the_file_is_a_failure(scene: Scene) -> None:
@@ -1860,7 +1894,9 @@ def test_a_result_the_inventory_disagrees_with_goes_pending(scene: Scene) -> Non
     `queue/result/` は reaper の申告であり、`state/inventory.json` は ingest が
     **独立に**走査した結果である。**両方が一致して初めて `COMPLETED` にする。**
     """
-    write_result(scene)
+    # **inventory（`NOW`）は結果より後の秒に書かれた**体にする。同じ秒だと「削除前の
+    # 走査」と区別できず、待つのが正しい（`test_an_inventory_from_the_same_second_says_nothing`）
+    write_result(scene, completed_at=(NOW - timedelta(minutes=5)).isoformat())
     scene.runner.collect_delete_results([scene.part()], scene.inventory)
 
     assert scene.part().status == PartStatus.SOURCE_DELETE_PENDING
