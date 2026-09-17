@@ -41,7 +41,7 @@ from voicedock.log import MAX_VALUE_CHARS
 from voicedock.paths import PartKey
 from voicedock.states import FAILED_STATUS, RETRY_RESET_STATUSES
 
-SCHEMA_VERSION: Final = 2
+SCHEMA_VERSION: Final = 3
 MIGRATIONS_PACKAGE: Final = "voicedock.migrations"
 MIGRATION_PATTERN: Final = re.compile(r"^(?P<version>\d{4})_[a-z0-9_]+\.sql$")
 DEFAULT_BUSY_TIMEOUT_MS: Final = 10000
@@ -114,6 +114,7 @@ class Recording:
     error_message: str | None = None
     source_deleted_at: str | None = None
     delete_request_id: str | None = None
+    duplicate_of: str | None = None
 
 
 @dataclass(frozen=True)

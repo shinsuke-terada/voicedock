@@ -326,6 +326,13 @@ class Pipeline:
         )
 
         if result.error_code is ErrorCode.DUPLICATE_CONTENT:
+            # **双子の鍵を列に書く**（§8.2 / §14.1 根拠 B）。`sha256` は双子と同じ値に
+            # なるので書けない（`idx_recordings_sha` が UNIQUE）。**`error_message` の
+            # 文字列を後から解析しない。**`_skip()` より先に書く —— 遷移で落ちたときに
+            # 列だけが進んだ状態を作らない（無音の `transcript_path` と同じ扱い）
+            self.database.update_recording(
+                record.partkey, duplicate_of=result.duplicate_of, now=self.now
+            )
             self._skip(
                 record,
                 ErrorCode.DUPLICATE_CONTENT,
@@ -862,6 +869,7 @@ class Pipeline:
                 vault_root=Path(self.cfg.obsidian.root),
                 log=self.log,
                 now=self.now or datetime.now(self.cfg.tz),
+                twin=self._twin_of(part),
             )
             if request is None:
                 continue
@@ -873,6 +881,28 @@ class Pipeline:
             )
             requested += 1
         return requested
+
+    def _twin_of(self, part: Recording) -> cleaner.TwinPart | None:
+        """重複の**双子**を DB から解決する（§14.1 根拠 B）。**`duplicate_of` 列だけを使う。**
+
+        **`error_message` の文字列を解析しない。**`sha256` からも引かない —— 重複の行は
+        `sha256` を持てない（`idx_recordings_sha` が UNIQUE）。
+
+        解決できなければ `None`。**`None` なら根拠 B は偽になる**（消さない側）。
+        """
+        if part.duplicate_of is None:
+            return None
+        twin = self.database.get_recording(PartKey(part.duplicate_of))
+        if twin is None or twin.session_key is None:
+            return None
+        session_row = self.database.get_session(SessionKey(twin.session_key))
+        if session_row is None:
+            return None
+        return cleaner.TwinPart(
+            part=twin,
+            session=session_row,
+            parts=self.database.recordings_for_session(SessionKey(twin.session_key)),
+        )
 
     def _skipped_retry_is_due(self, part: Recording) -> bool:
         """根拠 B の再要求を間引く（§15.2）。`delete_evaluation_backoff_seconds` の最小値。

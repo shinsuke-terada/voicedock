@@ -35,11 +35,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from voicedock import cleaner, device, llm, notes, paths, pipeline, transcribe
+from voicedock import audio, cleaner, device, llm, notes, paths, pipeline, transcribe
 from voicedock.config import Config
 from voicedock.db import Database, Recording, Session
 from voicedock.device import DeviceInventory
-from voicedock.errors import ErrorCode
+from voicedock.errors import DELETABLE_SKIP_REASONS, ErrorCode
 from voicedock.log import Logger
 from voicedock.paths import DevicePath, PartKey, SessionKey, partkey_for
 from voicedock.pipeline import Pipeline
@@ -684,6 +684,211 @@ def test_a_part_absent_from_the_inventory_is_not_evaluated(scene: Scene) -> None
     assert scene.requests() == []
 
 
+# --- 根拠 B: 重複の元音声（§14.1 / ND-03 / ND-35） ------------------------
+#
+# **重複は自分の本文を持たない。**このバイト列の本文は**双子の側に**在るので、
+# 双子（Scene の Part。Raw ノートと transcript が揃っている）に根拠 A を当てる。
+
+DUP_RELPATH = f"{FOLDER}/TX00_MIC002_20260912_093000_orig.wav"
+DUP_PARTKEY = partkey_for(DEVICE_ID, DevicePath(PurePosixPath(DUP_RELPATH)))
+
+
+def _add_duplicate(scene: Scene, *, duplicate_of: str | None = PARTKEY) -> None:
+    """Scene の Part を双子とする**重複の Part** を足す。**双子は `RAW_SAVED` に戻す。**"""
+    scene.rearm()
+    started = "2026-09-12T09:30:00+09:00"
+    scene.database.insert_recording(
+        Recording(
+            partkey=DUP_PARTKEY,
+            device_id=DEVICE_ID,
+            source_folder=FOLDER,
+            transmitter_id="TX00",
+            mic_index=2,
+            started_at=started,
+            status=PartStatus.SKIPPED,
+            updated_at=started,
+            duration_seconds=60.0,
+            source_path=DUP_RELPATH,
+            source_size=SOURCE_SIZE,
+            source_mtime=SOURCE_MTIME,
+            session_key=SESSION_KEY,
+            error_code=ErrorCode.DUPLICATE_CONTENT,
+            duplicate_of=duplicate_of,
+        )
+    )
+
+
+def _both(scene: Scene) -> DeviceInventory:
+    """双子と重複の両方がデバイスに在る `inventory.json`。"""
+    return DeviceInventory(
+        generated_at=NOW,
+        mount_readonly=False,
+        devices={
+            DEVICE_ID: frozenset(
+                {DevicePath(PurePosixPath(RELPATH)), DevicePath(PurePosixPath(DUP_RELPATH))}
+            )
+        },
+    )
+
+
+def _duplicate(scene: Scene) -> Recording:
+    row = scene.database.get_recording(DUP_PARTKEY)
+    assert row is not None
+    return row
+
+
+def _requested_keys(scene: Scene) -> list[str]:
+    return [json.loads(path.read_text(encoding="utf-8"))["partkey"] for path in scene.requests()]
+
+
+def test_a_duplicate_is_deleted_when_its_twin_text_is_preserved(scene: Scene) -> None:
+    """**正の対照。**双子が根拠 A を満たせば、重複の元音声に要求が 1 件書かれる。"""
+    _add_duplicate(scene)
+    scene.open_lock_b()
+
+    assert _settle_with(scene, _both(scene), now=LATER) == 1
+    assert _requested_keys(scene) == [DUP_PARTKEY], "双子のほうに要求を書いた"
+    duplicate = _duplicate(scene)
+    assert duplicate.status == PartStatus.SKIPPED
+    assert duplicate.error_code == ErrorCode.DUPLICATE_CONTENT
+
+
+def test_nd03_lock_b_keeps_a_duplicate(scene: Scene) -> None:
+    """ND-03: `delete_skipped_source: false` なら重複の元音声は残る。
+
+    **ロック以外はすべて満たしてある**（双子の本文は揃っている）。
+
+    **論理式そのものも偽であること。**`settle_skipped_deletions()` は同じロックで
+    早期に抜けるので、要求が無いことだけを見ると **`cleaner` 側の条件を削っても通る**
+    （意図的破壊で実際に通った）。
+    """
+    _add_duplicate(scene)  # ロック B は開けない
+
+    assert _settle_with(scene, _both(scene), now=LATER) == 0
+    assert scene.requests() == []
+    twin = cleaner.TwinPart(part=scene.part(), session=scene.session(), parts=[scene.part()])
+    assert not cleaner.can_delete_source(
+        _duplicate(scene),
+        scene.session(),
+        [scene.part(), _duplicate(scene)],
+        scene.cfg,
+        _both(scene),
+        vault_root=scene.vault,
+        twin=twin,
+    )
+
+
+def test_nd35_a_duplicate_whose_twin_text_is_not_in_the_vault_is_never_deleted(
+    scene: Scene,
+) -> None:
+    """ND-35: **双子の本文が Vault に確認できなければ**、重複の元音声は消さない。
+
+    重複の Part は自分の本文を持たない。**このバイト列の本文が残っていることを
+    言えるのは双子だけ**なので、双子の Raw ノートが検証を通らなければ根拠 B は偽である。
+    """
+    _add_duplicate(scene)
+    scene.open_lock_b()
+    scene.raw_path().unlink()
+
+    assert _settle_with(scene, _both(scene), now=LATER) == 0
+    assert scene.requests() == []
+
+
+def test_a_duplicate_recorded_before_v5_56_is_never_deleted(scene: Scene) -> None:
+    """**`duplicate_of` が `NULL` の重複は消さない**（v5.55 以前に `SKIPPED` になったもの）。
+
+    双子を指名できないので根拠 B が成立しない。**`error_message` の文字列から
+    推し量らない。**
+    """
+    _add_duplicate(scene, duplicate_of=None)
+    scene.open_lock_b()
+
+    assert _settle_with(scene, _both(scene), now=LATER) == 0
+    assert scene.requests() == []
+
+
+def test_only_the_recorded_twin_is_accepted(scene: Scene) -> None:
+    """**`duplicate_of` で指名された双子だけを認める。**呼び手が別の Part を渡しても通さない。
+
+    `Pipeline._twin_of()` は列で引くので、この形には通常ならない。**だから直接呼ぶ。**
+    本文が揃った Part を「双子」として渡しても、指名と違えば偽である。
+    """
+    _add_duplicate(scene, duplicate_of=f"{DEVICE_ID}/{FOLDER}/TX00_MIC009_20260912_120000_orig.wav")
+    scene.open_lock_b()
+    twin = cleaner.TwinPart(part=scene.part(), session=scene.session(), parts=[scene.part()])
+
+    assert not cleaner.can_delete_source(
+        _duplicate(scene),
+        scene.session(),
+        [scene.part(), _duplicate(scene)],
+        scene.cfg,
+        _both(scene),
+        vault_root=scene.vault,
+        twin=twin,
+    )
+    # **正の対照**: 指名どおりの双子なら真になる（ここまで揃っていることの確認）
+    scene.database.update_recording(DUP_PARTKEY, duplicate_of=PARTKEY)
+    assert cleaner.can_delete_source(
+        _duplicate(scene),
+        scene.session(),
+        [scene.part(), _duplicate(scene)],
+        scene.cfg,
+        _both(scene),
+        vault_root=scene.vault,
+        twin=twin,
+    )
+
+
+def test_every_deletable_reason_has_its_own_basis() -> None:
+    """**許可リストに足した理由には、必ず根拠の分岐が在ること**（§14.1 根拠 B）。
+
+    `_skip_reason_is_backed()` は表に無い理由を偽にする（消さない側）。**そのため
+    `DELETABLE_SKIP_REASONS` にだけ足して分岐を書き忘れても、振る舞いのテストは
+    どれも落ちない** —— 黙って「消えない」だけになる。だから分岐が在ることを固定する。
+    """
+    body = _body(cleaner._skip_reason_is_backed)
+    for reason in sorted(DELETABLE_SKIP_REASONS):
+        assert f"ErrorCode.{reason}" in body, f"{reason} の根拠が書かれていない"
+
+
+def test_a_duplicate_part_records_its_twin(
+    scene: Scene, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**重複に落ちたら `duplicate_of` を DB に書く**（§8.2）。
+
+    `sha256` は双子と同じ値なので書けない（`idx_recordings_sha` が UNIQUE）。
+    **双子を引く手段がこの列しか無い。**
+    """
+    inbox = tmp_path / "inbox.wav"
+    inbox.write_bytes(b"RIFF0000WAVE")
+    scene.set_part(status=PartStatus.DISCOVERED, inbox_path=str(inbox), sha256=None)
+    twin_key = f"{DEVICE_ID}/{FOLDER}/TX00_MIC009_20260912_120000_orig.wav"
+
+    def duplicate(*_args: object, **_kwargs: object) -> audio.NormalizeResult:
+        return audio.NormalizeResult(
+            path=None,
+            sha256="0" * 64,
+            error_code=ErrorCode.DUPLICATE_CONTENT,
+            error_message=f"同じ内容の Part が既にあります: {twin_key}",
+            duplicate_of=twin_key,
+        )
+
+    monkeypatch.setattr(audio, "normalize", duplicate)
+    monkeypatch.setattr(
+        audio,
+        "check_space",
+        lambda *_a, **_k: audio.SpaceCheck(
+            ok=True, detail="", expected_bytes=0, free_bytes=1, staging_bytes=0
+        ),
+    )
+
+    assert scene.runner.ensure_normalized_audio(scene.part()) is False
+    part = scene.part()
+    assert part.status == PartStatus.SKIPPED
+    assert part.error_code == ErrorCode.DUPLICATE_CONTENT
+    assert part.duplicate_of == twin_key
+
+
 # --- ND-07〜ND-09: Raw ノート ------------------------------------------
 
 
@@ -1186,6 +1391,15 @@ def test_the_watchdog_terms_are_present_in_the_formula() -> None:
     identified = _body(cleaner._deletion_is_identified)
     assert "len(parts) >= 1" in identified
     assert 'part.source_path != ""' in identified
+
+    # **重複の双子の番犬**（v5.56）。どれも他の条件が先に受け止める ——
+    # `duplicate_of` が `NULL` なら `_twin_of()` が `None` を渡し、自分自身を双子にすると
+    # `SKIPPED` は `PART_DELETABLE` に無いので根拠 A が偽、別セッションを渡すと
+    # `verify_raw_note()` の R-5 が偽になる。**だから在ることを固定する**
+    backed = _body(cleaner._skip_reason_is_backed)
+    assert "part.duplicate_of is not None" in backed
+    assert "twin.part.partkey != part.partkey" in backed
+    assert "twin.part.session_key == twin.session.session_key" in backed
 
     preserved = _body(cleaner._text_is_preserved)
     assert preserved.count("_note_contains(") == 1, "Raw ノートの鍵の包含が消えている"

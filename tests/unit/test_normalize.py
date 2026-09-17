@@ -547,6 +547,8 @@ def test_duplicate_content_is_skipped(cfg: Config, source: InboxPath) -> None:
         duplicate_of=lambda _digest: "DJIMIC3/other/other_orig.wav",
     )
     assert result.error_code is ErrorCode.DUPLICATE_CONTENT
+    # **双子の鍵を構造として返す**（§14.1 根拠 B）。文字列に埋め込むだけにしない
+    assert result.duplicate_of == "DJIMIC3/other/other_orig.wav"
     assert not Path(normalized_path_for(PARTKEY)).exists()
     assert Path(source).is_file()
 
@@ -650,6 +652,8 @@ def test_the_duplicate_check_runs_on_the_reuse_path_too(cfg: Config, source: Inb
 
     assert not again.ok
     assert again.error_code is ErrorCode.DUPLICATE_CONTENT
+    # **再利用の経路でも双子の鍵を返す**（変換の経路とは別の `return` である）
+    assert again.duplicate_of == "DJIMIC3/somewhere/else_orig.wav"
 
 
 @pytest.mark.needs_ffmpeg
