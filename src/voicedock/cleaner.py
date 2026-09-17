@@ -532,10 +532,20 @@ def inventory_is_newer(inventory: DeviceInventory | None, result: DeleteResult) 
 
     #148 / #107 と同じ型である —— **「まだ観測していない」と「そうでない」を
     区別しない。**
+
+    **同じ秒は「新しい」に含めない**（v5.54→v5.55）。どちらも秒の分解能しか無く、
+    **ingest は同じ走行の中で inventory を書いてから reaper を走らせる。**削除が 1 本だけ
+    だと reaper は同じ秒のうちに終わるので、**`generated_at == completed_at` の inventory は
+    削除の前に走査したもの**である。`>=` はそれを「結果より新しい」と読み、
+    **消えたファイルを「まだ在る」＝失敗として記録していた**（2026-09-17 21:28:37 に実機で踏んだ。
+    9/16 の E2E の `still_in_inventory` 6 件も同じ形）。
+
+    **次の走行の inventory は必ず後の秒になる**（launchd の `StartInterval` は 300 秒で、
+    走行は重ならない）。だから厳密に後の秒だけを判定に使えば、待つのは 1 周だけである。
     """
     if inventory is None or inventory.generated_at is None or result.completed_at is None:
         return None
-    return inventory.generated_at >= result.completed_at
+    return inventory.generated_at > result.completed_at
 
 
 def source_is_gone(part: Recording, inventory: DeviceInventory | None) -> bool:
