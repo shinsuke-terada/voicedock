@@ -594,6 +594,8 @@ ls -la "/Volumes/<VOL>/TX_.../"                       # ★元音声が消えて
 | テキストが残る | ✅ Raw ノート 133,746 バイト / transcript 26 件 |
 | 容量が解放される | ✅ 26.4 GiB → 27.7 GiB（1.3 GiB） |
 
+> **この判定条件は v5.53 時点のものである。**v5.54 で §14.1 に根拠 B が入り、`cleanup.delete_skipped_source: true` なら無音の元音声も削除される（既定は `false`）。**残った MIC006 は 30 分ちょうどで 0 文字だった** —— whisper の判定だけを根拠にすると、この 1 本も消えていた。
+
 **TCC を越えた。**手で叩いた reaper は `Operation not permitted` で `unlink` に失敗する。
 **LaunchAgent の子プロセスとして走ると通る**（§3.4(7) のラッパ経由。#152 の設計判断）。
 

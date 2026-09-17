@@ -12,8 +12,10 @@ from tests.spec_sync import (
     spec_error_next_states,
     spec_exit_codes,
     spec_startup_aborting_codes,
+    spec_status_tuple,
 )
 from voicedock import errors
+from voicedock.daily import BENIGN_SKIP_REASONS
 from voicedock.errors import Category, ErrorCode, RetryPolicy
 
 # SPEC §15.1 の「リトライ」列の原文 → RetryPolicy。
@@ -171,3 +173,33 @@ def test_exit_codes_match_spec() -> None:
         errors.EXIT_UNHEALTHY: "health check 失敗（unhealthy）",
         errors.EXIT_DOCTOR_FATAL: "診断で致命的な問題を検出（`doctor` のみ）",
     }
+
+
+# --- 根拠 B の許可リスト（§14.1） ----------------------------------------
+
+
+def test_deletable_skip_reasons_match_spec() -> None:
+    """**元音声を消してよい `SKIPPED` の理由**が §14.1 の `DELETABLE_SKIP_REASONS` と一致する。
+
+    **足すときは §14.1 を先に直すこと。**理由ごとに「保全すべき本文が無い」と
+    言える根拠が要る —— `NO_SPEECH_DETECTED` は whisper の出力が残ることがそれである。
+    """
+    assert {str(code) for code in errors.DELETABLE_SKIP_REASONS} == set(
+        spec_status_tuple("DELETABLE_SKIP_REASONS")
+    )
+    assert len(errors.DELETABLE_SKIP_REASONS) == 1
+
+
+def test_source_missing_is_never_deletable() -> None:
+    """`SOURCE_MISSING` は入れない。**内容について何も観測していない**（§15.1 / ND-33）。"""
+    assert ErrorCode.SOURCE_MISSING not in errors.DELETABLE_SKIP_REASONS
+
+
+def test_deletable_reasons_need_no_user_action() -> None:
+    """**消してよい理由は、必ず「利用者がすることが無い」理由である。**
+
+    `daily.BENIGN_SKIP_REASONS`（警告記号を付けない理由）と**別の定数に分けてある**が、
+    包含関係は崩してはならない —— 警告を出す（利用者の確認を求める）理由の元音声を
+    黙って消すと、**確認しに行ったときには音声がもう無い。**
+    """
+    assert errors.DELETABLE_SKIP_REASONS <= BENIGN_SKIP_REASONS

@@ -194,6 +194,7 @@ def test_the_tick_follows_the_spec_order(
     runner.process_pending_parts = note("process_pending_parts")  # type: ignore[method-assign]
     runner.process_ready_sessions = note("process_ready_sessions")  # type: ignore[method-assign]
     runner.evaluate_deletions = note("evaluate_deletions")  # type: ignore[method-assign]
+    runner.settle_skipped_deletions = note("settle_skipped_deletions")  # type: ignore[method-assign]
     runner.requeue_failed = note_requeue  # type: ignore[method-assign]
 
     runner.tick()
@@ -203,6 +204,7 @@ def test_the_tick_follows_the_spec_order(
         "process_pending_parts",
         "process_ready_sessions",
         "evaluate_deletions",
+        "settle_skipped_deletions",
         "requeue_failed",
     ]
 
@@ -236,6 +238,7 @@ def test_a_stale_heartbeat_does_not_stop_the_stages_that_ignore_the_helper(
     runner.process_pending_parts = note("process_pending_parts")  # type: ignore[method-assign]
     runner.process_ready_sessions = note("process_ready_sessions")  # type: ignore[method-assign]
     runner.evaluate_deletions = note("evaluate_deletions")  # type: ignore[method-assign]
+    runner.settle_skipped_deletions = note("settle_skipped_deletions")  # type: ignore[method-assign]
     runner.requeue_failed = note_requeue  # type: ignore[method-assign]
 
     assert runner.tick() is False, "取り込みを進めたと報告してはならない"

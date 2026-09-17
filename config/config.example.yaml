@@ -156,6 +156,11 @@ obsidian:
 cleanup:
   # 【安全ロック 1】DJI 側の元音声を削除するか。既定 false
   delete_source_audio: false
+  # 発話が検出されず SKIPPED になった Part の元音声も削除するか。既定 false
+  # **delete_source_audio が true でなければ効かない**（§14.1 の根拠 B）。
+  # 根拠は「whisper の出力が /data/transcripts/parts/ に無期限で残ること」であり、
+  # **保全すべき本文が無いことを、その保存物が示す**という一段の論理である
+  delete_skipped_source: false
   # 【安全ロック 2-A / 2-B は helper.conf 側にある（§7.4, §14.2）】
   # 文字起こし後に 16 kHz 音声を削除するか（容量節約）
   delete_normalized_after_transcribe: true
