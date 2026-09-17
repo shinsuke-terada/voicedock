@@ -131,7 +131,7 @@ class Worker:
         触れないのに、である。
 
         止めるのは `discover_parts`（`/inbox`）と、`evaluate_deletions` /
-        `requeue_failed`（`inventory.json`）の 3 つ。
+        `settle_skipped_deletions` / `requeue_failed`（`inventory.json`）の 4 つ。
         """
         inventory = device.read_inventory(self.state_root)
         self.helper_fresh = not self._helper_is_stale()
@@ -152,6 +152,7 @@ class Worker:
             # **`inventory.json` に依存する段**（変更 BH-4）。ハートビートが古ければ
             # inventory も同じだけ古く、**デバイスの在・書込可否について何も言えない**（§7.5）
             self.evaluate_deletions()
+            self.settle_skipped_deletions()
             self.requeue_failed(inventory)
         return self.helper_fresh
 
@@ -358,6 +359,18 @@ class Worker:
             if self.stopper.should_stop():
                 return
             runner.delete_sources_if_safe(SessionKey(session_key))
+
+    def settle_skipped_deletions(self) -> None:
+        """§14.1 の根拠 B を評価する（§14.3）。**セッションを 1 つも動かさない。**
+
+        **`evaluate_deletions()` では拾えない。**あちらの走査対象は `DELETE_EVALUATED` の
+        セッションだが、`SKIPPED` しか残っていない日のセッションは **`COMPLETED` に
+        畳まれて対象から外れている**（変更 BG-3）。**終端に達した Part の元音声を
+        後から消す経路は、セッションの外に置くしかない。**
+
+        **間引きは `Pipeline` 側が持つ**（`_skipped_retry_is_due()`）。ここは毎周回呼ぶ。
+        """
+        self._pipeline().settle_skipped_deletions()
 
     def deletable_session_keys(self) -> list[str]:
         """再評価の時期が来た `DELETE_EVALUATED` のセッション（§14.3）。

@@ -20,10 +20,12 @@ reaper（#54）であり、要求が無ければ reaper は何もしない。
 
 from __future__ import annotations
 
+import ast
 import inspect
 import io
 import json
 import re
+import textwrap
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -33,7 +35,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from voicedock import cleaner, device, llm, notes, paths, pipeline
+from voicedock import cleaner, device, llm, notes, paths, pipeline, transcribe
 from voicedock.config import Config
 from voicedock.db import Database, Recording, Session
 from voicedock.device import DeviceInventory
@@ -45,6 +47,14 @@ from voicedock.states import PartStatus, SessionStatus
 
 JST = ZoneInfo("Asia/Tokyo")
 NOW = datetime(2026, 9, 13, 9, 0, 0, tzinfo=JST)
+
+LATER = NOW + timedelta(minutes=5)
+"""根拠 B の間引き（`_skipped_retry_is_due()`）を越えた時刻。
+
+`delete_evaluation_backoff_seconds` の最小値（60 秒）だけ再要求を間引くので、
+**`NOW` のまま評価するとどのテストも「まだ時期でない」で 0 件になり、
+狙った条件を見ていないことになる**（§20.5 の 7）。
+"""
 DEVICE_ID = "DJIMIC3"
 SESSION_KEY = SessionKey(f"{DEVICE_ID}:20260912")
 FOLDER = "TX_MIC001_20260912_090000"
@@ -76,6 +86,41 @@ class Scene:
     vault: Path
     inventory: DeviceInventory
     log: io.StringIO
+    state: Path
+    logger: Logger
+    make_config: Callable[..., Config]
+
+    def settle(self, *, now: datetime = LATER) -> int:
+        """**根拠 B の後追い**を 1 周回す（§14.3）。`evaluate()` とは経路が違う。
+
+        **既定で時刻を進める。**`_skipped_retry_is_due()` の間引きを越えないと、
+        どの条件を壊しても 0 件になって**テストが空振りする。**
+        """
+        runner = Pipeline(
+            database=self.database,
+            cfg=self.cfg,
+            log=self.logger,
+            now=now,
+            state_root=self.state,
+        )
+        return runner.settle_skipped_deletions()
+
+    def set_locks(self, **cleanup: object) -> None:
+        """`cleanup` の鍵を差し替える。**`Config` は frozen なので組み直す。**"""
+        self.cfg = self.make_config(
+            {
+                "obsidian": {"root": str(self.vault)},
+                "cleanup": {
+                    "delete_source_audio": True,
+                    "queue_root": str(self.queue),
+                    **cleanup,
+                },
+            }
+        )
+
+    def open_lock_b(self) -> None:
+        """根拠 B のロック（`cleanup.delete_skipped_source`）を外す。"""
+        self.set_locks(delete_skipped_source=True)
 
     def requests(self) -> list[Path]:
         directory = self.queue / cleaner.DELETE_DIRNAME
@@ -90,11 +135,15 @@ class Scene:
 
         `status` を直接書くのはテストの都合である（`record_transition()` を通すと
         `events` が積み上がって読みにくくなる）。**壊すのはこのあとである。**
+
+        **`delete_request_id` も戻す。**fixture は `SAVED` まで進める過程で
+        **既に 1 件要求を出している**ので、列を残したままだと「結果を待っている」
+        Part に見え、**次の評価が条件を見る前に打ち切られる**（根拠 B の経路で踏んだ）。
         """
         for path in self.requests():
             path.unlink()
         self.database.conn.execute(
-            "UPDATE recordings SET status = ? WHERE partkey = ?",
+            "UPDATE recordings SET status = ?, delete_request_id = NULL WHERE partkey = ?",
             (PartStatus.RAW_SAVED, PARTKEY),
         )
         self.database.conn.execute(
@@ -200,6 +249,9 @@ def scene(
         vault=vault,
         inventory=inventory,
         log=stream,
+        state=state,
+        logger=log,
+        make_config=make_config,
     )
 
 
@@ -372,6 +424,264 @@ def test_nd01_to_nd06_a_part_that_did_not_finish_is_never_requested(
         scene.inventory,
         vault_root=scene.vault,
     ), nd
+
+
+# --- 根拠 B: 無音の元音声（§14.1 / ND-06 / ND-33 / ND-34） ---------------
+#
+# **`SKIPPED` には根拠 A が成立しない。**別の根拠（保全すべき本文が無い）で消すので、
+# **弾かせたい条件以外はすべて満たした状態**を作って 1 つずつ確かめる（§20.5 の 7）。
+
+
+def _as_no_speech(scene: Scene) -> None:
+    """`NO_SPEECH_DETECTED` で `SKIPPED` に落ちた Part にする。
+
+    **transcript はそのまま残す。**`transcribe.transcribe()` は `min_chars` の判定より
+    前に書くので、無音でもファイルは在る —— それが根拠 B の根拠そのものである。
+    """
+    scene.set_part(status=PartStatus.SKIPPED, error_code=ErrorCode.NO_SPEECH_DETECTED)
+
+
+def test_a_no_speech_part_is_deleted_when_lock_b_is_open(scene: Scene) -> None:
+    """**正の対照。**これが無いと、以下の 3 本は「そもそも何も動いていない」を見逃す。
+
+    根拠 B がすべて揃った状態（ロック 1 と 2-B が開き、`delete_skipped_source` が真、
+    理由が `NO_SPEECH_DETECTED`、transcript が読める）で**要求が 1 件書かれる。**
+    """
+    scene.rearm()
+    scene.open_lock_b()
+    _as_no_speech(scene)
+
+    assert scene.settle() == 1
+    assert len(scene.requests()) == 1
+    assert cleaner.can_delete_source(
+        scene.part(),
+        scene.session(),
+        [scene.part()],
+        scene.cfg,
+        scene.inventory,
+        vault_root=scene.vault,
+    )
+
+
+def test_a_no_speech_part_recorded_before_v5_54_is_also_deleted(scene: Scene) -> None:
+    """**`transcript_path` 列が `NULL` の無音 Part も消せること**（v5.53→v5.54）。
+
+    v5.53 までは無音の Part に列を書いていなかった。**ファイルは在るのに列は `NULL`**
+    である（2026-09-17 の実機に残った 1 本がこの形）。`part_transcript_is_valid()` が
+    列で門前払いしていると、**既存の無音 Part は根拠 B で永久に消えない。**
+
+    **Scene の Part は列が埋まっている**ので、他のテストではこの形に届かない。
+    """
+    scene.rearm()
+    scene.open_lock_b()
+    _as_no_speech(scene)
+    scene.set_part(transcript_path=None)
+
+    assert scene.settle() == 1
+    assert len(scene.requests()) == 1
+
+
+def test_an_old_skipped_part_without_a_request_is_not_treated_as_waiting(scene: Scene) -> None:
+    """**要求を出していない `SKIPPED` を「結果を待っている」と見ないこと**
+    （`cleaner.awaits_delete_result()` の要求 ID の確認）。
+
+    見てしまうと、`delete_result_timeout_seconds` より古い `SKIPPED` が毎周回
+    **期限切れとして取り下げられ**、そのたびに `updated_at` が更新されて
+    **間引きが永久に明けない** —— 要求が一度も出ない。**数時間前に無音で落ちた
+    Part（2026-09-17 の実機に残った 1 本）がまさにこの形である。**
+
+    Scene の Part は `updated_at` が新しいので、時刻を期限より先へ進めないと届かない。
+    """
+    scene.rearm()
+    scene.open_lock_b()
+    _as_no_speech(scene)
+    later = NOW + timedelta(seconds=scene.cfg.cleanup.delete_result_timeout_seconds + 60)
+
+    assert scene.settle(now=later) == 1, "古い SKIPPED に要求が出ない"
+    assert "source_delete_pending" not in scene.log.getvalue(), "待っていないものを取り下げた"
+
+
+def test_a_recent_attempt_is_not_repeated_immediately(scene: Scene) -> None:
+    """**再要求を間引くこと**（§15.2）。
+
+    判定材料は `state/inventory.json` であり、**それを書くのは ingest（5 分ごと）である。**
+    拒否されるたびに 5 秒周期で要求を書き直しても**答えは変わらず、キューだけが埋まる。**
+    `delete_evaluation_backoff_seconds` の最小値で間引く。
+
+    **`settle()` が既定で時刻を進めていることの対照でもある** —— 間引きを外すと
+    1 本目の assert が落ち、間引きが強すぎると 2 本目が落ちる。
+    """
+    scene.rearm()
+    scene.open_lock_b()
+    _as_no_speech(scene)
+
+    assert scene.settle(now=NOW) == 0, "間引きが効いていない"
+    assert scene.requests() == []
+    assert scene.settle(now=LATER) == 1, "間引きを越えても要求が出ない"
+
+
+def test_the_skipped_part_is_not_moved_out_of_skipped(scene: Scene) -> None:
+    """**要求を書いても `SKIPPED` と `error_code` が変わらないこと**（§14.1）。
+
+    `db.record_transition()` は `error_code` を**無条件に上書きする**ので、
+    `SOURCE_DELETING` を経由させると `NO_SPEECH_DETECTED` が消え、
+    (1) Daily ノートの「（無音）」表示が壊れ、(2) 許可リストの判定が二度と真にならない。
+    **待っていることは `delete_request_id` が表す**（`cleaner.awaits_delete_result()`）。
+    """
+    scene.rearm()
+    scene.open_lock_b()
+    _as_no_speech(scene)
+    scene.settle()
+
+    part = scene.part()
+    assert part.status == PartStatus.SKIPPED
+    assert part.error_code == ErrorCode.NO_SPEECH_DETECTED
+    assert part.delete_request_id is not None
+    assert cleaner.awaits_delete_result(part)
+
+
+def test_a_no_speech_part_records_where_its_transcript_is(
+    scene: Scene, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**無音でも `transcript_path` を DB に書く**（§10.6）。
+
+    `transcribe.transcribe()` は `min_chars` の判定より前に書くので、**ファイルは在る。**
+    列を `NULL` のままにすると、DB がディスクと食い違ったまま残る（v5.53 まで
+    そうだった）。**根拠 B はこの列を見ない**（`part_transcript_is_valid()` は実ファイル
+    だけを見る）ので、ここが壊れても削除の判定は変わらない —— **だから別に固定する。**
+    """
+    audio = tmp_path / "audio16k.wav"
+    audio.write_bytes(b"RIFF0000WAVE")
+    scene.set_part(status=PartStatus.NORMALIZED, transcript_path=None, normalized_path=str(audio))
+
+    def no_speech(*_args: object, **_kwargs: object) -> transcribe.TranscribeResult:
+        return transcribe.TranscribeResult(
+            transcript=None,
+            error_code=ErrorCode.NO_SPEECH_DETECTED,
+            error_message="0 文字（min_chars=1）",
+        )
+
+    monkeypatch.setattr(transcribe, "transcribe", no_speech)
+
+    assert scene.runner.ensure_part_transcript(scene.part()) is False
+    part = scene.part()
+    assert part.status == PartStatus.SKIPPED
+    assert part.error_code == ErrorCode.NO_SPEECH_DETECTED
+    assert part.transcript_path == str(paths.transcript_path_for(PartKey(PARTKEY)))
+
+
+def test_nd06_lock_b_keeps_a_no_speech_part(scene: Scene) -> None:
+    """ND-06: `delete_skipped_source: false` なら無音の元音声は残る。
+
+    **ロック以外はすべて満たしてある。**理由も transcript も揃っているので、
+    **ここで要求が書かれたらロックが効いていないということである。**
+    """
+    scene.rearm()
+    _as_no_speech(scene)  # ロック B は開けない（既定の false のまま）
+
+    assert scene.settle() == 0
+    assert scene.requests() == []
+    assert not cleaner.can_delete_source(
+        scene.part(),
+        scene.session(),
+        [scene.part()],
+        scene.cfg,
+        scene.inventory,
+        vault_root=scene.vault,
+    )
+
+
+def test_nd33_a_source_missing_part_is_never_deleted(scene: Scene) -> None:
+    """ND-33: `SOURCE_MISSING` の `SKIPPED` は、ロックを開けても消さない。
+
+    **文字起こしに到達しておらず、内容について何も観測していない**（§7.5）。
+    §15.1 は `SOURCE_MISSING` について「**デバイス上のファイルには触れない**」と
+    規定している。`DELETABLE_SKIP_REASONS` の許可リストがこれを弾く。
+    """
+    scene.rearm()
+    scene.open_lock_b()
+    scene.set_part(status=PartStatus.SKIPPED, error_code=ErrorCode.SOURCE_MISSING)
+
+    assert scene.settle() == 0
+    assert scene.requests() == []
+    assert not cleaner.can_delete_source(
+        scene.part(),
+        scene.session(),
+        [scene.part()],
+        scene.cfg,
+        scene.inventory,
+        vault_root=scene.vault,
+    )
+
+
+def test_nd34_a_no_speech_part_without_its_transcript_is_never_deleted(scene: Scene) -> None:
+    """ND-34: 無音でも transcript が読めなければ消さない。
+
+    **根拠 B の根拠は「whisper が何を返したかが残っていること」である。**
+    それが失われているなら、**本当に無音だったかを後から確かめる手段が無い** ——
+    「観測していない」を「無い」として扱わない（§7.5）。
+    """
+    scene.rearm()
+    scene.open_lock_b()
+    _as_no_speech(scene)
+    paths.transcript_path_for(PartKey(PARTKEY)).unlink()
+
+    assert scene.settle() == 0
+    assert scene.requests() == []
+    assert not cleaner.can_delete_source(
+        scene.part(),
+        scene.session(),
+        [scene.part()],
+        scene.cfg,
+        scene.inventory,
+        vault_root=scene.vault,
+    )
+
+
+def test_lock_one_also_stops_ground_b(scene: Scene) -> None:
+    """**ロック 1 は根拠 B にも掛かる**（§14.2）。
+
+    `delete_skipped_source` は `delete_source_audio` に**加えて**要求される条件であり、
+    単独で削除を有効にする鍵ではない。**共通項に置いてあることを振る舞いで確かめる。**
+    """
+    scene.rearm()
+    scene.open_lock_b()
+    _as_no_speech(scene)
+    scene.set_locks(delete_source_audio=False, delete_skipped_source=True)
+
+    assert scene.settle() == 0
+    assert scene.requests() == []
+
+
+def test_a_readonly_device_also_stops_ground_b(scene: Scene) -> None:
+    """**ロック 2-B も根拠 B に掛かる**（§14.2）。`mount_readonly: true` で止まる。"""
+    scene.rearm()
+    scene.open_lock_b()
+    _as_no_speech(scene)
+    readonly = DeviceInventory(
+        generated_at=NOW,
+        mount_readonly=True,
+        devices={DEVICE_ID: frozenset({DevicePath(PurePosixPath(RELPATH))})},
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(device, "read_inventory", lambda _root=None: readonly)
+        assert scene.settle() == 0
+    assert scene.requests() == []
+
+
+def test_a_part_absent_from_the_inventory_is_not_evaluated(scene: Scene) -> None:
+    """**デバイスに無いものは評価しない**（§14.1.1 検証 3）。
+
+    `SKIPPED` は消えずに増え続ける終端なので、**全件を毎周回評価すると費用が
+    過去の件数に比例する。**`inventory.json` に載っていないものは早い段階で落とす。
+    """
+    scene.rearm()
+    scene.open_lock_b()
+    _as_no_speech(scene)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(device, "read_inventory", lambda _root=None: gone(scene))
+        assert scene.settle() == 0
+    assert scene.requests() == []
 
 
 # --- ND-07〜ND-09: Raw ノート ------------------------------------------
@@ -840,6 +1150,14 @@ def test_a_key_that_disagrees_with_the_path_blocks_the_request(scene: Scene) -> 
 # --- 空集合・空文字の番犬が論理式に在ること（§14.1） --------------------
 
 
+def _body(func: object) -> str:
+    """docstring を除いた関数本文。
+
+    **説明文に関数名が出てくるので、素の `getsource` を数えると本文と区別がつかない。**
+    """
+    return inspect.getsource(func).split('"""', 2)[-1]  # type: ignore[arg-type]
+
+
 def test_the_watchdog_terms_are_present_in_the_formula() -> None:
     """**振る舞いでは単独で落とせない項が論理式に在ること。**
 
@@ -861,16 +1179,68 @@ def test_the_watchdog_terms_are_present_in_the_formula() -> None:
 
     **v5.37 で Daily 側の番犬は消えた**（AY-1）。論理式が Daily ノートを見なくなった
     ためであり、**`_note_contains()` は Raw 側の 1 回だけになる。**
+
+    **v5.54 で番犬は共通項へ移った**（根拠 A / B の分岐）。見に行く先が
+    `_deletion_is_identified()` になっただけで、**要求している項は同じである。**
     """
-    # **docstring を除く。**説明文に関数名が出てくるので、素の `getsource` を
-    # 数えると本文と説明の区別がつかない
-    source = inspect.getsource(cleaner.can_delete_source).split('"""', 2)[-1]
-    assert "len(parts) >= 1" in source
-    assert 'part.source_path != ""' in source
-    assert source.count("_note_contains(") == 1, "Raw ノートの鍵の包含が消えている"
-    assert "session.raw_output_path, part.partkey" in source
-    assert "session.output_path" not in source, "Daily ノートを条件に戻している（AY-1）"
-    assert "analysis" not in source, "解析結果を条件に戻している（AY-1）"
+    identified = _body(cleaner._deletion_is_identified)
+    assert "len(parts) >= 1" in identified
+    assert 'part.source_path != ""' in identified
+
+    preserved = _body(cleaner._text_is_preserved)
+    assert preserved.count("_note_contains(") == 1, "Raw ノートの鍵の包含が消えている"
+    assert "session.raw_output_path, part.partkey" in preserved
+    assert "session.output_path" not in preserved, "Daily ノートを条件に戻している（AY-1）"
+    assert "analysis" not in preserved, "解析結果を条件に戻している（AY-1）"
+
+
+def test_no_ground_can_bypass_the_watchdogs() -> None:
+    """**根拠 B から番犬を迂回できないこと**（§14.1）。
+
+    番犬を共通項へ括り出した目的がこれである。**2 本の AND 連鎖を並べる形にすると、
+    片方にだけ条件を足した状態が生まれる** —— この形は実際に何度も踏んでいる
+    （書き手と検証側が同じ規則を別々に持つ形）。
+
+    **論理式の形そのものを固定する。**`can_delete_source()` は
+
+        _deletion_is_identified(...) and (_text_is_preserved(...) or _nothing_to_preserve(...))
+
+    でなければならない。**`or` が共通項より外に出た瞬間**、根拠 B がロックも番犬も
+    通らずに真になりうる。**振る舞いでは落とせない** —— 根拠 B 単独のテストは
+    どちらの形でも通るからである。
+    """
+    tree = ast.parse(textwrap.dedent(inspect.getsource(cleaner.can_delete_source)))
+    func = tree.body[0]
+    assert isinstance(func, ast.FunctionDef)
+    returned = func.body[-1]
+    assert isinstance(returned, ast.Return)
+    outer = returned.value
+
+    # 最上位は `共通項 and (…)`
+    assert isinstance(outer, ast.BoolOp) and isinstance(outer.op, ast.And), (
+        "最上位が AND ではない — 共通項が根拠に掛かっていない"
+    )
+    assert len(outer.values) == 2, "AND の項が 2 つではない"
+    assert _called(outer.values[0]) == "_deletion_is_identified", (
+        "共通項が AND の第 1 項ではない（根拠 B が番犬を迂回できる）"
+    )
+
+    # 第 2 項は `根拠 A or 根拠 B`
+    inner = outer.values[1]
+    assert isinstance(inner, ast.BoolOp) and isinstance(inner.op, ast.Or), (
+        "根拠が OR で並んでいない"
+    )
+    assert sorted(_called(value) for value in inner.values) == [
+        "_nothing_to_preserve",
+        "_text_is_preserved",
+    ], "根拠の数か顔ぶれが変わっている"
+
+
+def _called(node: ast.expr) -> str:
+    """`f(...)` の `f`。呼び出しでなければ空文字。"""
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        return node.func.id
+    return ""
 
 
 # --- 待つものが無ければ完了する（#160）----------------------------------
@@ -1171,18 +1541,33 @@ Daily ノート・解析結果・全 Part 終端を §14.1 の条件から外し
 """
 
 
+def spec_nd_table() -> set[str]:
+    """§20.4 の故障注入表に**行として在る** ND 番号（`| ND-06 |` / `| **ND-33** |`）。"""
+    from tests.spec_sync import spec_section_text
+
+    section = spec_section_text("20.4")
+    return {f"ND-{int(n):02d}" for n in re.findall(r"^\| (?:\*\*)?ND-(\d+)", section, re.M)}
+
+
 def test_every_nd_number_is_assigned_to_a_layer() -> None:
-    """**廃止したものを除き、ND-01〜ND-31 がすべてどれかの層に属すること**
+    """**廃止したものを除き、表に在る ND がすべてどれかの層に属すること**
     （§20.4 / v5.8→v5.9 の変更 U-2）。
 
     v5.8 まで表は ND-28 で止まっており、**ND-29 / 30 / 31 がどの層にも
     属していなかった。**割り当てが無い ND は誰も書かない。
+
+    **上限を直書きしない**（§20.5 の 3）。v5.53 まで `range(1, 33)` だったので、
+    **ND を足すたびにこのテストも手で直す必要があり、直し忘れると新しい ND が
+    層に入っていなくても通った。**表の行から引く。
     """
     layers = spec_layers()
     assigned: set[str] = set()
     for numbers in layers.values():
         assigned |= numbers
-    expected = {f"ND-{n:02d}" for n in range(1, 33)} - RETIRED_ND
+    rows = spec_nd_table()
+    top = max(int(number.removeprefix("ND-")) for number in rows)
+    expected = {f"ND-{n:02d}" for n in range(1, top + 1)} - RETIRED_ND
+    assert rows == expected, f"表に欠けている ND がある: {sorted(expected - rows)}"
     assert assigned == expected, sorted(expected - assigned)
     assert not (assigned & RETIRED_ND), "廃止した ND が層の表に残っている"
 
@@ -1361,6 +1746,99 @@ def test_a_part_just_moved_to_pending_is_not_requested_again(scene: Scene) -> No
     after = {path.name for path in scene.requests()}
     assert after <= before, f"保留へ落とした直後に再要求した: {sorted(after - before)}"
     assert scene.part().status == PartStatus.SOURCE_DELETE_PENDING
+
+
+# --- 根拠 B の結果の回収（`SKIPPED` のまま往復する） ----------------------
+
+
+def _requested_no_speech(scene: Scene) -> datetime:
+    """根拠 B の要求を 1 件出した状態にする。戻り値は要求を書いた時刻。"""
+    scene.rearm()
+    scene.open_lock_b()
+    _as_no_speech(scene)
+    assert scene.settle(now=LATER) == 1
+    assert scene.part().delete_request_id is not None
+    return LATER
+
+
+def _settle_with(scene: Scene, inventory: DeviceInventory, *, now: datetime) -> int:
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(device, "read_inventory", lambda _root=None: inventory)
+        return scene.settle(now=now)
+
+
+def _after(inventory: DeviceInventory, moment: datetime) -> DeviceInventory:
+    """`moment` 以降に ingest が書いた体の inventory（結果より新しい）。"""
+    return DeviceInventory(
+        generated_at=moment, mount_readonly=inventory.mount_readonly, devices=inventory.devices
+    )
+
+
+def test_a_deleted_no_speech_part_is_recorded_and_stays_skipped(scene: Scene) -> None:
+    """根拠 B の往復: 要求 → reaper が消す → **`SKIPPED` のまま `source_deleted_at` が入る。**
+
+    **実機の順序で回す。**reaper が消した後に ingest が書く `inventory.json` には、
+    **そのファイルがもう載っていない。**「デバイスに在るものだけを見る」絞り込みを
+    結果の回収にまで掛けると、**回収できる瞬間に対象から外れて永久に回収されない**
+    （実装中に踏んだ）。
+
+    **`error_code` が残ること。**`SOURCE_DELETING` を経由させると
+    `record_transition()` が `NO_SPEECH_DETECTED` を消す。
+    """
+    requested_at = _requested_no_speech(scene)
+    result = write_result(scene, completed_at=(requested_at + timedelta(minutes=1)).isoformat())
+
+    _settle_with(
+        scene,
+        _after(gone(scene), requested_at + timedelta(minutes=5)),
+        now=requested_at + timedelta(minutes=5),
+    )
+
+    part = scene.part()
+    assert part.source_deleted_at is not None, "消えたのに記録していない"
+    assert part.delete_request_id is None, "決着した要求 ID が残っている"
+    assert part.status == PartStatus.SKIPPED, "SKIPPED から動かした"
+    assert part.error_code == ErrorCode.NO_SPEECH_DETECTED, "除外理由が消えた"
+    assert not result.exists(), "回収した結果を捨てていない"
+    assert "source_deleted" in scene.log.getvalue()
+
+
+def test_a_rejected_no_speech_part_is_not_retried_at_once(scene: Scene) -> None:
+    """reaper が拒否 → **`SKIPPED` のまま要求 ID だけを外し、同じ周回で再要求しない。**"""
+    requested_at = _requested_no_speech(scene)
+    write_result(
+        scene,
+        status="SOURCE_IDENTITY_MISMATCH",
+        detail="size_mismatch",
+        completed_at=(requested_at + timedelta(minutes=1)).isoformat(),
+    )
+
+    moment = requested_at + timedelta(minutes=5)
+    assert _settle_with(scene, _after(scene.inventory, moment), now=moment) == 0
+
+    part = scene.part()
+    assert part.status == PartStatus.SKIPPED
+    assert part.error_code == ErrorCode.NO_SPEECH_DETECTED, "拒否の理由で除外理由を上書きした"
+    assert part.delete_request_id is None
+    assert part.source_deleted_at is None, "消えていないのに記録している"
+    assert scene.requests() == [], "拒否された直後に要求を書き直した"
+    assert "reason=size_mismatch" in scene.log.getvalue()
+
+
+def test_an_unanswered_no_speech_request_expires(scene: Scene) -> None:
+    """結果が来ないまま `delete_result_timeout_seconds` を過ぎたら取り下げる（§10.12）。
+
+    **reaper が居ない（ロック 2-A）ときの正常な姿である。**`SKIPPED` のまま外す。
+    """
+    requested_at = _requested_no_speech(scene)
+    later = requested_at + timedelta(seconds=scene.cfg.cleanup.delete_result_timeout_seconds + 1)
+    _settle_with(scene, scene.inventory, now=later)
+
+    part = scene.part()
+    assert part.status == PartStatus.SKIPPED
+    assert part.error_code == ErrorCode.NO_SPEECH_DETECTED
+    assert part.delete_request_id is None, "期限切れの要求 ID が残っている"
+    assert scene.requests() == [], "古い要求がキューに残っている"
 
 
 def test_a_successful_result_completes_the_part(scene: Scene) -> None:

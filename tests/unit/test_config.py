@@ -379,8 +379,9 @@ def test_key_count_counts_leaves() -> None:
 
     assert key_count(document) == leaves(document)
     # v5.48 で `obsidian.raw.granularity`（BJ-1）、v5.52 で
-    # `obsidian.wiki.include_transcript` / `link_raw`（BN-1）を廃止して 3 つ減った
-    assert key_count(document) == 105
+    # `obsidian.wiki.include_transcript` / `link_raw`（BN-1）を廃止して 3 つ減り、
+    # v5.54 で `cleanup.delete_skipped_source` を足して 1 つ増えた
+    assert key_count(document) == 106
 
 
 def test_config_is_frozen() -> None:
