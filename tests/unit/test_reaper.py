@@ -363,6 +363,87 @@ def test_a_partkey_that_disagrees_is_refused(bench: Bench) -> None:
     assert bench.results()[0]["detail"] == "partkey_mismatch"
 
 
+# --- request_id の文字種検証（#186） ------------------------------------
+#
+# **`bench.request(request_id=...)` は使えない。**あのヘルパはファイル名と
+# JSON 本文の `request_id` に同じ文字列を使うため、`/` を含む値を渡すと
+# ファイル自体が queue/delete/ の外へ書かれてしまい、「ディスク上の名前は正常だが
+# 中身の request_id が不正」という実際の攻撃面を再現できない。ここでは
+# ディスク上のファイル名は正規の形のまま、JSON 本文の request_id だけを壊す。
+
+
+def _write_raw_request(bench: Bench, *, on_disk_name: str, request_id: object) -> Path:
+    payload: dict[str, object] = {
+        "schema": 1,
+        "request_id": request_id,
+        "created_at": "2026-09-13T09:00:00+09:00",
+        "device_id": DEVICE_ID,
+        "partkey": PARTKEY,
+        "session_key": f"{DEVICE_ID}:20260912",
+        "targets": [{"relpath": RELPATH, "size": len(CONTENT), "mtime": MTIME}],
+    }
+    bench.queue.mkdir(parents=True, exist_ok=True)
+    path = bench.queue / on_disk_name
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def test_a_request_id_containing_a_slash_is_rejected(bench: Bench) -> None:
+    """`request_id` に `/` を含む要求は削除せず、`queue/rejected/` へ退避する。
+
+    **`/` を許すと `write_result()` の書き込み先が `queue/result/` の外へ出うる**
+    （`request_id` がそのまま結果ファイルの名前になるため）。**要求を消し去らない**
+    （原因調査ができなくなるのを避ける）が、**`mark_processed()` も `write_result()` も
+    呼ばない** —— 信用できない値を processed.log や結果ファイル名に使わないため。
+    """
+    request = _write_raw_request(bench, on_disk_name="20260913T090000.json", request_id="../evil")
+    bench.run()
+
+    assert bench.target.exists(), "元音声は消えない"
+    assert bench.results() == [], "信用できない request_id で結果を書かない"
+    assert not request.is_file(), "要求は queue/delete/ から退避する"
+    rejected = bench.home / "queue" / "rejected" / request.name
+    assert rejected.is_file(), "要求は queue/rejected/ に残る（消し去らない）"
+
+    # **書き込み先が queue/result/ の外へ出ていないこと。**再現前のコードでは
+    # このディレクトリより上の階層（bench.home）に `evil.json` が書かれた
+    escaped = bench.home / "evil.json"
+    assert not escaped.exists(), "結果の書き込みが queue/result/ の外へ出ている"
+
+
+def test_an_empty_request_id_is_rejected_and_does_not_warn_forever(bench: Bench) -> None:
+    """`request_id` が空の要求も同様に `queue/rejected/` へ退避する。
+
+    **v5.56 までは `warn` するだけで要求をキューに残していた** —— 次の reaper 実行
+    （5 分ごと）でも同じ要求を読み、また `warn` する形が無期限に繰り返されていた。
+    2 回実行しても 2 回目は何も起きないことで「もう読まれない」ことを確かめる。
+    """
+    request = _write_raw_request(bench, on_disk_name="no-id.json", request_id="")
+    bench.run()
+    assert not request.is_file()
+    rejected = bench.home / "queue" / "rejected" / request.name
+    assert rejected.is_file()
+
+    result = bench.run()
+    assert result.returncode == 0
+    assert bench.results() == []
+
+
+def test_a_request_id_with_a_control_character_is_rejected(bench: Bench) -> None:
+    """`request_id` に改行を含む要求も拒否する（`processed.log` への注入を防ぐ）。"""
+    request = _write_raw_request(
+        bench, on_disk_name="ctrl.json", request_id="20260913T090000\nrm -rf /"
+    )
+    bench.run()
+    assert bench.target.exists()
+    assert bench.results() == []
+    assert not request.is_file()
+
+
+# **正の対照は既存の `test_a_valid_request_actually_deletes` が兼ねる**
+# （`bench.request()` は実際の `cleaner._request_id()` と同じ形式の request_id を使う
+# ので、新しい検証を素通りすることは既にそこで確かめられている）。
+
 # --- ND-22 / ND-23: 三重ロック（reaper 側） ----------------------------
 
 
