@@ -313,8 +313,19 @@ locks_are_released() {
     return 0
 }
 
+# **BRE の alternation（`\|`）は GNU sed の拡張であり、POSIX BRE にも macOS 同梱の
+# BSD sed にも無い。**`\(true\|false\)` は macOS の実機で常に無出力になり、
+# `locks_are_released()` の heartbeat 側の確認（ロック 2-B の後段）が常に素通りしていた
+# （#185。CI コンテナの GNU sed は `\|` を解釈するため、動作テストでは検出できない）。
+# alternation を使わず、true と false を別々の BRE で試す（`\{0,1\}` は POSIX BRE の
+# 区間表現なので両方の sed で使える。他の json_* 関数と同じ形のまま）
 json_string_bool() {        # $1=file $2=key
-    sed -n "s/^[[:space:]]*\"$2\":[[:space:]]*\\(true\\|false\\),\\{0,1\\}$/\\1/p" "$1" | head -1
+    local val
+    val="$(sed -n "s/^[[:space:]]*\"$2\":[[:space:]]*true,\\{0,1\\}$/true/p" "$1" | head -1)"
+    if [ -z "$val" ]; then
+        val="$(sed -n "s/^[[:space:]]*\"$2\":[[:space:]]*false,\\{0,1\\}$/false/p" "$1" | head -1)"
+    fi
+    printf '%s' "$val"
 }
 
 main() {
