@@ -130,6 +130,60 @@ def test_comments_do_not_trigger_false_positives() -> None:
         assert not pattern.search(strip_comments(text))
 
 
+# `sed` の BRE で GNU だけが解釈する拡張。**macOS 同梱の BSD sed（FreeBSD 由来）には無い。**
+# `\{n,m\}`（区間表現）は POSIX BRE なので両方が解釈し、対象に含めない。
+#
+# 実機（macOS）で `\(true\|false\)` が常に無出力になることを確認済み（#185）。
+# `helper/voicedock-reaper` の `json_string_bool()` がこれで、
+# **§14.2 ロック 2-B の heartbeat 側の確認（`mount_readonly` を見る後段）が
+# 実機では常に素通りしていた。**コンテナの GNU sed は `\|` を問題なく解釈するため、
+# `tests/unit/test_reaper.py` の動作テストはこの欠陥を検出できない。
+#
+# **バックスラッシュを 1 個（シングルクォート内の sed スクリプト）か 2 個
+# （ダブルクォート内。bash がエスケープを畳む前）のどちらでも検出する。**
+# `|` の直前に空白を挟む通常のパイプ（`cmd | head`）はバックスラッシュが無いので拾わない。
+GNU_SED_ONLY_BRE: dict[str, re.Pattern[str]] = {
+    "\\|（BRE の alternation）": re.compile(r"\\{1,2}\|"),
+    "\\+（BRE の 1 回以上）": re.compile(r"\\{1,2}\+"),
+    "\\?（BRE の 0 or 1 回）": re.compile(r"\\{1,2}\?"),
+}
+
+
+@pytest.mark.parametrize("label", sorted(GNU_SED_ONLY_BRE))
+def test_helper_avoids_gnu_only_sed_bre_extensions(label: str) -> None:
+    """`sed` の BRE で GNU だけの拡張を使っていないこと。
+
+    **コンテナの GNU sed では通ってしまうので、動作テストでは捕まらない。**
+    """
+    pattern = GNU_SED_ONLY_BRE[label]
+    offenders = [
+        p.name
+        for p in bash_files()
+        if pattern.search(strip_comments(p.read_text(encoding="utf-8")))
+    ]
+    assert offenders == [], f"{label} は macOS の BSD sed で解釈されない: {offenders}"
+
+
+@pytest.mark.parametrize(
+    ("label", "snippet"),
+    [
+        ("\\|（BRE の alternation）", r"sed -n 's/\(a\|b\)/x/p'"),
+        ("\\+（BRE の 1 回以上）", r"sed -n 's/a\+/x/p'"),
+        ("\\?（BRE の 0 or 1 回）", r"sed -n 's/ab\?/x/p'"),
+    ],
+)
+def test_the_gnu_sed_checks_actually_detect_violations(label: str, snippet: str) -> None:
+    """**検査そのものが効くこと。**文字列を直接与えて確認する。"""
+    assert GNU_SED_ONLY_BRE[label].search(snippet), f"{label} を検出できていない"
+
+
+def test_a_normal_pipe_does_not_trigger_the_sed_check() -> None:
+    """`cmd | head -1` のような通常のパイプで誤検出しないこと。"""
+    text = 'sed -n "s/^x$/y/p" "$1" | head -1\n'
+    for pattern in GNU_SED_ONLY_BRE.values():
+        assert not pattern.search(text)
+
+
 def test_strict_mode_is_enabled() -> None:
     """`set -euo pipefail` があること。
 
