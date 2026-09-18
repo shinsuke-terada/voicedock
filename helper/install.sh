@@ -67,7 +67,8 @@ check_home() {
 
 make_tree() {
     local dir
-    for dir in bin inbox queue/delete queue/result state log; do
+    # queue/rejected: request_id が読めない・安全でない削除要求の退避先（reaper が使う。§14.1.1）
+    for dir in bin inbox queue/delete queue/result queue/rejected state log; do
         mkdir -p "$VD_HOME/$dir"
     done
     info "tree ready: $VD_HOME"

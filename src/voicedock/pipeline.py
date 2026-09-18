@@ -326,6 +326,13 @@ class Pipeline:
         )
 
         if result.error_code is ErrorCode.DUPLICATE_CONTENT:
+            # **双子の鍵を列に書く**（§8.2 / §14.1 根拠 B）。`sha256` は双子と同じ値に
+            # なるので書けない（`idx_recordings_sha` が UNIQUE）。**`error_message` の
+            # 文字列を後から解析しない。**`_skip()` より先に書く —— 遷移で落ちたときに
+            # 列だけが進んだ状態を作らない（無音の `transcript_path` と同じ扱い）
+            self.database.update_recording(
+                record.partkey, duplicate_of=result.duplicate_of, now=self.now
+            )
             self._skip(
                 record,
                 ErrorCode.DUPLICATE_CONTENT,
@@ -406,7 +413,19 @@ class Pipeline:
         )
 
         if result.error_code is ErrorCode.NO_SPEECH_DETECTED:
-            # **失敗ではない**（§10.6）。`SKIPPED` へ倒して次の Part へ進む
+            # **失敗ではない**（§10.6）。`SKIPPED` へ倒して次の Part へ進む。
+            #
+            # **transcript の在りかは記録する。**`transcribe.transcribe()` は `min_chars` の
+            # 判定より**前**に書くので、無音でもファイルは在る。列を `NULL` のままにすると
+            # **DB がディスクと食い違ったまま残り**、「ファイルは在るのに列は無い」という
+            # 読み手を誤らせる状態になる（§7.5 の「未観測と偽を分ける」の裏返しで、
+            # **観測したものを書かない**形である）。`_skip()` より先に書く —— 遷移で
+            # 落ちたときに列だけが進んだ状態を作らない
+            self.database.update_recording(
+                record.partkey,
+                transcript_path=str(paths.transcript_path_for(PartKey(record.partkey))),
+                now=self.now,
+            )
             self._skip(
                 record,
                 ErrorCode.NO_SPEECH_DETECTED,
@@ -792,6 +811,113 @@ class Pipeline:
             self._session_transition(session_key, row.status, SessionStatus.SOURCE_DELETING)
         return False
 
+    def settle_skipped_deletions(self) -> int:
+        """§14.1 の根拠 B を評価し、結果を回収する（§14.3）。**`SKIPPED` 専用の後追い。**
+
+        **セッションの状態機械から独立している。**`delete_sources_if_safe()` の早期完了は
+        `AWAITING_DELETION`（= `PART_DELETABLE - {COMPLETED}`）で判定しており、そこへ
+        `SKIPPED` を入れると **reaper が居ないときにセッションが永久に完了できない**
+        （v5.44→v5.45 の変更 BG-3 で実機で踏んだ形そのもの）。**ここはセッションを
+        1 行も動かさないので、最悪の失敗は「消えない」＝現状維持である。**
+
+        **`request_deletions()` と経路を分ける理由もそれである。**あちらはセッションの
+        進行と結びついており、`SKIPPED` を混ぜると早期完了の条件を触らざるをえない。
+
+        戻り値は要求を書いた件数。**このメソッドはデバイスに触れない**（§14.4 N-16）。
+        """
+        if not self.cfg.cleanup.delete_skipped_source:
+            # **根拠 B のロック**（§14.2）。要求を出していないので結果の回収も要らない
+            return 0
+        inventory = device.read_inventory(self.state_root)
+        if inventory is None:
+            # **不明は安全側へ倒す**（§7.5）。`device_is_writable()` も偽になるので、
+            # ここで抜けても判定は変わらない — **変わるのは費用だけである**
+            return 0
+        skipped = self.database.recordings_with_status(PartStatus.SKIPPED)
+        # **結果を待っているものは、デバイスに無くても回収する。**reaper が消した後に
+        # ingest が書く `inventory.json` にはそのファイルが載っていない —— 下の絞り込みを
+        # ここにも掛けると、**回収できる瞬間に対象から外れて永久に回収されない。**
+        awaiting = [part for part in skipped if cleaner.awaits_delete_result(part)]
+        if awaiting:
+            self.collect_delete_results(awaiting, inventory)
+
+        # **要求を出す候補は、デバイスに実在するものだけ。**`SKIPPED` は消えずに増え続ける
+        # 終端なので、**全件に DB 問い合わせを掛けると毎周回の費用が過去の件数に比例する。**
+        # 未接続の周回はここで 0 件になる（`inventory.json` にデバイスが載らない）
+        present = [part for part in skipped if not cleaner.source_is_gone(part, inventory)]
+
+        requested = 0
+        for stale in present:
+            # **読み直す。**`collect_delete_results()` が同じ周回で動かしている
+            part = self.database.get_recording(PartKey(stale.partkey))
+            if part is None or part.session_key is None:
+                continue
+            if part.source_deleted_at is not None or part.delete_request_id is not None:
+                # 決着済み、または結果を待っている
+                continue
+            if not self._skipped_retry_is_due(part):
+                continue
+            row = self.database.get_session(SessionKey(part.session_key))
+            if row is None:
+                continue
+            request = cleaner.request_part_deletion(
+                part,
+                row,
+                self.database.recordings_for_session(SessionKey(part.session_key)),
+                self.cfg,
+                inventory,
+                vault_root=Path(self.cfg.obsidian.root),
+                log=self.log,
+                now=self.now or datetime.now(self.cfg.tz),
+                twin=self._twin_of(part),
+            )
+            if request is None:
+                continue
+            # **状態は動かさない。**待っていることは `delete_request_id` が表す
+            # （`cleaner.awaits_delete_result()`）。`record_transition()` を通すと
+            # `error_code` が消え、`NO_SPEECH_DETECTED` が失われる
+            self.database.update_recording(
+                PartKey(part.partkey), delete_request_id=request.request_id, now=self.now
+            )
+            requested += 1
+        return requested
+
+    def _twin_of(self, part: Recording) -> cleaner.TwinPart | None:
+        """重複の**双子**を DB から解決する（§14.1 根拠 B）。**`duplicate_of` 列だけを使う。**
+
+        **`error_message` の文字列を解析しない。**`sha256` からも引かない —— 重複の行は
+        `sha256` を持てない（`idx_recordings_sha` が UNIQUE）。
+
+        解決できなければ `None`。**`None` なら根拠 B は偽になる**（消さない側）。
+        """
+        if part.duplicate_of is None:
+            return None
+        twin = self.database.get_recording(PartKey(part.duplicate_of))
+        if twin is None or twin.session_key is None:
+            return None
+        session_row = self.database.get_session(SessionKey(twin.session_key))
+        if session_row is None:
+            return None
+        return cleaner.TwinPart(
+            part=twin,
+            session=session_row,
+            parts=self.database.recordings_for_session(SessionKey(twin.session_key)),
+        )
+
+    def _skipped_retry_is_due(self, part: Recording) -> bool:
+        """根拠 B の再要求を間引く（§15.2）。`delete_evaluation_backoff_seconds` の最小値。
+
+        **拒否されるたびに 5 秒ごとへ要求を書き直さない。**判定材料は
+        `state/inventory.json` であり、**それを書くのは ingest（5 分ごと）である** ——
+        更新されるまで同じ答えしか出ないので、その間に何度書いても無駄である。
+
+        **時刻の出どころは `updated_at` ひとつ。**要求を書いたときも、拒否されて
+        `delete_request_id` を外したときも `update_recording()` が更新する。
+        """
+        floor = self.cfg.cleanup.delete_evaluation_backoff_seconds[0]
+        age = (self._moment() - datetime.fromisoformat(part.updated_at)).total_seconds()
+        return age >= floor
+
     def collect_delete_results(
         self, parts: list[Recording], inventory: DeviceInventory | None
     ) -> set[str]:
@@ -821,10 +947,13 @@ class Pipeline:
                 # **DB に無い。**別のセッションのものかもしれないので**捨てない**
                 # （そのセッションを処理する周回で回収される）
                 continue
-            if part.status != PartStatus.SOURCE_DELETING:
+            if not cleaner.awaits_delete_result(part):
                 # **Part は在るが、もう待っていない**（v5.44→v5.45 の変更 BG-1）。
                 # **二度と `SOURCE_DELETING` に戻らないので回収されない。**残すと
                 # `status` の `awaiting result` が実態と食い違い、ファイルも溜まり続ける
+                #
+                # **待ち方は 2 つある**（§14.1 の根拠 A / B）。判定を `cleaner` の
+                # 述語 1 つに寄せてあるので、**ここに状態名を書かない。**
                 cleaner.discard_result(result, cfg=self.cfg)
                 continue
             if result.request_id != part.delete_request_id:
@@ -857,9 +986,13 @@ class Pipeline:
                     delete_request_id=None,
                     now=self.now,
                 )
-                self._transition(
-                    PartKey(part.partkey), PartStatus.SOURCE_DELETING, PartStatus.COMPLETED
-                )
+                if part.status != PartStatus.SKIPPED:
+                    # **根拠 B の Part は動かさない**（§14.1）。`SKIPPED` は終端であり、
+                    # `record_transition()` は `error_code` を無条件に上書きするので、
+                    # 通すと `NO_SPEECH_DETECTED` が消える（`cleaner.awaits_delete_result()`）
+                    self._transition(
+                        PartKey(part.partkey), PartStatus.SOURCE_DELETING, PartStatus.COMPLETED
+                    )
                 self.log.info(
                     "source_deleted", recording_key=part.partkey, request_id=result.request_id
                 )
@@ -887,7 +1020,7 @@ class Pipeline:
         expired = 0
         for stale in parts:
             part = self.database.get_recording(PartKey(stale.partkey))
-            if part is None or part.status != PartStatus.SOURCE_DELETING:
+            if part is None or not cleaner.awaits_delete_result(part):
                 continue
             age = (moment - datetime.fromisoformat(part.updated_at)).total_seconds()
             if age < limit:
@@ -905,7 +1038,21 @@ class Pipeline:
         return expired
 
     def _delete_pending(self, part: Recording, code: ErrorCode, reason: str) -> None:
-        """`SOURCE_DELETING → SOURCE_DELETE_PENDING`（§9.3）。**ノートは残す。**"""
+        """`SOURCE_DELETING → SOURCE_DELETE_PENDING`（§9.3）。**ノートは残す。**
+
+        **根拠 B（`SKIPPED`）の Part は遷移させない。**`record_transition()` は
+        `error_code` を無条件に上書きするので、`NO_SPEECH_DETECTED` が
+        `SOURCE_IDENTITY_MISMATCH` に置き換わってしまう —— それは
+        (1) Daily ノートの「（無音）」表示（`daily._skip_reasons()`）を壊し、
+        (2) `DELETABLE_SKIP_REASONS` の判定を二度と真にしない。
+        **要求 ID を外すだけにして、再評価は `settle_skipped_deletions()` に任せる。**
+        """
+        if part.status == PartStatus.SKIPPED:
+            self.database.update_recording(
+                PartKey(part.partkey), delete_request_id=None, now=self.now
+            )
+            self.log.warning("source_delete_pending", recording_key=part.partkey, reason=reason)
+            return
         self.database.record_transition(
             EntityType.RECORDING,
             part.partkey,

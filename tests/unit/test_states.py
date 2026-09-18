@@ -233,7 +233,12 @@ def test_deletable_is_a_strict_subset_of_terminal() -> None:
 
 
 def test_terminal_states_have_no_outgoing_work() -> None:
-    """終端状態から進めるのは削除関連と再オープンだけであること。"""
+    """終端状態から進めるのは削除関連と再オープンだけであること。
+
+    **`SKIPPED` に出る辺は無い。**根拠 B（§14.1）で元音声を消すときも `SKIPPED` の
+    まま進める —— `record_transition()` が `error_code` を上書きするので、辺を足すと
+    `NO_SPEECH_DETECTED` が消える（`cleaner.awaits_delete_result()`）。
+    """
     assert transitions_for(PartStatus.FAILED) == PART_RETRYABLE_FROM_FAILED
     assert transitions_for(PartStatus.SKIPPED) == frozenset()
 

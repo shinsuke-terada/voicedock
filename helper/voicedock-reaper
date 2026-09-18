@@ -98,6 +98,19 @@ relpath_is_safe() {         # $1=relpath
     return 0
 }
 
+# **request_id はそのまま `queue/result/<request_id>.json` というファイル名になる**
+# （`write_result()`）。`/` や `..` を許すと、その書き込みが `queue/result/` の外へ
+# 出うる。relpath（検証 4/9）と同じ理由で、request_id にも同じ発想の制約を掛ける。
+# **英数字と `-` / `_` だけを許す**（`scripts/fetch-models.sh` のモデル名検証と同じ形）。
+# 実際に `cleaner._request_id()` が生成する形式（時刻・16 進の slug・16 進の乱数を
+# `-` でつないだもの）はこの範囲に収まる
+request_id_is_safe() {      # $1=request_id
+    case "$1" in
+        '' | *[!A-Za-z0-9_-]*) return 1 ;;
+    esac
+    return 0
+}
+
 # 検証 7: ファイル名が RECORDING_FILENAME_RE に一致する
 _is_recording_file() {      # $1=basename
     case "$1" in
@@ -207,6 +220,23 @@ already_processed() {       # $1=request_id
     grep -q -x -F "$1" "$log"
 }
 
+# **request_id を信用できない要求は `queue/rejected/` へ退避する。**
+# 消し去らない —— 削除は不可逆の判断であり、原因調査ができなくなるのを避ける
+# （§14.3 の「不可逆操作の記録に嘘を混ぜない」と同じ発想）。
+#
+# **`mark_processed()` も `write_result()` も呼ばない。**request_id が空、または
+# 安全な文字種でない場合、それを `processed.log` や結果ファイルの名前に使うこと自体が
+# 信用できない値を使うことになる。
+#
+# 退避せず `warn` だけで放置すると（v5.56 までの実装）、次の reaper 実行（5 分ごと）でも
+# 同じ要求を読み、また `warn` する —— これが無期限に繰り返される。
+move_to_rejected() {        # $1=file $2=reason
+    local dest_dir="$VOICEDOCK_HOME/queue/rejected"
+    mkdir -p "$dest_dir"
+    warn "request_invalid file=$1 reason=$2"
+    mv -f "$1" "$dest_dir/$(basename "$1")" 2>/dev/null || rm -f "$1"
+}
+
 # --- 1 件の要求 ----------------------------------------------------------
 
 process_request() {         # $1=path
@@ -215,7 +245,14 @@ process_request() {         # $1=path
     RESULT_PARTKEY=""
     request_id="$(json_string "$file" request_id)"
     if [ -z "$request_id" ]; then
-        warn "request_invalid file=$file reason=no_request_id"
+        move_to_rejected "$file" "no_request_id"
+        return 0
+    fi
+    # **partkey / device_id を読む前に検証する。**request_id は以降 write_result() と
+    # mark_processed() のファイル名・ログ行にそのまま使われるため、ここを通す前に
+    # 一度でも書き込みへ使ってはならない
+    if ! request_id_is_safe "$request_id"; then
+        move_to_rejected "$file" "request_id_unsafe"
         return 0
     fi
 
@@ -313,8 +350,19 @@ locks_are_released() {
     return 0
 }
 
+# **BRE の alternation（`\|`）は GNU sed の拡張であり、POSIX BRE にも macOS 同梱の
+# BSD sed にも無い。**`\(true\|false\)` は macOS の実機で常に無出力になり、
+# `locks_are_released()` の heartbeat 側の確認（ロック 2-B の後段）が常に素通りしていた
+# （#185。CI コンテナの GNU sed は `\|` を解釈するため、動作テストでは検出できない）。
+# alternation を使わず、true と false を別々の BRE で試す（`\{0,1\}` は POSIX BRE の
+# 区間表現なので両方の sed で使える。他の json_* 関数と同じ形のまま）
 json_string_bool() {        # $1=file $2=key
-    sed -n "s/^[[:space:]]*\"$2\":[[:space:]]*\\(true\\|false\\),\\{0,1\\}$/\\1/p" "$1" | head -1
+    local val
+    val="$(sed -n "s/^[[:space:]]*\"$2\":[[:space:]]*true,\\{0,1\\}$/true/p" "$1" | head -1)"
+    if [ -z "$val" ]; then
+        val="$(sed -n "s/^[[:space:]]*\"$2\":[[:space:]]*false,\\{0,1\\}$/false/p" "$1" | head -1)"
+    fi
+    printf '%s' "$val"
 }
 
 main() {

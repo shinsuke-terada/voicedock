@@ -1,0 +1,24 @@
+-- ============================================================
+-- SPEC §8.2 recordings: duplicate_of
+--
+-- ★DUPLICATE_CONTENT で SKIPPED になった Part の「双子」（同じ内容で先に
+--   正規化された Part）の partkey を持つ列（v5.55→v5.56。§14.1 根拠 B）。
+--
+--   重複の Part は自分の本文を持たないので、元音声を消してよい根拠は
+--   **双子の本文が Vault に在ること**である。v5.55 までその双子を引く手段が
+--   DB に無かった:
+--
+--   - `sha256` は NULL のまま（idx_recordings_sha が部分 UNIQUE なので、
+--     双子と同じ値を書けない）
+--   - 双子の partkey は error_message の**文字列**にしか無かった
+--
+--   **文字列を解析しない。**audio.normalize() が既に知っている値を列に書く。
+--
+-- ★NULL 可。既存行と重複でない行は NULL。**NULL の重複 Part は削除しない**
+--   （双子を確かめられないので、根拠 B が成立しない。安全側）。
+--
+-- ★ALTER TABLE ADD COLUMN は列を末尾に足すので、SPEC §8.2 の DDL でも
+--   delete_request_id の後に置いてある（test_schema_matches_spec は順序込みで比べる）。
+-- ============================================================
+
+ALTER TABLE recordings ADD COLUMN duplicate_of TEXT;

@@ -30,9 +30,10 @@ from voicedock import notes, paths, transcribe
 from voicedock.config import Config
 from voicedock.db import Recording, Session
 from voicedock.device import DeviceInventory
+from voicedock.errors import DELETABLE_SKIP_REASONS, ErrorCode
 from voicedock.log import Logger
 from voicedock.paths import DevicePath, PartKey, QueuePath, SessionKey, StagingPath
-from voicedock.states import PART_DELETABLE, RAW_NOTE_MEMBERS, STAGING_DISPOSABLE
+from voicedock.states import PART_DELETABLE, RAW_NOTE_MEMBERS, STAGING_DISPOSABLE, PartStatus
 
 QUEUE_SCHEMA: Final = 1
 """`queue/delete/<request_id>.json` の `schema`（§14.1.1）。"""
@@ -82,6 +83,21 @@ class DeleteRequest:
 # --- §14.1 の論理式 -------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class TwinPart:
+    """重複（`DUPLICATE_CONTENT`）の**双子**。同じ内容で先に正規化された Part（§14.1 根拠 B）。
+
+    **呼び手が DB から解決して渡す。**`cleaner` は DB を持たない。
+
+    `session` と `parts` は**双子の**セッションのものである（重複と双子は別の日でありうる）。
+    根拠 A を双子に対して評価するのに要る。
+    """
+
+    part: Recording
+    session: Session
+    parts: list[Recording]
+
+
 def can_delete_source(
     part: Recording,
     session: Session,
@@ -90,14 +106,81 @@ def can_delete_source(
     inventory: DeviceInventory | None,
     *,
     vault_root: Path,
+    twin: TwinPart | None = None,
 ) -> bool:
-    """§14.1 の必要十分条件。**論理式をそのまま写す。**
+    """§14.1 の必要十分条件。**共通の同定 AND（根拠 A OR 根拠 B）である。**
 
-    **根拠は「テキストが 2 か所に独立して存在すること」である**（v5.36→v5.37 の変更 AY-1）。
+    **削除してよい理由は 2 つある。**どちらも「デバイス上のその 1 ファイルを消しても
+    記録が失われない」ことを言うが、**言い方が違う。**
 
-    - **Vault の Raw ノート** —— `verify_raw_note()` が実ファイルを読み直して
+    - **根拠 A** — テキストが 2 か所に独立して存在する（`PART_DELETABLE` の 4 状態）
+    - **根拠 B** — 保全すべき本文が無いことが確定している
+      （`SKIPPED` のうち `DELETABLE_SKIP_REASONS` の理由のものに限る）
+
+    **A と B は `status` で排他である** — `PART_DELETABLE` に `SKIPPED` は無い。
+    片方を緩めても、もう片方の経路は開かない（`tests/unit/test_states.py` が固定する）。
+
+    **共通項を括り出してある。**ロック・番犬・対象の同定は**どちらの根拠でも必ず通る。**
+    v5.53 まで 1 本の AND 連鎖だったものを 3 つに分けたが、**分けた目的は
+    「根拠 B から番犬を迂回できなくすること」**である — 2 本の AND 連鎖を並べる形に
+    すると、**片方にだけ条件を足した状態が生まれる。**
+
+    **DB の `status` を信用しない**（§14.4 N-12）。Raw ノートも transcript も
+    **実ファイルを読み直す。**
+    """
+    return _deletion_is_identified(part, session, parts, cfg, inventory) and (
+        _text_is_preserved(part, session, parts, vault_root=vault_root)
+        or _nothing_to_preserve(part, cfg, twin, vault_root=vault_root)
+    )
+
+
+def _deletion_is_identified(
+    part: Recording,
+    session: Session,
+    parts: list[Recording],
+    cfg: Config,
+    inventory: DeviceInventory | None,
+) -> bool:
+    """ロック・番犬・対象の同定。**根拠 A と B の両方が必ず通る共通項である。**
+
+    **`NULL` / 空文字の番犬は消さない** — `os.path.join(volume, "")` は
+    **ボリュームのルートを指す**（§14.1）。
+
+    **`len(parts) >= 1` も共通項に置く。**「`all()` / `any()` を安全条件に使うなら
+    対象集合が非空であることを別条件として必ず明示する」規則である（§14.1）。
+    根拠 B は `parts` を読まないが、**番犬は根拠ごとに付け外しするものではない。**
+
+    **最初に評価される。**`target_is_identical()` は `inventory.json` を見るだけで
+    ファイルを開かないので、デバイスが繋がっていない周回は**ノートも transcript も
+    読まずに抜ける** — `settle_skipped_deletions()` が毎周回走るので、これが効く。
+    """
+    return (
+        # --- 安全ロック（§14.2） ---
+        cfg.cleanup.delete_source_audio is True
+        and device_is_writable(inventory) is True
+        # --- 渡された Session がこの Part のものであること ---
+        and part.session_key == session.session_key
+        # --- Part を 1 つも持たない Session を真にしない ---
+        and len(parts) >= 1
+        # --- 削除対象ファイルの同定（§14.1.1）。**NULL / 空文字を真にしない** ---
+        and part.source_path is not None
+        and part.source_path != ""
+        and target_is_identical(part, inventory)
+    )
+
+
+def _text_is_preserved(
+    part: Recording,
+    session: Session,
+    parts: list[Recording],
+    *,
+    vault_root: Path,
+) -> bool:
+    """**根拠 A: テキストが 2 か所に独立して存在する**（v5.36→v5.37 の変更 AY-1）。
+
+    - **Vault の Raw ノート** — `verify_raw_note()` が実ファイルを読み直して
       §13.7 R-1〜R-6 を再実行し、`_note_contains()` がその Part の鍵を確かめる
-    - **`/data/transcripts/parts/`** —— `part_transcript_is_valid()`。
+    - **`/data/transcripts/parts/`** — `part_transcript_is_valid()`。
       `retain_transcript_days: 0` で**無期限保持**され、Raw ノートの再生成元になる
 
     **Daily ノートと解析結果は条件にしない。**要約は元音声を使わないので、
@@ -106,33 +189,75 @@ def can_delete_source(
 
     **全 Part 終端も条件にしない。**1 本詰まるとその日ぶん丸ごと解放されない
     （#131 / #133 と同じ「1 件の失敗が全体を止める」形）。**Part ごとに評価する。**
-
-    **`NULL` / 空文字の番犬は消さない** — `os.path.join(volume, "")` は
-    **ボリュームのルートを指す**（§14.1）。
-
-    **DB の `status` を信用しない**（§14.4 N-12）。Raw ノートは実ファイルを
-    読み直して §13.7 を再実行する。
     """
     return (
-        # --- 安全ロック（§14.2） ---
-        cfg.cleanup.delete_source_audio is True
-        and device_is_writable(inventory) is True
-        # --- Raw ノート（文字起こし本文）が保存検証済みで、この Part を含む ---
-        and session.raw_output_path is not None
+        session.raw_output_path is not None
         and verify_raw_note(session, parts, vault_root=vault_root) is True
         and _note_contains(vault_root, session.raw_output_path, part.partkey)
-        # --- Part 自身の処理が完了（**transcript がテキストの 2 つ目のコピーである**） ---
-        and part.session_key == session.session_key
         and part.status in {status.value for status in PART_DELETABLE}
         and part.transcript_path is not None
         and part_transcript_is_valid(part)
-        # --- Part を 1 つも持たない Session を真にしない ---
-        and len(parts) >= 1
-        # --- 削除対象ファイルの同定（§14.1.1）。**NULL / 空文字を真にしない** ---
-        and part.source_path is not None
-        and part.source_path != ""
-        and target_is_identical(part, inventory)
     )
+
+
+def _nothing_to_preserve(
+    part: Recording, cfg: Config, twin: TwinPart | None, *, vault_root: Path
+) -> bool:
+    """**根拠 B: 保全すべき本文が無いことが確定している**（§14.1）。
+
+    `SKIPPED` に根拠 A は成立しない — Raw ノートに載らず（`RAW_NOTE_MEMBERS`）、
+    `PART_DELETABLE` にも入っていない。**だから「テキストが 2 か所に在る」ではなく
+    「この Part が保全すべき本文がそもそも無い」を根拠にする。**
+
+    **許可リストにする**（`DELETABLE_SKIP_REASONS`）。`SOURCE_MISSING` は文字起こしに
+    到達しておらず**内容について何も観測していない**ので入らない。知らない理由が
+    増えたときも、**既定で「消さない」側へ落ちる**（`_skip_reason_is_backed()`）。
+
+    **専用のロックを持つ。**`delete_skipped_source` は `delete_source_audio` が真である
+    ことに**加えて**要求される（前者は `_deletion_is_identified()` が見る）。
+    **根拠 A だけを有効にしたまま運用できる形にしてある。**
+    """
+    return (
+        cfg.cleanup.delete_skipped_source is True
+        and part.status == PartStatus.SKIPPED
+        and part.error_code in DELETABLE_SKIP_REASONS
+        and _skip_reason_is_backed(part, twin, vault_root=vault_root)
+    )
+
+
+def _skip_reason_is_backed(part: Recording, twin: TwinPart | None, *, vault_root: Path) -> bool:
+    """**理由ごとに、「本文が無い」と言える根拠が実在するか**（§14.1 根拠 B）。
+
+    - `NO_SPEECH_DETECTED` — **whisper の出力そのもの**が `/data/transcripts/parts/` に残る
+    - `DUPLICATE_CONTENT` — **同じ内容の双子の本文が根拠 A を満たす**（Raw ノートと transcript）
+
+    **「まだ観測していない」を根拠にしない**（§7.5）。`NO_SPEECH_DETECTED` は whisper が
+    最後まで走って `min_chars` 未満を返したという観測で、`transcribe.transcribe()` は
+    判定より**前**に書くので保存物が在る。`part_transcript_is_valid()` がそれを読み直す。
+
+    **重複は自分の本文を持たない。**このバイト列の本文は**双子の側に**在るので、
+    双子に根拠 A を当てる。**双子には同定（`_deletion_is_identified()`）を要求しない** ——
+    双子の元音声は既に消えているのが通常で、`target_is_identical()` は偽になる。
+    消すのは**この** Part のファイルであり、その同定は `can_delete_source()` が済ませている。
+
+    **双子は `duplicate_of` 列で指名されたものだけを認める。**呼び手が別の Part を
+    渡しても通さない。`duplicate_of` が `NULL`（v5.55 以前の重複）なら消さない。
+
+    **表に無い理由は偽。**`DELETABLE_SKIP_REASONS` にだけ足して根拠を書き忘れても、
+    消える側には倒れない。
+    """
+    if part.error_code == ErrorCode.NO_SPEECH_DETECTED:
+        return part_transcript_is_valid(part)
+    if part.error_code == ErrorCode.DUPLICATE_CONTENT:
+        return (
+            part.duplicate_of is not None
+            and twin is not None
+            and twin.part.partkey == part.duplicate_of
+            and twin.part.partkey != part.partkey
+            and twin.part.session_key == twin.session.session_key
+            and _text_is_preserved(twin.part, twin.session, twin.parts, vault_root=vault_root)
+        )
+    return False
 
 
 def device_is_writable(inventory: DeviceInventory | None) -> bool:
@@ -205,9 +330,18 @@ def verify_raw_note(session: Session, parts: list[Recording], *, vault_root: Pat
 
 
 def part_transcript_is_valid(part: Recording) -> bool:
-    """Part transcript が実在し読めるか（§14.1）。**DB の列だけを根拠にしない。**"""
-    if part.transcript_path is None:
-        return False
+    """Part transcript が実在し読めるか（§14.1）。**実ファイルだけを根拠にする。**
+
+    **`transcript_path` 列を見ない**（v5.53→v5.54）。列は「文字起こしが成功した」の
+    記録であり、**ファイルが在るかどうかとは別のことを言っている** ——
+    `NO_SPEECH_DETECTED` の Part は**ファイルは在るのに列は `NULL`** である
+    （`transcribe.transcribe()` が `min_chars` の判定より前に書き、`Pipeline._skip()` は
+    列を書かない）。根拠 B はその保存物そのものを根拠にするので、**列で門前払いすると
+    根拠 B が永久に偽になる。**
+
+    **根拠 A の振る舞いは変わらない。**あちらは `part.transcript_path is not None` を
+    **自分の条件として別に持っている**（`_text_is_preserved()`）。
+    """
     return transcribe.load_transcript(PartKey(part.partkey)) is not None
 
 
@@ -264,13 +398,16 @@ def request_part_deletion(
     vault_root: Path,
     log: Logger,
     now: datetime,
+    twin: TwinPart | None = None,
 ) -> DeleteRequest | None:
     """§14.1 が真のときだけ要求を書く（§10.12）。書かなければ `None`。
 
     **一時名で書いて rename する。**reaper が書き込み途中の JSON を読むと、
     **壊れた要求を「検証できないもの」として扱う経路が要る**ことになる。
     """
-    if not can_delete_source(part, session, parts, cfg, inventory, vault_root=vault_root):
+    if not can_delete_source(
+        part, session, parts, cfg, inventory, vault_root=vault_root, twin=twin
+    ):
         return None
 
     if part.source_size is None or part.source_mtime is None:
@@ -349,6 +486,31 @@ DELETED_STATUS: Final = "DELETED"
 """reaper が削除に成功したときの `status`（§14.1.1 の結果の形式）。"""
 
 
+def awaits_delete_result(part: Recording) -> bool:
+    """この Part は削除結果を待っているか。**判定はここだけに置く**（§10.12）。
+
+    待ち方が 2 つある。**要求 ID が在ることは共通で、状態の見え方だけが違う。**
+
+    | 根拠 | 待っているときの状態 |
+    |---|---|
+    | A | `SOURCE_DELETING`（§9.3 の正規の辺） |
+    | B | **`SKIPPED` のまま** |
+
+    **根拠 B の Part を `SOURCE_DELETING` へ動かしてはならない。**
+    `db.record_transition()` は `error_code` を**無条件に UPDATE する**ので、往復させると
+    `NO_SPEECH_DETECTED` が `NULL` になり、(1) Daily ノートの「（無音）」表示
+    （`daily._skip_reasons()`）が壊れ、(2) `DELETABLE_SKIP_REASONS` の判定が
+    二度と真にならない。**`SKIPPED` は終端であり、元音声の削除はその Part の
+    「工程」ではない** —— `PART_TRANSITIONS` に辺を足さないのはそのためである。
+
+    **`delete_request_id` を先に見る。**これが `NULL` なら待っていない ——
+    `SKIPPED` は要求を出していないものが常に大多数である。
+    """
+    if part.delete_request_id is None:
+        return False
+    return part.status in {PartStatus.SOURCE_DELETING, PartStatus.SKIPPED}
+
+
 @dataclass(frozen=True)
 class DeleteResult:
     """`queue/result/<request_id>.json`（§14.1.1 / v5.9→v5.10 の変更 X-1）。"""
@@ -420,10 +582,20 @@ def inventory_is_newer(inventory: DeviceInventory | None, result: DeleteResult) 
 
     #148 / #107 と同じ型である —— **「まだ観測していない」と「そうでない」を
     区別しない。**
+
+    **同じ秒は「新しい」に含めない**（v5.54→v5.55）。どちらも秒の分解能しか無く、
+    **ingest は同じ走行の中で inventory を書いてから reaper を走らせる。**削除が 1 本だけ
+    だと reaper は同じ秒のうちに終わるので、**`generated_at == completed_at` の inventory は
+    削除の前に走査したもの**である。`>=` はそれを「結果より新しい」と読み、
+    **消えたファイルを「まだ在る」＝失敗として記録していた**（2026-09-17 21:28:37 に実機で踏んだ。
+    9/16 の E2E の `still_in_inventory` 6 件も同じ形）。
+
+    **次の走行の inventory は必ず後の秒になる**（launchd の `StartInterval` は 300 秒で、
+    走行は重ならない）。だから厳密に後の秒だけを判定に使えば、待つのは 1 周だけである。
     """
     if inventory is None or inventory.generated_at is None or result.completed_at is None:
         return None
-    return inventory.generated_at >= result.completed_at
+    return inventory.generated_at > result.completed_at
 
 
 def source_is_gone(part: Recording, inventory: DeviceInventory | None) -> bool:

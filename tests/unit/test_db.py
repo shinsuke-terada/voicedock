@@ -101,7 +101,7 @@ def test_schema_has_the_spec_tables(database: Database) -> None:
 
 
 def test_recordings_has_25_columns(database: Database) -> None:
-    """列数の記録（v5.1 で 30 列 → 24 列、v5.46 で 25 列）。
+    """列数の記録（v5.1 で 30 列 → 24 列、v5.46 で 25 列、v5.56 で 26 列）。
 
     v5.0 までは「v1 完全形」を保つための数だった（§8.5 が破壊的変更を禁じており、
     後から足せない列を先に入れてあった）。**v5.1 で `0001_initial.sql` を 1 回だけ
@@ -112,10 +112,13 @@ def test_recordings_has_25_columns(database: Database) -> None:
 
     **v5.46 で `delete_request_id` を 1 列足した**（変更 BH-1）。
     `ALTER TABLE ADD COLUMN` である（`0002_delete_request_id.sql`）。
+
+    **v5.56 で `duplicate_of` を 1 列足した**（`0003_duplicate_of.sql`）。重複の双子を
+    `error_message` の文字列から解析しないための列である（§14.1 根拠 B）。
     """
     columns = structure(database.conn)["table:recordings"]
     assert isinstance(columns, list)
-    assert len(columns) == 25
+    assert len(columns) == 26
 
 
 @pytest.mark.parametrize(

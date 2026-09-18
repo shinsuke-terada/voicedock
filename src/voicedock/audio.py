@@ -364,6 +364,12 @@ class NormalizeResult:
     reused: bool = False
     in_bytes: int = 0
     out_bytes: int = 0
+    duplicate_of: str | None = None
+    """`DUPLICATE_CONTENT` のとき、**同じ内容で先に正規化された Part の `partkey`**。
+
+    **`error_message` の文字列に埋め込むだけにしない**（v5.55→v5.56）。§14.1 の根拠 B は
+    双子の本文が Vault に在ることを確かめるので、呼び手が DB の列へ書ける形で返す。
+    """
 
     @property
     def ok(self) -> bool:
@@ -482,6 +488,7 @@ def normalize(
                 error_message=f"同じ内容の Part が既にあります: {other}",
                 elapsed_seconds=elapsed,
                 in_bytes=in_bytes,
+                duplicate_of=other,
             )
 
     return NormalizeResult(
@@ -555,6 +562,7 @@ def _reuse(
                 error_code=ErrorCode.DUPLICATE_CONTENT,
                 error_message=f"同じ内容の Part が既にあります: {other}",
                 in_bytes=in_bytes,
+                duplicate_of=other,
             )
 
     return NormalizeResult(

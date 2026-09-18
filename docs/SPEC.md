@@ -1,13 +1,13 @@
-# VoiceDock 詳細仕様書 v5.53
+# VoiceDock 詳細仕様書 v5.58
 
 **DJI Mic 3 × ローカル文字起こし × ローカルLLM × Obsidian**
 
 | 項目 | 内容 |
 |---|---|
-| 文書版 | **v5.53（録音 0 件のデバイスで ingest が止まるのを直す）** |
-| 前身文書 | v5.52 / v5.51 / v5.50 / v5.49 / v5.48 / v5.47 / v5.46 / v5.45 / v5.44 / v5.43 / v5.42 / v5.41 / v5.40 / v5.39 / v5.38 / v5.37 / v5.36 / v5.35 / v5.34 / v5.33 / v5.32 / v5.31 / v5.30 / v5.29 / v5.28 / v5.27 / v5.26 / v5.25 / v5.24 / v5.23 / v5.22 / v5.21 / v5.20 / v5.19 / v5.18 / v5.17 / v5.16 / v5.15 / v5.14 / v5.13 / v5.12 / v5.11 / v5.10 / v5.9 / v5.8 / v5.7 / v5.6 / v5.5 / v5.4 / v5.3 / v5.2 / v5.1 / v5.0 / v4.6 / v4.5 / v4.4 / v4.3 / v4.2 / v4.1 / v4.0 / v3.4 / v3.3 / v3.2 / v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
+| 文書版 | **v5.58（reaper が request_id の文字種を検証しないのを直す）** |
+| 前身文書 | v5.57 / v5.56 / v5.55 / v5.54 / v5.53 / v5.52 / v5.51 / v5.50 / v5.49 / v5.48 / v5.47 / v5.46 / v5.45 / v5.44 / v5.43 / v5.42 / v5.41 / v5.40 / v5.39 / v5.38 / v5.37 / v5.36 / v5.35 / v5.34 / v5.33 / v5.32 / v5.31 / v5.30 / v5.29 / v5.28 / v5.27 / v5.26 / v5.25 / v5.24 / v5.23 / v5.22 / v5.21 / v5.20 / v5.19 / v5.18 / v5.17 / v5.16 / v5.15 / v5.14 / v5.13 / v5.12 / v5.11 / v5.10 / v5.9 / v5.8 / v5.7 / v5.6 / v5.5 / v5.4 / v5.3 / v5.2 / v5.1 / v5.0 / v4.6 / v4.5 / v4.4 / v4.3 / v4.2 / v4.1 / v4.0 / v3.4 / v3.3 / v3.2 / v3.1 / v3.0（git 履歴）、`docs/archive/VoiceDock_Docker_Implementation_Spec_v2.0.md`（方針書） |
 | 作成日 | 2026-09-11 |
-| 改訂日 | 2026-09-16 |
+| 改訂日 | 2026-09-18 |
 | 実測記録 | `docs/POC.md`（Phase 0 の実測値と判断。本書と食い違う場合は POC.md を正とする） |
 | 設計の決定記録 | `docs/STORE.md`（ストア方式と識別子の決定と、その根拠。§8 を変えるときは先に読むこと） |
 | 対象環境 | macOS / Apple Silicon |
@@ -455,7 +455,8 @@ flowchart TD
 │   └── <device_id>/<source_folder>/<name>.wav + <name>.wav.meta.json
 ├── queue/
 │   ├── delete/              # コンテナが書く / reaper が読む
-│   └── result/              # reaper が書く / コンテナが読む
+│   ├── result/              # reaper が書く / コンテナが読む
+│   └── rejected/            # reaper が退避する。request_id が読めない/安全でない要求（§14.1.1）
 ├── state/
 │   ├── heartbeat.json       # Helper の生存・mount_readonly・版（§7.5）
 │   ├── inventory.json       # デバイス上の現在のファイル一覧（§7.5）
@@ -1167,6 +1168,11 @@ obsidian:
 cleanup:
   # 【安全ロック 1】DJI 側の元音声を削除するか。既定 false
   delete_source_audio: false
+  # 発話が検出されず SKIPPED になった Part の元音声も削除するか。既定 false
+  # **delete_source_audio が true でなければ効かない**（§14.1 の根拠 B）。
+  # 根拠は「whisper の出力が /data/transcripts/parts/ に無期限で残ること」であり、
+  # **保全すべき本文が無いことを、その保存物が示す**という一段の論理である
+  delete_skipped_source: false
   # 【安全ロック 2-A / 2-B は helper.conf 側にある（§7.4, §14.2）】
   # 文字起こし後に 16 kHz 音声を削除するか（容量節約）
   delete_normalized_after_transcribe: true
@@ -1562,7 +1568,11 @@ CREATE TABLE recordings (
     -- ★v5.46 で追加（変更 BH-1）。いま出ている削除要求の request_id（§10.12）。
     --   `ALTER TABLE ADD COLUMN` は列を末尾に足すので、グループの途中ではなくここに置く
     --   （test_schema_matches_spec は PRAGMA table_info を順序込みで比べる）
-    delete_request_id     TEXT                -- NULL = 要求を出していない
+    delete_request_id     TEXT,               -- NULL = 要求を出していない
+
+    -- ★v5.56 で追加。DUPLICATE_CONTENT の Part の「双子」（同じ内容で先に正規化された
+    --   Part）の partkey。§14.1 根拠 B が双子の本文を確かめるのに使う。末尾に置く理由は上と同じ
+    duplicate_of          TEXT                -- NULL = 重複ではない（または v5.55 以前の重複）
 );
 
 -- 論理的な同一 Part の二重登録は PRIMARY KEY が防ぐ。
@@ -1590,6 +1600,10 @@ CREATE INDEX idx_recordings_started  ON recordings (started_at);
 - `sha256_helper` は Helper がコピーしながら算出した値。コンテナは inbox から読み直して再計算し、
   一致しなければ `SOURCE_HASH_MISMATCH` → `FAILED` とする（§10.5）。**コピー破損を検出する唯一の経路**
 - `inbox_path` は `NORMALIZED` 到達後に削除される（`import.inbox_retain`）。削除後も列は残す（監査用）
+- **`duplicate_of` は重複の双子を指す**（v5.56）。重複の Part は `sha256` を持てない
+  （`idx_recordings_sha` が UNIQUE なので双子と同じ値を書けない）ため、**双子を引く手段が
+  `error_message` の文字列にしか無かった。**文字列を解析しないために列を持つ。
+  **`NULL` の重複 Part は元音声を削除しない**（§14.1 根拠 B が成立しない）
 - **工程ごとの監査タイムスタンプ列は持たない。**§14.1 の削除条件（ノートの実体と ID で判定）も §9.4 の再開規則（パスと sha256 で判定）もこれらを 1 つも参照しない。工程別の所要時間は §16.2 のログ（`elapsed_s` / `rtf` / `speech_ratio`）で追える。**v5.0 は `FAILED` からの経過時間を使わない**（再評価は時間ではなく契機で起こる。§15.2）
 
 ### 8.3 `sessions`（1 デバイス・1 日）
@@ -1782,7 +1796,7 @@ stateDiagram-v2
 | `SOURCE_DELETE_PENDING` | 削除すべきだがデバイス未接続 / 同定失敗 / 削除失敗 / **結果がタイムアウト**。次回接続時に再試行 | — | ✅ |
 | `COMPLETED` | 当該 Part の処理をすべて終えた | 可（§14.1 が真なら） | ✅ |
 | `FAILED` | 失敗。デバイス再接続とサービス起動で再評価される（§15.2） | 不可 | ✅ |
-| `SKIPPED` | 既知の重複、発話が検出されなかった、または取り込み対象の実体が失われた | 不可 | ✅ |
+| `SKIPPED` | 既知の重複、発話が検出されなかった、または取り込み対象の実体が失われた | **無音（`NO_SPEECH_DETECTED`）と重複（`DUPLICATE_CONTENT`）は条件付きで可**（§14.1 根拠 B。`delete_skipped_source` が真のとき）。**状態は `SKIPPED` のまま** | ✅ |
 
 **終端状態**（Session の進行判定に使う）: `RAW_SAVED` / `SOURCE_DELETING` / `SOURCE_DELETE_PENDING` / `COMPLETED` / `FAILED` / `SKIPPED`
 
@@ -2001,6 +2015,7 @@ def worker_loop() -> None:
         if helper_fresh:                     # ← inventory.json に依存する段だけ
             evaluate_deletions()             # §14.3 SAVED 以降を backoff に従って再評価
                                              #       （結果の回収と要求の投入を含む。§10.12）
+            settle_skipped_deletions()       # §14.1 根拠 B。SKIPPED の元音声（セッションを動かさない）
             requeue_failed(inventory)        # §15.2 再接続の立ち上がりで FAILED を再投入
         sleep(cfg.device.poll_interval_seconds)
 ```
@@ -2012,8 +2027,8 @@ def worker_loop() -> None:
 「新しい録音が無い」と解釈して静かに待ち続ける状態を作らないため（§22 R-23）。
 
 **ただし止めるのは「Helper の報告に依存する段」だけである**（v5.45→v5.46 の変更 BH-4）。
-`discover_parts`（`/inbox`）と `evaluate_deletions` / `requeue_failed`（`inventory.json`）が
-それにあたる。**文字起こし・LLM・ノート生成は Helper に一切触れない**ので進める ——
+`discover_parts`（`/inbox`）と `evaluate_deletions` / `settle_skipped_deletions` /
+`requeue_failed`（`inventory.json`）がそれにあたる。**文字起こし・LLM・ノート生成は Helper に一切触れない**ので進める ——
 v5.45 まではここで周回ごと打ち切っており、**LaunchAgent を止めるだけでパイプライン全体が
 凍った。**§22 R-23 の根拠は「**Helper の死を検出せずに黙って待つな**」であって、
 「Helper と無関係な処理まで凍らせろ」ではない。
@@ -2340,7 +2355,7 @@ if du(staging_root) + expected > import.staging_max_bytes:  -> DISK_SPACE_LOW
 - **部分出力を必ず削除する**（次回の再開時に「変換済み」と誤認しないため）
 - 元データには触らない。次回デバイス接続時に自動リトライ対象となる
 
-**二重処理防止**: 算出した SHA-256 が既存行と衝突した場合、それは内容が同一の既処理ファイルを意味するため `SKIPPED`（`DUPLICATE_CONTENT`）とし、生成した 16 kHz 音声を削除する。
+**二重処理防止**: 算出した SHA-256 が既存行と衝突した場合、それは内容が同一の既処理ファイルを意味するため `SKIPPED`（`DUPLICATE_CONTENT`）とし、生成した 16 kHz 音声を削除する。**衝突した相手（双子）の `partkey` を `recordings.duplicate_of` に書く**（v5.56。§14.1 根拠 B が双子の本文を確かめるのに使う。`sha256` は双子と同じ値なので書けない）。
 
 ### 10.6 文字起こし
 
@@ -2399,7 +2414,7 @@ VAD はタイムスタンプを元の時刻のまま維持するため、Raw ノ
 | タイムアウト | `clamp(duration_seconds × timeout_factor, min_timeout_seconds, max_timeout_seconds)` |
 | タイムアウト時 | プロセスグループごと kill → 部分出力削除 → `WHISPER_TIMEOUT` → `FAILED` |
 | 終了コード != 0 | stderr の末尾 1000 文字を `error_message` に記録 → `WHISPER_FAILED` → `FAILED` |
-| 発話なし | 全 segment の text 合計が `min_chars` 未満なら `NO_SPEECH_DETECTED` → **`SKIPPED`**（失敗ではない） |
+| 発話なし | 全 segment の text 合計が `min_chars` 未満なら `NO_SPEECH_DETECTED` → **`SKIPPED`**（失敗ではない）。**transcript は判定より前に書かれているので `transcript_path` も記録する**（v5.54。§14.1 根拠 B の根拠がこの保存物である） |
 | 冪等性 | 出力 JSON が存在し、**正規化スキーマとしてパースでき `text` が `min_chars` 以上**なら再実行しない |
 
 **成功後**、`cleanup.delete_normalized_after_transcribe` が `true` なら `audio16k.wav` を削除する。
@@ -2539,7 +2554,7 @@ for part in sorted(valid_parts, key=lambda p: p.started_at):
 | **削除を待っている Part が 1 つも無い** | **セッションを完了させる**（変更 BG-3）。`COMPLETED` / `SKIPPED` / `FAILED` はもう削除の対象にならないので、**待っても何も変わらない。**v5.44 まで `delete_attempts` だけが増え、**`SOURCE_DELETE_PENDING` から永久に出られなかった。**`RAW_SAVED` の Part が居て §14.1 が偽の場合は**待ち続ける**（ノートの検証が通れば真になりうる） |
 | **結果が届いたが Part はもう `SOURCE_DELETING` でない** | **結果を捨てる**（変更 BG-1）。**二度と回収されない**ので残すと `status` の `awaiting result` が実態と食い違い、ファイルも溜まり続ける。**`partkey` が DB に無い場合は残す** —— 別セッションのものかもしれない |
 | **結果の `request_id` が `recordings.delete_request_id` と食い違う** | **結果を捨てる**（変更 BG-2 / 直し BH-1）。古い試行のものである。**照合先は DB の列である** —— `queue/delete/<id>.json` は **reaper が所有し、処理した瞬間に消す**ので、結果が届くとき要求は**必ず 0 件**である。**キューを走査する実装はすべての結果を捨てていた**（v5.45 の欠陥） |
-| 削除は成功したが `inventory.json` にまだ在る | **`inventory.generated_at` が結果の `completed_at` より新しいときだけ** `SOURCE_DELETE_FAILED` → `SOURCE_DELETE_PENDING`。**古い inventory はその削除について何も言えない**ので `SOURCE_DELETING` のまま待つ（結果ファイルも消さない。v5.42→v5.43 の変更 BE-1） |
+| 削除は成功したが `inventory.json` にまだ在る | **`inventory.generated_at` が結果の `completed_at` より新しいときだけ**（**同じ秒は含まない**。v5.55） `SOURCE_DELETE_FAILED` → `SOURCE_DELETE_PENDING`。**古い inventory はその削除について何も言えない**ので `SOURCE_DELETING` のまま待つ（結果ファイルも消さない。v5.42→v5.43 の変更 BE-1） |
 
 | **デバイスが書き込み不能**（ロック 2-B が有効、または再マウントに失敗） | **止めない**（#145）。`INFO source_delete_skipped reason=device_readonly` を出し、元音声を残したまま `CLEANUP → COMPLETED` へ進む。**`MOUNT_MODE` は設定なので待っても変わらず、待つと staging が解放されない。**`COMPLETED` は行き止まりではない —— §17.1 の `cleanup --backlog` が後から拾う |
 | staging 削除失敗 | `LOCAL_DELETE_FAILED`。Session は `CLEANUP` に留める。次回リトライ |
@@ -2562,9 +2577,22 @@ for part in sorted(valid_parts, key=lambda p: p.started_at):
 
 | `inventory.generated_at` と結果の `completed_at` | 扱い |
 |---|---|
-| inventory のほうが**新しい** | 判定に使う（在れば `SOURCE_DELETE_FAILED`、無ければ `COMPLETED`） |
-| inventory のほうが**古い** | **何も言えない。**`SOURCE_DELETING` のまま待ち、**結果ファイルも消さない** |
+| inventory のほうが**新しい**（**後の秒**） | 判定に使う（在れば `SOURCE_DELETE_FAILED`、無ければ `COMPLETED`） |
+| inventory のほうが**古い**、または**同じ秒** | **何も言えない。**`SOURCE_DELETING` のまま待ち、**結果ファイルも消さない** |
 | どちらかが**読めない** | 従来どおり保留（**不明は安全側**。§7.5） |
+
+**同じ秒は「新しい」に含めない**（v5.54→v5.55 の変更 BQ-1）。どちらも秒の分解能しか無く、
+**ingest は同じ走行の中で inventory を書いてから reaper を走らせる。**削除が 1 本だけだと
+reaper は同じ秒のうちに終わるので、**`generated_at == completed_at` の inventory は削除の前に
+走査したもの**である。**次の走行の inventory は必ず後の秒になる**（`StartInterval` は 300 秒で、
+走行は重ならない）ので、待つのは 1 周だけである。
+
+```text
+21:28:37  write_inventory        ← まだ在る状態を書く（generated_at 21:28:37）
+21:28:37  reaper が削除          ← completed_at 21:28:37（同じ秒）
+21:28:41  コンテナが回収         ← v5.54 は `>=` で「新しい」と読み、still_in_inventory で保留へ落とした
+21:29:41  再要求 → 21:33:37 reaper が target_missing で拒否（ファイルはもう無い）
+```
 
 歯止めは `cleanup.delete_result_timeout_seconds` である（§9.3）。**新しい上限を足さない。**
 
@@ -3367,7 +3395,7 @@ VoiceDock の削除条件を整理し、午後の打ち合わせで MVP の範�
 
 **理由の並びは §15.1 の表の順に固定する。**出現順にすると、同じ組み合わせのノートが Part の処理順で違う文面になり、**§9.4 の `output_sha256` 一致（再生成の冪等性）が壊れる。**
 
-**欠落を隠さないこと。**除外された Part の音声は削除されない（§14.1 が `voicedock_recording_keys` への収録を要求するため自動的に保証される）。
+**欠落を隠さないこと。**除外された Part の音声は**根拠 A では**削除されない（§14.1 が `voicedock_recording_keys` への収録を要求するため自動的に保証される）。**無音（`NO_SPEECH_DETECTED`）と重複（`DUPLICATE_CONTENT`）は `cleanup.delete_skipped_source` が真なら根拠 B で削除されうる**（v5.54 / v5.56）。**そのときも除外の記載（frontmatter と警告行）は変わらない** —— 状態は `SKIPPED` のままで、`error_code` も残る。
 
 ### 13.5 ファイル名と sanitize
 
@@ -3485,6 +3513,9 @@ VoiceDock の削除条件を整理し、午後の打ち合わせで MVP の範�
 
 Part の元音声を削除してよいのは、以下の論理式が真のときだけである。
 
+> **v5.54 で「共通の同定 AND（根拠 A OR 根拠 B）」の形に分けた。**根拠 A（v5.53 までの式）の
+> 項は 1 つも変えていない。**足したのは根拠 B（保全すべき本文が無いこと）だけである**（後述）。
+>
 > **v4.0 でもこの論理式は 1 文字も変えていない。**変わったのは**評価の結果として何が起きるか**だけで、
 > 真になったときコンテナは削除ではなく**削除要求の書き込み**を行う（§10.12）。
 > `device` は `state/inventory.json` から得た `DeviceInventory` であり、
@@ -3501,29 +3532,31 @@ Part の元音声を削除してよいのは、以下の論理式が真のとき
 ```python
 # ★2 つの集合を使い分ける（§9.1 の「終端状態」と混同しないこと）
 #   PART_TERMINAL  : §9.1 の 6 件。Session の進行判定に使う（FAILED / SKIPPED を含む）
-#   PART_DELETABLE : 削除してよい 4 件。FAILED / SKIPPED は本文が保存されていないので含めない
+#   PART_DELETABLE : 根拠 A で削除してよい 4 件。FAILED / SKIPPED は本文が保存されていないので含めない
 # ★v5.37 以降、下の論理式は PART_TERMINAL を使わない。**それでも並べておく** —
 #   条件を足すときに誤って 6 件のほうを使うと、FAILED / SKIPPED の元音声を消す（付録の K-1）
 PART_TERMINAL = ("RAW_SAVED", "SOURCE_DELETING", "SOURCE_DELETE_PENDING", "COMPLETED",
                  "FAILED", "SKIPPED")
 PART_DELETABLE = ("RAW_SAVED", "SOURCE_DELETING", "SOURCE_DELETE_PENDING", "COMPLETED")
+# ★根拠 B で元音声を消してよい SKIPPED の理由（v5.54）。**許可リストである**
+DELETABLE_SKIP_REASONS = ("DUPLICATE_CONTENT", "NO_SPEECH_DETECTED")
 
-def can_delete_source(part, session, cfg, device) -> bool:
+def can_delete_source(part, session, cfg, device, twin=None) -> bool:
+    # ★共通の同定 AND（根拠 A OR 根拠 B）。**`or` を共通項の外へ出してはならない** —
+    #   出すと根拠 B がロックも番犬も通らずに真になる（tests が AST で形を固定している）
+    return deletion_is_identified(part, session, cfg, device) and (
+        text_is_preserved(part, session)          # 根拠 A
+        or nothing_to_preserve(part, cfg, twin)   # 根拠 B
+    )
+
+def deletion_is_identified(part, session, cfg, device) -> bool:
     return (
         # --- 安全ロック（§14.2） ---
         cfg.cleanup.delete_source_audio is True
         and device.writable is True
 
-        # --- Raw ノート（文字起こし本文）が保存検証済みで、この Part を含む ---
-        and session.raw_output_path is not None
-        and verify_raw_note(session) is True          # §13.7 R-1〜R-6 を実ファイルで再実行
-        and part.partkey in frontmatter_keys(session.raw_output_path)
-
-        # --- Part 自身の処理が完了（transcript がテキストの 2 つ目のコピー） ---
+        # --- 渡された Session がこの Part のもの ---
         and part.session_key == session.session_key
-        and part.status in PART_DELETABLE
-        and part.transcript_path is not None
-        and part_transcript_is_valid(part)
 
         # --- Part を 1 つも持たない Session を真にしない ---
         and len(session.parts) >= 1
@@ -3533,6 +3566,41 @@ def can_delete_source(part, session, cfg, device) -> bool:
         and part.source_path != ""
         and target_is_identical(part, device)
     )
+
+def text_is_preserved(part, session) -> bool:     # 根拠 A: テキストが 2 か所に在る
+    return (
+        # --- Raw ノート（文字起こし本文）が保存検証済みで、この Part を含む ---
+        session.raw_output_path is not None
+        and verify_raw_note(session) is True          # §13.7 R-1〜R-6 を実ファイルで再実行
+        and part.partkey in frontmatter_keys(session.raw_output_path)
+
+        # --- Part 自身の処理が完了（transcript がテキストの 2 つ目のコピー） ---
+        and part.status in PART_DELETABLE
+        and part.transcript_path is not None
+        and part_transcript_is_valid(part)            # 実ファイルを読む（列は見ない）
+    )
+
+def nothing_to_preserve(part, cfg, twin) -> bool: # 根拠 B: 保全すべき本文が無い
+    return (
+        cfg.cleanup.delete_skipped_source is True     # 根拠 B 専用のロック
+        and part.status == "SKIPPED"
+        and part.error_code in DELETABLE_SKIP_REASONS
+        and skip_reason_is_backed(part, twin)         # 理由ごとの根拠が実在する
+    )
+
+def skip_reason_is_backed(part, twin) -> bool:
+    if part.error_code == "NO_SPEECH_DETECTED":
+        return part_transcript_is_valid(part)         # whisper の出力そのものが残っている
+    if part.error_code == "DUPLICATE_CONTENT":        # 本文は双子の側に在る（v5.56）
+        return (
+            part.duplicate_of is not None             # §8.2。NULL（v5.55 以前）は消さない
+            and twin is not None
+            and twin.part.partkey == part.duplicate_of    # 指名された双子だけを認める
+            and twin.part.partkey != part.partkey
+            and twin.part.session_key == twin.session.session_key
+            and text_is_preserved(twin.part, twin.session)  # 双子に根拠 A。同定は要求しない
+        )
+    return False                                      # 表に無い理由は消さない側
 ```
 
 #### 根拠は「テキストが 2 か所に独立して存在すること」
@@ -3561,6 +3629,67 @@ def can_delete_source(part, session, cfg, device) -> bool:
 > **条件が `part_transcript_is_valid(part)` を要求しているのは、この 2 つ目のコピーを
 > 確かめるためである。**
 
+#### 根拠 B は「保全すべき本文が無いこと」（v5.54）
+
+`SKIPPED` の Part には**根拠 A が成立しない。**Raw ノートに載らず（`RAW_NOTE_MEMBERS`）、
+`PART_DELETABLE` にも入っていない。v5.53 まではそのため**自動で消える経路が一切無く**、
+無音の録音はデバイスに溜まり続けた（`cleanup --backlog` も `COMPLETED` だけが対象）。
+
+**根拠 A を緩めるのではなく、別の根拠を足す。**「テキストが 2 か所に在る」ではなく
+**「残すべきテキストがそもそも無い」**ことを根拠にする。
+
+| 理由 | 根拠 B が言えるか |
+|---|---|
+| `NO_SPEECH_DETECTED` | **言える。**whisper が最後まで走って `min_chars` 未満を返したという**観測**であり、**その出力そのものが** `/data/transcripts/parts/` に無期限で残る（`transcribe()` は `min_chars` の判定より**前**に書く）。`part_transcript_is_valid()` がそれを実ファイルで読み直す |
+| `SOURCE_MISSING` | **言えない。**文字起こしに到達しておらず、**内容について何も観測していない**（§7.5）。§15.1 は「デバイス上のファイルには触れない」と規定している |
+| `DUPLICATE_CONTENT` | **言える（v5.56）。**重複は自分の本文を持たないが、**同じバイト列の本文は双子の側に在る。**`recordings.duplicate_of` で指名された双子が**根拠 A を満たす**ことを確かめる。**双子には同定を要求しない** —— 双子の元音声は既に消えているのが通常で、`target_is_identical()` は偽になる。消すのは重複のほうのファイルであり、その同定は共通項が済ませている |
+
+- **専用のロックを持つ**（`cleanup.delete_skipped_source`、既定 `false`）。**`delete_source_audio` が
+  真であることに加えて**要求される。根拠 A だけを有効にしたまま運用できる
+- **ロック・番犬・同定は共通項に置く。**根拠 B も `len(session.parts) >= 1` / `source_path != ""` /
+  `target_is_identical()` を必ず通る。**分けた目的はこれである** —— 2 本の AND 連鎖を並べると、
+  片方にだけ条件を足した状態が生まれる
+- **A と B は `status` で排他である。**`PART_DELETABLE` に `SKIPPED` は無い
+  （`tests/unit/test_states.py` が差 `{FAILED, SKIPPED}` を固定している）
+- **`part_transcript_is_valid()` は `transcript_path` 列を見ない**（実ファイルだけを見る）。
+  `NO_SPEECH_DETECTED` の Part は**ファイルは在るのに列が `NULL`** だった（v5.53 まで）。
+  根拠 A は `part.transcript_path is not None` を**自分の条件として別に持つ**ので振る舞いは変わらない。
+  v5.54 から無音の Part にも列を書く
+
+**`SKIPPED` のまま進める。状態遷移を使わない。**`db.record_transition()` は `error_code` を
+**無条件に上書きする**ので、`SOURCE_DELETING` を経由させると `NO_SPEECH_DETECTED` が消え、
+(1) Daily ノートの「（無音）」表示（§13.4）が壊れ、(2) `DELETABLE_SKIP_REASONS` の判定が
+二度と真にならない。**結果を待っていることは `delete_request_id` が表し**
+（`cleaner.awaits_delete_result()`）、決着は `source_deleted_at` が表す。
+`PART_TRANSITIONS` に `SKIPPED` から出る辺は足さない（§9.3）。
+
+**双子は DB の列で引く**（`Pipeline._twin_of()`）。v5.55 までは双子の `partkey` が
+`error_message` の文字列（`"同じ内容の Part が既にあります: …"`）にしか無く、`sha256` も
+`NULL` だった（双子と同じ値は `idx_recordings_sha` が弾く）。**文字列を解析しない。**
+`duplicate_of` が `NULL` の重複（v5.55 以前に `SKIPPED` になったもの）は消さない。
+
+**セッションの状態機械から独立した経路で評価する**（`Pipeline.settle_skipped_deletions()`。§10.0）。
+`delete_sources_if_safe()` の早期完了は `AWAITING_DELETION` で判定しており、そこへ `SKIPPED` を
+入れると **reaper が居ないときにセッションが永久に完了できない**（変更 BG-3 で実機で踏んだ形）。
+この経路は**セッションを 1 行も動かさないので、最悪の失敗は「消えない」＝ v5.53 と同じ**である。
+
+| 段 | 対象 | 理由 |
+|---|---|---|
+| 結果の回収 | `delete_request_id` を持つ `SKIPPED`（**デバイスに無くても**） | reaper が消した後の `inventory.json` にはそのファイルが載らない。絞り込みを掛けると**回収できる瞬間に対象から外れる** |
+| 要求の投入 | `inventory.json` に載っている `SKIPPED` | `SKIPPED` は消えずに増え続ける終端なので、全件を毎周回評価すると費用が過去の件数に比例する |
+| 間引き | `updated_at` から `delete_evaluation_backoff_seconds` の最小値 | 拒否されるたびに 5 秒周期で書き直さない。判定材料の `inventory.json` は ingest が 5 分ごとにしか書かない |
+
+結果の回収規則（`request_id` の照合・`inventory` の新しさ・期限切れの取り下げ）は
+**`collect_delete_results()` を共有する。**`SKIPPED` で分かれるのは後始末だけである
+（成功: `source_deleted_at` を書き要求 ID を外す／失敗・期限切れ: 要求 ID を外すだけ）。
+
+> **承知している危険**: 根拠は「whisper が `min_chars` 未満を返したこと」そのものであり、
+> **whisper が発話を取りこぼした場合も消える。**2026-09-15 には 30 分ちょうどで 0 文字の
+> `NO_SPEECH_DETECTED` が実際に出ている。**音量などの独立した裏取りは要求しない**
+> （利用者の判断）。そのため**既定を `false` にし、有効化を 2 か所の書き換え
+> （`delete_source_audio` と `delete_skipped_source`）に残す。**whisper の出力 JSON は残るので、
+> 「何を返したか」は後から確かめられる。
+
 重要な点:
 
 - `verify_raw_note()` は **DB の `status` を信用せず、実ファイルを読み直して §13.7 を再実行する**（Daily ノートは AY-1 で条件から外れた。v5.47 で `verify_daily_note()` も削除した）
@@ -3574,13 +3703,14 @@ def can_delete_source(part, session, cfg, device) -> bool:
 - **コンテナはデバイスを読めない。**`target_is_identical()` がコンテナ側で参照するサイズ・更新時刻は
   Helper が `.meta.json` に記録した値であり、**実ファイルとの突き合わせは reaper が行う**（§14.1.1）
 - **削除の根拠は「音声のコピーが正しかったこと」ではなく「テキストが Vault に確実に残っていること」である。**原音のコピーを保持しない設計（§10.5）に合わせて、v3.0 の「staging 上のファイルからハッシュを再計算する」条件は廃止した
-- 処理できなかった Part（`FAILED` / `SKIPPED`）はノートの `voicedock_recording_keys` に載らないため、**自動的に削除対象から外れる**
+- 処理できなかった Part（`FAILED` / `SKIPPED`）はノートの `voicedock_recording_keys` に載らないため、**根拠 A からは自動的に外れる。**`SKIPPED` のうち `DELETABLE_SKIP_REASONS` の理由（無音・重複）のものだけが根拠 B で扱われ、`FAILED` と `SOURCE_MISSING` はどちらの根拠からも外れる
 - `all()` / `any()` を安全条件に使う場合は、**対象集合が空でないことを別条件として必ず明示する**（空集合の `all()` は真になるため。§14.1 では `session.parts` がこれに当たる）
 - **`_orig` 固定（§5.3）で削除対象は 1 ファイルになったが、`all()` を外しても「非空の明示」は消さない。**スカラーに退化した以上の危険は `NULL` / 空文字であり、`os.path.join(volume, "")` は**ボリュームのルートを指す。**上の 2 条件はそのための番犬である（v3.0 の欠陥 A-14 と同型）
 - **denoised はデバイスに残しても削除しない。**読まなかったファイルを消してよい根拠が無いためである（§5.3）
 - **`PART_DELETABLE` は §9.1 の「終端状態」（`PART_TERMINAL`）とは別集合である。**§9.1 の終端状態は
   `FAILED` / `SKIPPED` を**含む**（失敗した 1 本でその日の記録全体を止めないため。§1.3）が、
-  それらは**文字起こし本文が保存されていない**ので削除してはならない。v4.5 まで削除条件側を
+  それらは**文字起こし本文が保存されていない**ので**根拠 A で**削除してはならない
+  （`SKIPPED` の一部は根拠 B で別に扱う。`PART_DELETABLE` には入れない）。v4.5 まで削除条件側を
   `TERMINAL` という同じ名前で呼んでいた。**実装は `states.py` の `PART_TERMINAL`（6 件）と
   `PART_DELETABLE`（4 件）を使い分け、文字列を再掲しない**（`tests/unit/test_states.py` が
   包含関係と差を固定している）
@@ -3645,6 +3775,22 @@ def can_delete_source(part, session, cfg, device) -> bool:
 > 引く —— **キューが唯一の出所**であり、DB に `request_id` の列を足さない。`status` は `DELETED` か `SOURCE_IDENTITY_MISMATCH` の
 > どちらかで、`detail` は判定が落ちた理由（`size_mismatch` / `target_is_symlink` など）である。
 > **結果はコンテナが回収したら捨てる**（§10.12）。
+
+**要求を読む前に `request_id` 自身を検証する（v5.58 で追加）。**relpath（検証 4/9）と同じ発想で、
+`request_id` にも文字種の制約を課す —— 英数字と `-` / `_` だけを許す。`request_id` は
+`write_result()` と `state/processed.log` にそのままファイル名・ログ行として使われるため、
+検証を通す**前に**これらへ書いてはならない。
+
+- `request_id` が**空**、または**安全な文字種でない**（`/` や `..` を含む等）場合、
+  要求は**削除せず・`mark_processed()` も `write_result()` も呼ばず**、
+  `queue/rejected/` へ退避する（消し去らない。原因調査ができなくなるのを避けるため）
+- **v5.57 までは `warn` するだけで要求を残していた** —— そのため次の reaper 実行
+  （5 分ごと）でも同じ要求を読み、また `warn` する形が無期限に繰り返されていた
+- **`/` を許すと `write_result()` の書き込み先が `queue/result/` の外へ出うる**
+  （`request_id` がそのまま `<request_id>.json` というファイル名になるため）。
+  通常運用でこの値を書くのは `cleaner._request_id()`（固定形式）だけなので到達可能性は
+  低いが、§14.1.1 の他の検証項目と同じ「実行者は判断者を信用しない」という設計原則を
+  ここにも揃えた
 
 **reaper の検証（12 項目）。1 つでも偽なら削除せず、結果に `SOURCE_IDENTITY_MISMATCH` を書く。**
 
@@ -3970,6 +4116,8 @@ VoiceDock Container ──HTTP──> Docker Model Runner（ローカル）
 | `LOCAL_DELETE_FAILED` | 削除 | staging 削除 | 可（3 回） | Session は `CLEANUP` に留まる |
 | `DB_ERROR` | DB | 全般 | 可（3 回） | 現状態を維持 |
 
+> **`NO_SPEECH_DETECTED` と `DUPLICATE_CONTENT` の Part の元音声は、`cleanup.delete_skipped_source` が真なら削除されうる**（§14.1 根拠 B。v5.54 / v5.56）。遷移先は `SKIPPED` のままで変わらない。**`SOURCE_MISSING` の元音声は削除しない。**
+
 ### 15.2 リトライ方針
 
 ```yaml
@@ -4235,7 +4383,7 @@ $ voicedock cleanup --backlog --dry-run
 ```text
 $ voicedock status
 
-VoiceDock v1.0.0
+VoiceDock v1.1.0
 ────────────────────────────────────────────────────────
 Helper                : running   (last seen 42s ago, v5.5.0, mount=readOnly (MOUNT_MODE=ro))
 Devices connected     : 1  (DJIMIC3, readOnly)
@@ -4789,7 +4937,7 @@ VoiceDock doctor
 ────────────────────────────────────────────────────────
 [✓] Config file          /app/config/config.yaml
 [✓] Config validation    107 keys, 0 errors
-[✓] Database             /data/voicedock.db (schema v2, 261 recordings, 8 sessions, 2104 events, 4.1 MiB)
+[✓] Database             /data/voicedock.db (schema v3, 261 recordings, 8 sessions, 2104 events, 4.1 MiB)
 [✓] Data volume          /data writable, 58.1 GiB free
 [✓] Whisper executable   /usr/local/bin/whisper-cli (v1.9.4, VAD: supported)
 [✓] Whisper model        ggml-large-v3-turbo-q5_0.bin (574.0 MiB)
@@ -5022,7 +5170,7 @@ fixture の WAV は **実機と同じ 48 kHz / 24 bit PCM / モノラル**（144
 
 | 層 | 何を assert するか | 実行方法 |
 |---|---|---|
-| **コンテナ層**（ND-01〜ND-09、**ND-21、ND-30、ND-31、ND-32**） | §14.1 が偽のとき **`queue/delete/` に要求が 1 件も書かれない**こと | pytest。偽 inbox と偽 state を与える |
+| **コンテナ層**（ND-01〜ND-09、**ND-21、ND-30、ND-31、ND-32、ND-33、ND-34、ND-35**） | §14.1 が偽のとき **`queue/delete/` に要求が 1 件も書かれない**こと | pytest。偽 inbox と偽 state を与える |
 | **reaper 層**（ND-18〜ND-20、ND-24〜ND-29） | 偽装・改竄した要求を置いても **偽ボリューム上のファイルが消えない**こと | pytest から `subprocess.run(["bash", "helper/voicedock-reaper"], env=...)` |
 | **両層**（ND-22 / ND-23） | ロックが 1 つでも掛かっていれば削除されないこと | 両方 |
 
@@ -5040,10 +5188,10 @@ fixture の WAV は **実機と同じ 48 kHz / 24 bit PCM / モノラル**（144
 |---|---|---|---|
 | ND-01 | 変換中に I/O エラー | `part.status != RAW_SAVED` | 元音声が残る。部分出力が消える |
 | ND-02 | 変換結果の長さが入力と 1 秒以上ずれる | `NORMALIZE_VERIFY_FAILED` | 元音声が残る |
-| ND-03 | 内容が同一の重複ファイル | `SKIPPED`。ノートの ID 集合に載らない | 元音声が残る |
+| ND-03 | 内容が同一の重複ファイル（**`cleanup.delete_skipped_source: false`**） | `SKIPPED`。ノートの ID 集合に載らず、根拠 B のロックが偽 | 元音声が残る（**v5.56 から**。ロックを外し、双子の本文が根拠 A を満たせば §14.1 根拠 B で消える） |
 | ND-04 | Whisper 失敗（終了コード != 0） | `part.status != RAW_SAVED` | 元音声が残る |
 | ND-05 | Whisper タイムアウト | 同上 | 元音声が残る。プロセスが残らない |
-| ND-06 | 発話が検出されない | `SKIPPED`。Raw ノートに含まれない | 元音声が残る |
+| ND-06 | 発話が検出されない（**`cleanup.delete_skipped_source: false`**） | `SKIPPED`。Raw ノートに含まれず、根拠 B のロックが偽 | 元音声が残る（**v5.54 から**。ロックを外すと §14.1 根拠 B で消える） |
 | ND-07 | Raw ノート書き込み失敗 | `session.raw_output_path is None` | 元音声が残る |
 | ND-08 | Raw ノートを保存後に外部から削除 | `verify_raw_note` が偽 | 元音声が残る |
 | ND-09 | Raw ノートの `voicedock_recording_keys` に当該 Part が無い | 鍵の包含が偽 | 元音声が残る |
@@ -5063,6 +5211,9 @@ fixture の WAV は **実機と同じ 48 kHz / 24 bit PCM / モノラル**（144
 | **ND-30** | `state/` をコンテナから書き換えて `mount_readonly` を偽装しようとする | `/state` は `ro` マウント（§18.2） | 書き込み自体が失敗する |
 | **ND-31** | **ノートの `voicedock_recording_keys` に載っている鍵の `device_id` だけが対象と違う**（`NO NAME` などの同名衝突。§5.4）。フォルダ名以降は完全一致する | 鍵の包含が偽（`partkey` が `device_id` を含む） | **別デバイスの同名録音を消さない。**v5.0 までは整数 ID だったため、**この食い違いはノートを見ても分からなかった**（v5.1 で追加） |
 | **ND-32** | **Part transcript が無い / 壊れている** | `part_transcript_is_valid` が偽 | 元音声が残る。**テキストの 2 つ目のコピーが無い状態では消さない**（§14.1 / AY-1。v5.36 まで ND 番号もテストも無かった） |
+| **ND-33** | **`SOURCE_MISSING` の `SKIPPED`**（根拠 B のロックを外した状態） | `error_code not in DELETABLE_SKIP_REASONS` | 元音声が残る。**内容について何も観測していないものを「本文が無い」として扱わない**（§14.1 根拠 B / §7.5。v5.54 で追加） |
+| **ND-34** | **無音だが whisper の出力 JSON が無い / 壊れている**（根拠 B のロックを外した状態） | `part_transcript_is_valid` が偽 | 元音声が残る。**「本当に無音だったか」を後から確かめる手段が無い状態では消さない**（§14.1 根拠 B。v5.54 で追加） |
+| **ND-35** | **重複だが、双子の本文が Vault に確認できない**（根拠 B のロックを外した状態） | 双子の `text_is_preserved` が偽 | 元音声が残る。**このバイト列の本文が残っていることを言えるのは双子だけ**である（§14.1 根拠 B。v5.56 で追加） |
 
 このテスト群は CI で必ず実行し、**1 件でも失敗したらリリースしない。**
 
@@ -5251,7 +5402,7 @@ docker compose up -d        # config.yaml の再読み込み
 | R-14 | **DJI 本体の容量**（使用可能 30.0 GB。設定により 22〜58 時間） | 設定によっては 1.4 日で満杯になり録音が止まる | `status` に本体の残容量を表示する（Helper が `state/heartbeat.json` に書いた値の転記。§17.2）。**推定残り録音時間の算出は v5.0 で D-6 ごと廃止した**（`_orig` 固定で「Variant 数」の変数が消え、接続頻度は §5.1 の表で足りる）。**検証機の現設定（24 bit・`_orig` のみ）では 3.6 日分の余裕がある**が、32 bit float・両 Variant では 1.4 日しか持たない（§5.1）。**さらに v5.0 は denoised を削除しない**（§5.3）ため、denoised が生成される設定では本体が埋まり続ける。P0-13 で `_orig` 保存をオフにできるかを確認する |
 | R-15 | **無音区間の幻覚**（whisper が定型文を生成する既知の挙動）。**2026-09-14 に実測**（`docs/POC.md` §12.4）: VAD を切ると 26 分の音声で **178 区間中 170 が幻覚**になり（74 区間が「はい、ご視聴ありがとうございました。」）、**文字数が 3.4 倍・所要が 13.4 倍**になった | 要約に実在しない内容が混ざる。**性能にも直撃する** — `rtf 1.806` では 16 時間の録音に 29 時間かかり、§21.2 Phase 2 を満たせない | **VAD が前提条件である**（緩和策ではない）。`vad.enabled: false` は設定としては許すが **D-9 が警告する**（§19.2）。Raw ノートに原文が残るため検証は可能。プロンプトでも「存在しない事実を追加しない」を指示（§12.5） |
 | R-16 | **処理の遅延蓄積** | 1 日 32 Part の直列処理が追いつかないと未処理が溜まる | `status` に「未処理 Part の合計時間」を表示して可視化（§17.2）。閾値超過時は Whisper モデルを下げる。**R-4 の実測では 16 時間 → 6.95 時間で追いつく**が、**余裕は 13% しかない。**加えて**取り込み自体に 1 日分で約 11 分**かかる（`docs/POC.md` §10.5）。**`StartInterval` の 300 秒は超えるが壊れない** — ロックが直列化する |
-| R-17 | **失敗 Part を除外して進む設計** | 1 日のノートが一部欠けたまま確定する | 欠落を隠さず frontmatter（`voicedock_failed_parts` / `voicedock_skipped_parts`）と本文の警告行に明記する（§13.4）。欠落分の音声は削除されない。復旧後は再オープンで作り直される |
+| R-17 | **失敗 Part を除外して進む設計** | 1 日のノートが一部欠けたまま確定する | 欠落を隠さず frontmatter（`voicedock_failed_parts` / `voicedock_skipped_parts`）と本文の警告行に明記する（§13.4）。欠落分の音声は削除されない（**無音と重複は `delete_skipped_source` が真なら §14.1 根拠 B で削除されうる。**無音は whisper の出力 JSON が、重複は双子の本文が根拠になる）。復旧後は再オープンで作り直される |
 | R-18 | **Daily ノートの手動編集との競合** | ユーザーがノートを編集すると `output_sha256` が不一致になり、削除が止まる（安全側）。再オープン時には編集内容が上書きされる | 削除は止まるだけで害はない。編集を保持したい場合は別ノートへ切り出す運用とする。§23 で追記マージを検討 |
 | R-19 | **`/Volumes/Macintosh HD` が `/` への symlink**（実機で実在を確認） | `Path.parents` は字句的判定のため、パス封じ込めを擦り抜ける経路が理論上残る | §14.1.1 を `realpath` 解決後の判定へ改訂（**本版で対応済**）。§5.4 でボリュームルートが symlink なら走査対象から外す。ND-20 で検証 |
 | R-20 | **DJI 以外のマウント済みボリューム**（実機の `/Volumes` には `Macintosh HD` のほか、時期によって `PATLABOR`・`NO NAME` などが現れる） | 走査対象に混ざる。名前が回によって変わるため固定の除外リストでは守れない | §5.4 の判定（DJI 形式のフォルダ／ファイルの実在を要求）で除外されるはず。`device.exclude_volumes` の既定へ追加すべきかは **#2 で判断する** |
@@ -5283,7 +5434,97 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 ---
 
-## 付録 A. v5.52 から v5.53 への主な変更点
+## 付録 A. v5.57 から v5.58 への主な変更点
+
+**reaper が `request_id` の文字種を一度も検証していなかった**（2026-09-18。#186）。
+`relpath`（検証 4/9）と同じ発想を `request_id` にも揃えた。
+
+| # | 変更 | 理由 |
+|---|---|---|
+| BT-1 | **`request_id_is_safe()` を足し、要求を読む前に検証する**（§14.1.1） | `request_id` は `write_result()` と `state/processed.log` にそのままファイル名・ログ行として使われる。**`/` や `..` を許すと、結果の書き込み先が `queue/result/` の外へ出うる**。relpath と同じ「実行者は判断者を信用しない」原則をここにも揃えた |
+| BT-2 | **`request_id` が空 / 安全でない要求を `queue/rejected/` へ退避する**（§14.1.1） | v5.57 までは `warn` するだけで要求を残しており、**次の reaper 実行（5 分ごと）でも同じ要求を読み、また `warn` する形が無期限に繰り返されていた。**`mark_processed()` も `write_result()` も呼ばない ―― 信用できない値を processed.log や結果ファイル名に使わないため |
+
+> **到達可能性は低い。**通常運用で `request_id` を書くのは `cleaner._request_id()`
+> （固定形式: `<timestamp>-<16 進の slug>-<16 進の乱数>`）だけであり、これは新しい
+> 検証をそのまま通る。§14.1.1 の他の検証項目（relpath・partkey・size/mtime など）との
+> 一貫性のための変更である。
+
+---
+
+## 付録 B. v5.56 から v5.57 への主な変更点
+
+**実機（macOS）で `voicedock-reaper` の BRE alternation が常に無出力になることを確認した**
+（2026-09-18。#185）。CI コンテナの GNU sed では検出できない。
+
+| # | 変更 | 理由 |
+|---|---|---|
+| BS-1 | **`json_string_bool()` から BRE の alternation（`\|`）を無くす**（§14.2） | **`\|` は GNU sed の拡張であり、POSIX BRE にも macOS 同梱の BSD sed にも無い。**`heartbeat.json` の `mount_readonly` を読むこの関数は `\(true\|false\)` を使っており、実機では常に空文字列を返していた。**ロック 2-B の後段（heartbeat 側の確認）が実機では一度も効いていなかった。**`true` と `false` を別々の POSIX BRE（`\{0,1\}` は区間表現なので両方の sed が解釈する）で試す形に直した |
+
+> **実害は限定的である。**同じ検証の前段（`helper.conf` の `MOUNT_MODE=rw` かどうかの文字列比較）は
+> 生きているため、既定の `MOUNT_MODE=ro` では reaper は動かない。この後段が救うはずだったのは
+> 「利用者が手でボリュームを読み取り専用にしている」など、**設定値と実際のマウント状態が
+> 食い違う場面**だけである。
+>
+> **CI では再発を検出できない。**`test_nd23_a_readonly_heartbeat_stops_the_reaper` は
+> 元の実装でも GNU sed の下では通っていた。§20.1 の bash 3.2 互換検査と同じ発想で、
+> `tests/unit/test_helper_portability.py` に **GNU だけが解釈する BRE 拡張
+> （`\|` / `\+` / `\?`。`\{n,m\}` は POSIX BRE なので対象外）を静的に検出する検査**を足した。
+
+---
+
+## 付録 C. v5.55 から v5.56 への主な変更点
+
+| # | 変更 | 理由 |
+|---|---|---|
+| BR-1 | **`recordings.duplicate_of` を足す**（§8.2 / §10.5。`0003_duplicate_of.sql`） | 重複の Part は `sha256` を持てず（双子と同じ値を `idx_recordings_sha` が弾く）、**双子の `partkey` が `error_message` の文字列にしか無かった。**文字列を解析しないために、`audio.normalize()` が既に知っている値を列に書く |
+| BR-2 | **根拠 B に `DUPLICATE_CONTENT` を足す**（§14.1） | 重複は自分の本文を持たないが、**同じバイト列の本文は双子の側に在る。**`duplicate_of` で指名された双子に**根拠 A を当てる。**双子には同定を要求しない（双子の元音声は既に消えているのが通常） |
+| BR-3 | **理由ごとの根拠を `skip_reason_is_backed()` に分け、表に無い理由は偽にする**（§14.1） | 許可リストにだけ足して根拠を書き忘れても**消える側に倒れない。**その代わり振る舞いのテストでは落ちないので、分岐が在ることを tests が静的に固定する |
+| BR-4 | **ND-03 の前提を「根拠 B のロックが偽」に改め、ND-35 を足す**（§20.4） | ND-03 は「重複なら元音声が残る」だったが、v5.56 からはロックを外すと消える |
+
+> **`duplicate_of` が `NULL` の重複は消さない。**v5.55 以前に `SKIPPED` になった重複は
+> 双子を指名できない。実機の DB に `DUPLICATE_CONTENT` の行は 0 件だったので、
+> 埋め戻しは行わない。
+
+---
+
+## 付録 D. v5.54 から v5.55 への主な変更点
+
+| # | 変更 | 理由 |
+|---|---|---|
+| BQ-1 | **`inventory.generated_at` と結果の `completed_at` が同じ秒なら、inventory を判定に使わない**（§10.12） | どちらも秒の分解能で、**ingest は inventory を書いてから reaper を走らせる。**削除が 1 本だと同じ秒に終わるので、**削除前の走査を「結果より新しい」と読み、消えたファイルを `still_in_inventory` として保留へ落としていた。**再要求は `target_missing` で拒否され、**削除済みの記録が永久に入らない** |
+
+> **2026-09-17 21:28:37 に実機で踏んだ**（#179 の実機確認。根拠 B の 1 本）。events を遡ると、
+> **9/16 の E2E の `still_in_inventory` 6 件も同じ形**で、手で `cleanup --resolve-absent` していた。
+> 今朝の根拠 A の 4 件は、reaper の完了が次の秒にずれたので通っていた —— **競合で通ったり落ちたりする。**
+
+> **テストが欠陥を固定していた。**`gone()` の `generated_at` と `write_result()` の `completed_at` は
+> どちらも既定が `NOW` で、**同じ秒を「新しい」と読む実装を正しいものとして検証していた**（§20.5 の 1）。
+
+---
+
+## 付録 E. v5.53 から v5.54 への主な変更点
+
+| # | 変更 | 理由 |
+|---|---|---|
+| BP-1 | **§14.1 を「共通の同定 AND（根拠 A OR 根拠 B）」の形に分ける**（§14.1） | `SKIPPED` には根拠 A（テキストが 2 か所に在ること）が成立せず、**自動で消える経路が一切無かった。**根拠 A を緩めず、**「保全すべき本文が無い」を別の根拠として足す。**ロック・番犬・同定は**共通項に括り出し**、根拠 B から迂回できない形にした（tests が AST で式の形を固定する） |
+| BP-2 | **根拠 B を新設する。対象は `NO_SPEECH_DETECTED` だけ**（§14.1 / §7.2 `cleanup.delete_skipped_source`） | whisper が最後まで走って `min_chars` 未満を返したという観測であり、**その出力 JSON が無期限で残る。**`SOURCE_MISSING` は内容を観測していないので入れない（ND-33）。`DUPLICATE_CONTENT` は双子の本文を確かめる手段がまだ無いので入れない。**専用のロックを持ち、既定は `false`** |
+| BP-3 | **`SKIPPED` のまま削除する。状態遷移を使わない**（§9.1 / §9.3） | `record_transition()` は `error_code` を無条件に上書きするので、`SOURCE_DELETING` を経由させると `NO_SPEECH_DETECTED` が消え、**Daily ノートの「（無音）」表示と根拠 B の判定の両方が壊れる。**待ちは `delete_request_id`、決着は `source_deleted_at` が表す |
+| BP-4 | **根拠 B はセッションから独立した経路で評価する**（§10.0 `settle_skipped_deletions()`） | 早期完了の判定（`AWAITING_DELETION`）へ `SKIPPED` を入れると、**reaper が居ないときにセッションが永久に完了できない**（BG-3 の形）。この経路はセッションを動かさないので、**最悪の失敗は「消えない」** |
+| BP-5 | **`part_transcript_is_valid()` は `transcript_path` 列を見ない。無音の Part にも列を書く**（§14.1 / §10.6） | 無音の Part は**ファイルが在るのに列が `NULL`** で、DB がディスクと食い違っていた。根拠 A は列の条件を別に持つので振る舞いは変わらない |
+| BP-6 | **ND-06 の前提を「根拠 B のロックが偽」に改め、ND-33 / ND-34 を足す**（§20.4） | ND-06 は「無音なら元音声が残る」だったが、v5.54 からはロックを外すと消える。**表の上限を tests に直書きしていた**（`range(1, 33)`）ので、表の行から引く形に直した |
+
+> **結果の回収だけは、デバイスに無いものも対象にする。**要求を出す候補は `inventory.json` に
+> 載っているものに絞る（`SKIPPED` は増え続けるので全件は見ない）が、**同じ絞り込みを回収にも
+> 掛けていた版では、reaper が消した瞬間に対象から外れ、`source_deleted_at` が永久に入らなかった。**
+> 実装中に往復のテストで見つかった。
+
+> **承知している危険**: 根拠は whisper の判定そのものである。2026-09-15 には
+> **30 分ちょうどで 0 文字**の `NO_SPEECH_DETECTED` が出ている（E2E の削除試験で残った MIC006）。
+> 音量などの独立した裏取りは要求しない（利用者の判断）。そのため既定を `false` にした。
+
+---
+
+## 付録 F. v5.52 から v5.53 への主な変更点
 
 | # | 変更 | 理由 |
 |---|---|---|
@@ -5305,7 +5546,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 ---
 
-## 付録 B. v5.51 から v5.52 への主な変更点
+## 付録 G. v5.51 から v5.52 への主な変更点
 
 | # | 変更 | 理由 |
 |---|---|---|
@@ -5321,7 +5562,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 ---
 
-## 付録 C. v5.50 から v5.51 への主な変更点
+## 付録 H. v5.50 から v5.51 への主な変更点
 
 | # | 変更 | 理由 |
 |---|---|---|
@@ -5340,7 +5581,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 ---
 
-## 付録 D. v5.49 から v5.50 への主な変更点
+## 付録 I. v5.49 から v5.50 への主な変更点
 
 | # | 変更 | 理由 |
 |---|---|---|
@@ -5358,7 +5599,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 ---
 
-## 付録 E. v5.48 から v5.49 への主な変更点
+## 付録 J. v5.48 から v5.49 への主な変更点
 
 **全体コードレビューの S3/S4 のうち、生成経路と時刻の 4 件。**
 **どれも「2 か所に書いた同じことが、片方だけずれる」形である。**
@@ -5372,7 +5613,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 ---
 
-## 付録 F. v5.47 から v5.48 への主な変更点
+## 付録 K. v5.47 から v5.48 への主な変更点
 
 **全体コードレビューの S3/S4 のうち、「設定が受理されるのに効かない / 矛盾した設定を受理する」3 件。**
 
@@ -5387,7 +5628,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 ---
 
-## 付録 G. v5.46 から v5.47 への主な変更点
+## 付録 L. v5.46 から v5.47 への主な変更点
 
 **全体コードレビューの S3/S4 のうち、削除の根拠にかかわる 3 件。**
 
@@ -5402,7 +5643,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 ---
 
-## 付録 H. v5.45 から v5.46 への主な変更点
+## 付録 M. v5.45 から v5.46 への主な変更点
 
 **全体コードレビュー（`src/` + `helper/`）で見つかった致命的 2 件と停止 3 件。**
 **#161（v5.45 / 変更 BG-2）は実機検証の後にマージしたので、誰も踏んでいなかった。**
@@ -5428,7 +5669,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 ---
 
-## 付録 I. v5.44 から v5.45 への主な変更点
+## 付録 N. v5.44 から v5.45 への主な変更点
 
 **回収されない結果が残り、古い結果が新しい要求に適用されうる状態だった**
 （2026-09-16。#38 のマージ後の確認で判明。#160）。
@@ -5462,7 +5703,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > **塞ぎすぎない。**`RAW_SAVED` の Part が居て §14.1 が偽（ノートの検証が通っていない等）
 > なら**待ち続ける** —— それは真になりうる。
 
-## 付録 J. v5.43 から v5.44 への主な変更点
+## 付録 O. v5.43 から v5.44 への主な変更点
 
 **Phase 7 の後追い削除に入口が無かった**（#38）。
 
@@ -5486,7 +5727,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > 削除を有効にした。**ゲートは緩めない** ——「守らなかったから条件を下げる」を認めると
 > 次も同じことが起きる。**根拠のほうを実態に合わせるのは順序が逆である。**
 
-## 付録 K. v5.42 から v5.43 への主な変更点
+## 付録 P. v5.42 から v5.43 への主な変更点
 
 **削除に成功したのに「保留」として記録されていた**（2026-09-16 実機。削除が初めて
 成立した直後に判明。#156）。
@@ -5506,7 +5747,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > ときに「消えた」ことにはしない。歯止めは `delete_result_timeout_seconds` のままで、
 > **新しい上限を足さない。**
 
-## 付録 L. v5.41 から v5.42 への主な変更点
+## 付録 Q. v5.41 から v5.42 への主な変更点
 
 **削除の再評価を回すものが無く、再試行しようとすると例外で止まっていた**
 （2026-09-16 実機。#154）。
@@ -5527,7 +5768,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > **実機では新しい Part が届くたびに再オープンされて `MERGING → … → SAVED` を
 > 通り直していたので動いて見えていた。**Part が尽きた瞬間に止まる。
 
-## 付録 M. v5.40 から v5.41 への主な変更点
+## 付録 R. v5.40 から v5.41 への主な変更点
 
 **削除が一度も成立しない状態だった**（2026-09-15 実機。三重ロックを全部外して 1 本流して判明。#151 / #152）。
 
@@ -5557,7 +5798,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > **reaper の失敗で取り込みを落とさない。**取り込みは記録の保全、削除は容量の解放で
 > あり、優先順位が違う（§1.3）。ただし `reaper_failed exit=N` を出す。
 
-## 付録 N. v5.39 から v5.40 への主な変更点
+## 付録 S. v5.39 から v5.40 への主な変更点
 
 **デバイスが接続されていないのに「書き込み可能」と表示していた**（2026-09-15。#148）。
 
@@ -5579,7 +5820,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > **#107 と同じ型が 1 つ残っていた。**あのとき `None` を `writable` に丸めないように
 > したが、**「0 台のときの `false`」という 2 つ目の「値が無い」**を見落としていた。
 
-## 付録 O. v5.38 から v5.39 への主な変更点
+## 付録 T. v5.38 から v5.39 への主な変更点
 
 **三重ロックの解除を 1 つずつ手で直させないようにした**（#39）。
 
@@ -5600,7 +5841,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 > **戻せることが要る。**戻せない変更は怖くて実行できない。
 
-## 付録 P. v5.37 から v5.38 への主な変更点
+## 付録 U. v5.37 から v5.38 への主な変更点
 
 **安全ロック 1 だけを解除するとセッションが永久に止まっていた**（2026-09-15。#145）。
 
@@ -5627,7 +5868,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > **`SOURCE_DELETE_PENDING` にはしない。**あれは「要求を出したが結果が来ない」状態であり
 > （§10.12）、**要求を出していない今回とは別物**である。
 
-## 付録 Q. v5.36 から v5.37 への主な変更点
+## 付録 V. v5.36 から v5.37 への主な変更点
 
 **削除の契機を「要約の後」から「その Part の文字起こし本文が Vault に載った時点」へ移した**
 （2026-09-15。#143）。
@@ -5654,7 +5895,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 
 > **三重ロックの既定値は 1 つも変えていない**（#39 は別の判断である）。
 
-## 付録 R. v5.35 から v5.36 への主な変更点
+## 付録 W. v5.35 から v5.36 への主な変更点
 
 **ノートの警告行が、`SKIPPED` にも「自動で再試行されます」と約束していた**
 （2026-09-15 実機。#140）。
@@ -5679,7 +5920,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > 生む試験だった。**#108 / #131 / #133 / #134 と同じ型である —— 表示が、自分の知っている
 > 以上のことを主張していた。
 
-## 付録 S. v5.34 から v5.35 への主な変更点
+## 付録 X. v5.34 から v5.35 への主な変更点
 
 **`WHISPER_FAILED` の `error_message` が whisper のヘルプ全文になり、原因を隠していた**
 （2026-09-15 実機。#135）。
@@ -5706,7 +5947,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > **イベント名を増やさない。**§16.4 の原則に従い `normalize_failed` + `reason=input`
 > で表す。遷移は `NORMALIZING → FAILED` であり、§15.1 の区分も「音声」である。
 
-## 付録 T. v5.33 から v5.34 への主な変更点
+## 付録 Y. v5.33 から v5.34 への主な変更点
 
 **Vault が消えても検知できず、幻の Vault へ書き続けていた**（2026-09-15 実機。#134）。
 
@@ -5732,7 +5973,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > **`vault_marker: ""` で無効化できる** — Obsidian は Vault ごとに設定フォルダ名を
 > 変更できるため、**誤検知でパイプラインが止まる方が害が大きい。**
 
-## 付録 U. v5.32 から v5.33 への主な変更点
+## 付録 Z. v5.32 から v5.33 への主な変更点
 
 **`FAILED` の Part の 16 kHz 音声まで消しており、恒久的に復旧不能になっていた**
 （2026-09-15 実機。#133）。
@@ -5752,7 +5993,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > **記録そのものは失われない。**デバイス側の `_orig` は無傷であり、§14.1 の削除条件も
 > `PART_DELETABLE` に `FAILED` を含めていないので働かない。**失われるのは復旧手段である。**
 
-## 付録 V. v5.31 から v5.32 への主な変更点
+## 付録 AA. v5.31 から v5.32 への主な変更点
 
 **完成済みのセッションに入った Part が失敗しても、ノートが作り直されなかった**
 （2026-09-15 実機。#131）。
@@ -5771,7 +6012,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > 統合してしまう。**`RAW_SAVED` / `FAILED` / `SKIPPED` はいずれも、その Part の行き先が
 > 決まった時点**である。
 
-## 付録 W. v5.30 から v5.31 への主な変更点
+## 付録 AB. v5.30 から v5.31 への主な変更点
 
 **README を clone から通したら、名乗っている件数が実装と食い違っていた**
 （2026-09-15。#40）。
@@ -5787,7 +6028,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > **Phase 7 の前提の参照先が §21.1 になっていた**（正しくは §21.2）。§21.1 は初回セットアップ、
 > Phase の受け入れ条件は §21.2 である。README と §17.1 の両方で誤っていた。
 
-## 付録 X. v5.29 から v5.30 への主な変更点
+## 付録 AC. v5.29 から v5.30 への主な変更点
 
 **MVP 完成条件の達成状況を実測で埋めた**（2026-09-15。#40）。**25 項目中 23 が達成済み。**
 
@@ -5805,7 +6046,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > `rtf 0.5` を割っており（最悪 0.724）、**素材によっては超える。**
 > **「PASS だが余裕は小さい」が正確な記述である。**
 
-## 付録 Y. v5.28 から v5.29 への主な変更点
+## 付録 AD. v5.28 から v5.29 への主な変更点
 
 **通っているのに何も試していないテストが、実際に何度も紛れ込んだ**
 （2026-09-14〜15 の実機作業で 7 つの形を踏んだ）。
@@ -5818,7 +6059,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > **「通ってしまった」を放置しない**のが §20.6 の要点である。
 > **それはテストが空振りしているということである。**
 
-## 付録 Z. v5.27 から v5.28 への主な変更点
+## 付録 AE. v5.27 から v5.28 への主な変更点
 
 **`status` が、二度と処理されないファイルを `pending` と報告し続けていた**
 （2026-09-15 実機。#120）。
@@ -5836,7 +6077,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > **行き先を「`status` が見る」としていた。その `status` が正しく見ていなかった**のが
 > 今回の発見である。**欠番は欠番のまま残し、D-20 として足した。**
 
-## 付録 AA. v5.26 から v5.27 への主な変更点
+## 付録 AF. v5.26 から v5.27 への主な変更点
 
 **16 時間の終日運用と電池切れは、専用の試験を組まず通常運用の中で確認する**
 （2026-09-15 の判断。#125）。
@@ -5853,7 +6094,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 >
 > **順序を逆にしてはならない** — 消してしまった録音は戻らない（§1.3）。
 
-## 付録 AB. v5.25 から v5.26 への主な変更点
+## 付録 AG. v5.25 から v5.26 への主な変更点
 
 **工程内リトライが Part に対して一度も実行されていなかった**（2026-09-15 実機。#123）。
 
@@ -5872,7 +6113,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > `restart: unless-stopped` で落ちなければ**いつまでも止まったまま**で、
 > **症状は「何も起きない」**（§22 R-23）。
 
-## 付録 AC. v5.24 から v5.25 への主な変更点
+## 付録 AH. v5.24 から v5.25 への主な変更点
 
 **E2E-02 が試験になっていなかった**（2026-09-14 に実施して判明）。
 
@@ -5888,7 +6129,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > `COMPLETED` なので二度と処理されないが、`voicedock status` は
 > **`Inbox : 1 parts pending`** と報告し続けた。`Backlog : 未処理なし` と同時に出る。
 
-## 付録 AD. v5.23 から v5.24 への主な変更点
+## 付録 AI. v5.23 から v5.24 への主な変更点
 
 **動いている Helper を「死んだ」と報告していた**（#117。P0-15 の見積もりから判明）。
 
@@ -5910,7 +6151,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > （ロック 2-B は `mount_readonly == false` で開く）。#107 で直した
 > 「試行の成否から書く」誤りを再導入しないこと — **観測から書く。**
 
-## 付録 AE. v5.22 から v5.23 への主な変更点
+## 付録 AJ. v5.22 から v5.23 への主な変更点
 
 **P0-15 は 64 ファイルを用意しなくても測れた**（2026-09-14）。分解すれば、
 ファイル数に依存するのはスキャンだけだからである。
@@ -5933,7 +6174,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > コンテナは**動いている helper を死んだと判定してパイプラインを止める。**
 > **閾値を上げても解決しない**（必要な大きさが溜まったバイト数に依存する）。
 
-## 付録 AF. v5.21 から v5.22 への主な変更点
+## 付録 AK. v5.21 から v5.22 への主な変更点
 
 **P0-11 を実施したら、判定の前提そのものが違っていた**（2026-09-14 実機）。
 
@@ -5951,7 +6192,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > ずつ確認する。**64 ファイルでも合計 `STABILITY_INTERVAL_SECONDS × STABILITY_CHECKS`（既定 6 秒）**
 > である（P0-15 の見積もりに効く）。
 
-## 付録 AG. v5.20 から v5.21 への主な変更点
+## 付録 AL. v5.20 から v5.21 への主な変更点
 
 **送信機 2 台の実機検証を断念し、MVP を 1 台前提と定めた**（2026-09-14。機材が用意できない）。
 
@@ -5964,7 +6205,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > v5.20 までは「P0-1〜P0-7, P0-9〜P0-15 がすべて PASS」と書いており、
 > **任意の項目まで必須に読めた。**
 
-## 付録 AH. v5.19 から v5.20 への主な変更点
+## 付録 AM. v5.19 から v5.20 への主な変更点
 
 **タグ 5 個の超過で 3 時間 47 分ぶんの解析が失われた**（2026-09-14 実機。#112）。
 
@@ -5985,7 +6226,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > `sessions.error_message` を直接読むまで何が起きたか分からず、
 > **この不具合の診断に SQLite を開く必要があった。**
 
-## 付録 AI. v5.18 から v5.19 への主な変更点
+## 付録 AN. v5.18 から v5.19 への主な変更点
 
 **再オープンしても LLM 解析がやり直されていなかった**（2026-09-14 実機。#108）。
 8 Part・3 時間 47 分と書かれたノートの本文が、**2 Part・56 分ぶんのままだった。**
@@ -6008,7 +6249,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > §1.3 の優先順位 1（記録の保護）は守られていた。壊れていたのは Daily ノートだけである。
 > **この非対称（Raw は毎回・解析はキャッシュ）が食い違いを生んだ。**
 
-## 付録 AJ. v5.17 から v5.18 への主な変更点
+## 付録 AO. v5.17 から v5.18 への主な変更点
 
 **報告された保護状態が実態と合っていなかった**（2026-09-14 実機。#107）。
 デバイスは読み取り専用のままなのに、`mount_readonly: false` を 10 分間報告していた。
@@ -6024,7 +6265,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > Helper が値を書けなかったことと、デバイスが書き込み可能であることは別の事実であり、
 > **後者は §14.2 のロック 2-B を開ける。**
 
-## 付録 AK. v5.16 から v5.17 への主な変更点
+## 付録 AP. v5.16 から v5.17 への主な変更点
 
 **性能を実機で測った**（2026-09-14。30 分級の Part 2 本。`docs/POC.md` §12.3 / §12.4）。
 **VAD を切ると破滅的である**ことが数字で出た。
@@ -6039,7 +6280,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > 比較計測などに要る。**ただし黙っては通さない** — 「遅い」だけでなく
 > **嘘の記録が Vault に残る**ためである（§1.3 の優先順位 1）。
 
-## 付録 AL. v5.15 から v5.16 への主な変更点
+## 付録 AQ. v5.15 から v5.16 への主な変更点
 
 **heartbeat の鮮度の閾値が、Helper の書き込み間隔と同じ値だった。**5 分ごとに
 `helper_heartbeat_stale` が出て、そのたび取り込みを見送っていた（2026-09-14 に実機で確認。#104）。
@@ -6054,7 +6295,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > そして **§19.1 H-8 が同じ閾値を使う**ため、`interval: 120s` / `retries: 3` の
 > healthcheck が境界で振れうることである。
 
-## 付録 AM. v5.14 から v5.15 への主な変更点
+## 付録 AR. v5.14 から v5.15 への主な変更点
 
 **Daily ノートに、本人が言っていないことが書かれていた。**20 秒・79 文字の文字起こしから
 `key_points` が 19 項目生成された（2026-09-14 に実機で確認。#98）。
@@ -6070,7 +6311,7 @@ MVP 完成後に検討する。**すべて Core Pipeline とは分離して実�
 > **上限そのものは捨てていない。**`max_length` として検証し、超過したら §12.3 の修復が走る。
 > 修復プロンプトは `{errors}` を渡すので、そこで件数の上限が伝わる。
 
-## 付録 AN. v5.13 から v5.14 への主な変更点
+## 付録 AS. v5.13 から v5.14 への主な変更点
 
 **Helper の配備方式が変わった。**LaunchAgent がシェルスクリプトを直接起動すると
 macOS の TCC でデバイスを読めず、**録音が 1 本も取り込まれない**（2026-09-14 に実機で確認。#95）。
@@ -6087,7 +6328,7 @@ macOS の TCC でデバイスを読めず、**録音が 1 本も取り込まれ�
 > **付録のレターが `Z` で尽きた。**本版から 2 文字へ繰り下がる（`付録 AA` が参考資料）。
 > 変更記号の 2 文字化（`AA-*` / `AB-*`）とは別の話である。
 
-## 付録 AO. v5.12 から v5.13 への主な変更点
+## 付録 AT. v5.12 から v5.13 への主な変更点
 
 **実機で踏んだ 1 件。**`fetch-models.sh` で 574 MB の Whisper モデルを取得したのに、
 コンテナは**空の volume** をマウントしていた（2026-09-14 / #95）。
@@ -6099,7 +6340,7 @@ macOS の TCC でデバイスを読めず、**録音が 1 本も取り込まれ�
 > **変更記号が `Z` で尽きたので 2 文字にした**（`AA-*`）。`V` / `W` を飛ばした理由は
 > v5.9→v5.10 の変更の註記にある。
 
-## 付録 AP. v5.11 から v5.12 への主な変更点
+## 付録 AU. v5.11 から v5.12 への主な変更点
 
 **実機で踏んだ 1 件。**DJI Mic 3 を接続したのに `volume_skipped reason=no DJI recordings` が
 出続けた。実際は macOS の TCC がボリュームの列挙を拒んでいた（2026-09-14 / #3）。
@@ -6117,7 +6358,7 @@ macOS の TCC でデバイスを読めず、**録音が 1 本も取り込まれ�
 > **変更記号は `Z` で尽きる。**次の版からは `AA-*` `AB-*` … と 2 文字にする。
 > `V` / `W` を飛ばした理由は v5.9→v5.10 の変更の註記にある。
 
-## 付録 AQ. v5.10 から v5.11 への主な変更点
+## 付録 AV. v5.10 から v5.11 への主な変更点
 
 **実機手順の正本がどこにも定められていなかった。**そのため手順が GitHub issue の本文に
 置かれ、**v5.0 で削除したサブコマンドを呼び続けたまま腐っていた**（#93）。
@@ -6130,7 +6371,7 @@ macOS の TCC でデバイスを読めず、**録音が 1 本も取り込まれ�
 > 正本がリポジトリに在れば `tests/unit/test_runbook.py` が
 > **手順に現れる `voicedock <サブコマンド>` の実在**と、**§20.3 との 1 対 1** を固定できる。
 
-## 付録 AR. v5.9 から v5.10 への主な変更点
+## 付録 AW. v5.9 から v5.10 への主な変更点
 
 **削除結果の形式がどこにも書かれていなかった。**#54 で reaper が結果を書くように
 なり、コンテナ側の回収（§10.12）を実装して顕在化した。
@@ -6147,7 +6388,7 @@ macOS の TCC でデバイスを読めず、**録音が 1 本も取り込まれ�
 > 初めて `COMPLETED` にする。**この設計は v4.0 から変わっていないが、実装が入るまで
 > 「結果に何が載るか」が曖昧だった。
 
-## 付録 AS. v5.8 から v5.9 への主な変更点
+## 付録 AX. v5.8 から v5.9 への主な変更点
 
 **#36 / #37 の実装で、削除まわりの記述に 3 つの穴が見つかった。**
 
@@ -6163,7 +6404,7 @@ macOS の TCC でデバイスを読めず、**録音が 1 本も取り込まれ�
 > （`tests/unit/test_no_delete.py::test_the_watchdog_terms_are_present_in_the_formula`）。
 > **消したくなったら本節を先に直すこと。**
 
-## 付録 AT. v5.7 から v5.8 への主な変更点
+## 付録 AY. v5.7 から v5.8 への主な変更点
 
 **§10.4 と §9.3 が再オープンの契機で食い違っていた**うえ、**上限超過の行き先が
 どこにも書かれていなかった。**#31 の実装で顕在化した。
@@ -6183,7 +6424,7 @@ macOS の TCC でデバイスを読めず、**録音が 1 本も取り込まれ�
 > **「1 日 1 枚」は上限に達しない限り成り立つ** — §10.4 の但し書きのとおり、日境界で
 > 切れるので通常は到達しない。
 
-## 付録 AU. v5.6 から v5.7 への主な変更点
+## 付録 AZ. v5.6 から v5.7 への主な変更点
 
 **§9.3 と §15.2 が `retry_count` の増やし方で食い違っていた。**#32 の実装で顕在化した。
 
@@ -6195,7 +6436,7 @@ macOS の TCC でデバイスを読めず、**録音が 1 本も取り込まれ�
 > `retry_count == 3` になり `< max_attempts` が偽になって止まる（**ちょうど 3 回試す**）。
 > リトライ側で数えると 4 回試す。§15.2 の「`max_attempts`（既定 3）回」に合うのは前者である。
 
-## 付録 AV. v5.5 から v5.6 への主な変更点
+## 付録 BA. v5.5 から v5.6 への主な変更点
 
 **Daily ノートを実際に生成して分かった 1 件を直した。**
 
@@ -6209,7 +6450,7 @@ macOS の TCC でデバイスを読めず、**録音が 1 本も取り込まれ�
 > 単体テストは代替経路と Map 経路の両方を個別に通しており、**繋いだときにどちらが
 > 選ばれるかを見ていなかった。**
 
-## 付録 AW. v5.4 から v5.5 への主な変更点
+## 付録 BB. v5.4 から v5.5 への主な変更点
 
 **§12.4 が宿題にしていた「多段 Reduce の束ね方と上限」を規定した。**#26 の実装で
 必要になったもので、**規定が無いまま書くと実装ごとに畳み方が変わる。**
@@ -6222,7 +6463,7 @@ macOS の TCC でデバイスを読めず、**録音が 1 本も取り込まれ�
 > （記録の保護）より下であり、**Raw ノートは既に保存されている。**最後の束だけを残して
 > 打ち切り、`llm_failed` に `reason=reduce_depth_exceeded` を出す。
 
-## 付録 AX. v5.3 から v5.4 への主な変更点
+## 付録 BC. v5.3 から v5.4 への主な変更点
 
 **本書が実装に追いついていなかった箇所を直した。**#17 / #18 / #20 / #24 / #25 / #29 / #33 の
 9 本を実装する過程で見つかったもので、**どれも「削ったものの参照が残った」か
@@ -6241,7 +6482,7 @@ macOS の TCC でデバイスを読めず、**録音が 1 本も取り込まれ�
 > **文書と実装の食い違いは、気づいた時に直すだけでは次に同じ場所で起きる。**
 > 機械が見る形にして初めて止まる。
 
-## 付録 AY. v5.2 から v5.3 への主な変更点
+## 付録 BD. v5.2 から v5.3 への主な変更点
 
 **本文とログ規約の不整合を解消した。**v5.0 で §16.4 のイベント名を 68 件から 28 件へ削ったとき、
 **本文（§9.3 / §10.2 / §10.5）が出力を指示している 2 つの名前が一覧から落ちた。**`log.py` は
@@ -6260,7 +6501,7 @@ macOS の TCC でデバイスを読めず、**録音が 1 本も取り込まれ�
 > **「件数のずれ」（中リスク）に当たる** — 実装者は本文の指示どおり書き、その時点で初めて落ちる。
 > O-5 の検査は、同じことが次に起きたときに**書く前に落とす**ためにある。
 
-## 付録 AZ. v5.1 から v5.2 への主な変更点
+## 付録 BE. v5.1 から v5.2 への主な変更点
 
 **ホスト側 Helper（`voicedock-ingest`）を実装した**（#53 / T-49）。**これが入るまで `/inbox` には
 何も入らず、録音は 1 本も取り込まれなかった。**実装の過程で仕様の穴 3 つが出たので合わせて埋めた。
@@ -6277,7 +6518,7 @@ macOS の TCC でデバイスを読めず、**録音が 1 本も取り込まれ�
 | N-5 | **排他の奪取規則を §10.1 に明記** | 「`mkdir` で代用する」だけでは、**ingest が途中で落ちたときロックが残って永久に 1 本も取り込まれない**（§22 R-23 と同じ形で、症状は「何も起きない」）。「生きていない PID なら奪う」でクラッシュを即回復し、「6 時間」で PID の再利用とハングの両方に歯止めをかける |
 | N-6 | **検証 2 の `/Users` 条件を Darwin 限定に。DH-13 に設置場所の一致を追加**（§7.4, §19.2） | `/Users` 条件は **Docker Desktop for Mac の VirtioFS が理由**であり、Linux（テストコンテナ・CI）には `/Users` も VirtioFS も無い。**根拠が無い環境で条件を課すと検査そのものが動かせなくなる。**一方「conf の `VOICEDOCK_HOME` と実際の設置場所の食い違い」は heartbeat を誰も見ない場所へ書かせる実害があるので、ホスト側の DH-13 で見る（ingest では検査しない — 検証の番号と件数を増やさない） |
 
-## 付録 BA. v5.0 から v5.1 への主な変更点
+## 付録 BF. v5.0 から v5.1 への主な変更点
 
 **識別子を整数の連番から自然キーへ移した。**根拠と実測は `docs/STORE.md`（#60 / T-52）にある。
 **§14.1 の論理式・§14.1.1 の検証・§14.2 の三重ロックの設計思想は変えていない**
@@ -6302,7 +6543,7 @@ macOS の TCC でデバイスを読めず、**録音が 1 本も取り込まれ�
 | M-7 | **ファイル名に使う鍵は `key_slug()` を通す**（§10.5, §10.6, §11.2, §8.2, §8.3） | `device_id` は Volume 名なので空白や任意文字を含みうる（`NO NAME` / `Macintosh HD`）し、`session_key` は `:` を含む。sanitize は衝突しうるので使わず `sha256(key)[:16]` にした。**slug は識別子ではなく派生値である**（正は `partkey`）。**衝突は確率で片付けず、§10.5 に「既存の `staging/<slug>/` の `partkey` が自分と一致すること」の確認を置いた** — 衝突したまま進むと別 Part の音声を自分のものとして文字起こしし、その結果で §14.1 が真になる |
 | M-8 | **frontmatter を `voicedock_recording_keys` へ改名し `voicedock_session_id` を削除**（§13.3, §13.4, §13.7） | **改名するのは、古い形式のノートが R-6 / W-7 を黙って通らないようにするため。**32 Part の日で frontmatter が約 2.4 KB 増える（Daily ノート全体は約 12.8 KB）が、**frontmatter は「何を消してよいか」の唯一の根拠である**（§14.1）。`voicedock_session_id` は Session に整数 ID が無くなったので消えた |
 
-## 付録 BB. v4.6 から v5.0 への主な変更点
+## 付録 BG. v4.6 から v5.0 への主な変更点
 
 **本筋は「USB 接続 → 文字起こし → LLM 要約 → Obsidian へ 2 枚のノート → 元音声を削除」である。**
 v5.0 はこの筋に必須でない付属機能と、v3.x から残っていた残骸を落とした。
@@ -6327,7 +6568,7 @@ v5.0 はこの筋に必須でない付属機能と、v3.x から残っていた�
 | L-6 | **ログのイベント名を 68 件から 28 件へ**（§16.2, §16.4） | 原則を「1 工程につき完了 1 件 + 失敗 1 件。開始イベントは出さない。状態遷移は `events` テーブルが持つのでログに二重で並べない」と明文化し、細かい分岐は `reason=` / `error_code=` のフィールドへ移した。**うち 9 件（`device_*` 5 件・`deep_scan_*` 3 件・`file_not_stable`）は純粋な v3.x の残骸**で、v4.0 で検出が、v4.1 で走査が Helper へ移ったのに一覧だけ更新されていなかった。**コンテナはデバイスを見ないので、これらを出せるコードは書けない**（§11.1 の `DevicePath`） |
 | L-7 | **スキーマは変えない**（§8.2, §8.3） | `*_denoised` 5 列・`primary_variant`・`auto_retry_rounds` は v5.0 で使わなくなったが、**列は残して「常に NULL / 0」と注記した。**理由は §8.5 が破壊的変更を禁じており（`recordings.id` の同一性に削除可否を賭けているため）、いま列を落とすには `0001_initial.sql` の書き直しが要る。**ストア方式（SQLite かファイルか）を T-52 で決める前に書き直すと、二度作ることになる。**#16（Part 登録）に着手する前に T-52 を決め、そのときに 1 回だけ作り直す |
 
-## 付録 BC. v4.5 から v4.6 への主な変更点
+## 付録 BH. v4.5 から v4.6 への主な変更点
 
 v4.6 は、**状態機械の内部整合を取る**改訂である。SPEC を parse して図と表を突き合わせた
 結果として見つかった食い違いを直した。**§14.1 の論理式そのものは変えていない**（参照する
@@ -6342,7 +6583,7 @@ v4.6 は、**状態機械の内部整合を取る**改訂である。SPEC を pa
 
 ---
 
-## 付録 BD. v4.4 から v4.5 への主な変更点
+## 付録 BI. v4.4 から v4.5 への主な変更点
 
 v4.5 は、**スキーマ v1 を確定させる**改訂である。§8.5 が破壊的変更を禁じているため、
 **v1 に入れ損ねた制約は後から安全に足せない。**§14 の削除設計には触れていない。
@@ -6354,7 +6595,7 @@ v4.5 は、**スキーマ v1 を確定させる**改訂である。§8.5 が破�
 
 ---
 
-## 付録 BE. v4.3 から v4.4 への主な変更点
+## 付録 BJ. v4.3 から v4.4 への主な変更点
 
 v4.4 は、**テスト fixture の形式と組み立て方式を実測へ合わせる**改訂である。
 **規則そのものは 1 つも変えていない。**変更範囲はテスト仕様だけである。
@@ -6368,7 +6609,7 @@ v4.4 は、**テスト fixture の形式と組み立て方式を実測へ合わ�
 
 ---
 
-## 付録 BF. v4.2 から v4.3 への主な変更点
+## 付録 BK. v4.2 から v4.3 への主な変更点
 
 v4.3 は、**パス封じ込めの API を本文へ明記する**改訂である。実装が §14.1.1 のコードを
 各モジュールでインライン展開する余地を消すことが目的で、**規則そのものは 1 つも変えていない。**
@@ -6383,7 +6624,7 @@ v4.3 は、**パス封じ込めの API を本文へ明記する**改訂である
 
 ---
 
-## 付録 BG. v4.1 から v4.2 への主な変更点
+## 付録 BL. v4.1 から v4.2 への主な変更点
 
 v4.2 は、**§7.3 の検証規則を実装可能な形へ整え、Helper からコンテナへの報告形式を明文化する**
 改訂である。**§14 の削除設計には一切触れていない。**
@@ -6402,7 +6643,7 @@ v4.2 は、**§7.3 の検証規則を実装可能な形へ整え、Helper から
 
 ---
 
-## 付録 BH. v4.0 から v4.1 への主な変更点
+## 付録 BM. v4.0 から v4.1 への主な変更点
 
 v4.1 は、**走査対象の許可リストを追加し、あわせて v4.0 が残した設定の積み残しを解消する**改訂である。
 **§14 の削除設計には一切触れていない。**変更範囲は検出側だけである。
@@ -6424,7 +6665,7 @@ v4.1 は、**走査対象の許可リストを追加し、あわせて v4.0 が�
 
 ---
 
-## 付録 BI. v3.4 から v4.0 への主な変更点
+## 付録 BN. v3.4 から v4.0 への主な変更点
 
 v4.0 は、**#2 の実機検証で現行アーキテクチャが成立しないと判明したことを受けた構成変更**である。
 
@@ -6451,7 +6692,7 @@ Obsidian 出力）、状態機械の骨格、設定項目の意味。
 
 ---
 
-## 付録 BJ. v3.3 から v3.4 への主な変更点
+## 付録 BO. v3.3 から v3.4 への主な変更点
 
 v3.4 は、**#2（Phase 0 PoC）で DJI Mic 3 の実機から得た測定値を反映する**ことだけを目的とした改訂である。
 **機能・安全設計・設定項目は 1 つも変えていない。**実測値の出典はすべて `docs/POC.md` §6。
@@ -6472,7 +6713,7 @@ v3.4 は、**#2（Phase 0 PoC）で DJI Mic 3 の実機から得た測定値を�
 
 ---
 
-## 付録 BK. v3.2 から v3.3 への主な変更点
+## 付録 BP. v3.2 から v3.3 への主な変更点
 
 v3.3 は、**実装に着手する前に、仕様書に残っていた事実誤りと仕様内の不整合を潰す**ことだけを目的とした
 改訂である。**処理の内容・安全設計・設定項目の意味は 1 つも変えていない**（追加は V-27 と
@@ -6497,7 +6738,7 @@ v3.3 は、**実装に着手する前に、仕様書に残っていた事実誤�
 
 ---
 
-## 付録 BL. v3.1 から v3.2 への主な変更点
+## 付録 BQ. v3.1 から v3.2 への主な変更点
 
 v3.2 は、**実装に着手する前に「個人用途に対して過剰な構造」を削る**ことだけを目的とした改訂である。
 **機能・安全設計・設定項目は 1 つも削っていない。**処理の内容が変わる変更は含まれない。
@@ -6529,7 +6770,7 @@ v3.2 は、**実装に着手する前に「個人用途に対して過剰な構�
 
 ---
 
-## 付録 BM. v3.0 から v3.1 への主な変更点
+## 付録 BR. v3.0 から v3.1 への主な変更点
 
 v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間録り続ける」へ変わった**ことを起点に全面改訂したものである。
 
@@ -6566,7 +6807,7 @@ v3.1 は、**運用規模が「会議を時々録る」から「毎日 16 時間
 
 ---
 
-## 付録 BN. 参考資料
+## 付録 BS. 参考資料
 
 Docker 公式ドキュメントを実装時の一次資料とする。
 

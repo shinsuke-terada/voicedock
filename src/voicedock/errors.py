@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Final
 
 # --- 終了コード（SPEC §17.3） --------------------------------------------
 EXIT_OK = 0
@@ -171,6 +172,30 @@ ERRORS: Mapping[ErrorCode, ErrorSpec] = {
     ErrorCode.LOCAL_DELETE_FAILED: ErrorSpec(_C.DELETE, _R.ATTEMPTS),
     ErrorCode.DB_ERROR: ErrorSpec(_C.DB, _R.ATTEMPTS),
 }
+
+
+DELETABLE_SKIP_REASONS: Final[frozenset[str]] = frozenset(
+    {ErrorCode.DUPLICATE_CONTENT, ErrorCode.NO_SPEECH_DETECTED}
+)
+"""**元音声を削除してよい** `SKIPPED` の理由（§14.1 の根拠 B）。
+
+`SKIPPED` には §14.1 の根拠 A（テキストが Raw ノートと transcript の 2 か所に在ること）が
+成立しない。**代わりに「保全すべき本文が無いことが確定している」ことを根拠にする**ので、
+**どの理由でそれが言えるかをここで限定する。**
+
+- `NO_SPEECH_DETECTED` — **言える。**whisper が何を返したかは
+  `/data/transcripts/parts/` に残る（`retain_transcript_days: 0` で無期限）。
+  **保全すべき本文が無いことを、その保存物が示す。**
+- `DUPLICATE_CONTENT` — **言える（v5.56）。**同じバイト列の本文は**双子の側に**在り、
+  双子が根拠 A を満たすことを `recordings.duplicate_of` で指名して確かめる。
+- `SOURCE_MISSING` — **言えない。**文字起こしに到達しておらず、**内容について
+  何も観測していない**（§15.1 は「**デバイス上のファイルには触れない**」と規定している）。
+
+**許可リストである。**`daily.BENIGN_SKIP_REASONS` と同じ集合になりうるが、**別の問いに
+答える定数なので分ける** —— あちらは「利用者がすることが有るか」（警告記号を付けるか）で、
+こちらは「元音声を消してよいか」である。**片方を広げたときにもう片方が黙って追随しては
+ならない。**`tests/unit/test_errors.py` が両者の包含関係を不変条件として固定する。
+"""
 
 
 def spec_for(code: ErrorCode) -> ErrorSpec:

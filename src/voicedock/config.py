@@ -395,6 +395,7 @@ class ObsidianConfig(_Section):
 
 class CleanupConfig(_Section):
     delete_source_audio: bool
+    delete_skipped_source: bool
     delete_normalized_after_transcribe: bool
     retain_transcript_days: Literal[0]  # V-21
     delete_evaluation_backoff_seconds: tuple[int, ...]
