@@ -30,7 +30,7 @@ from voicedock import notes, paths, transcribe
 from voicedock.config import Config
 from voicedock.db import Recording, Session
 from voicedock.device import DeviceInventory
-from voicedock.errors import DELETABLE_SKIP_REASONS
+from voicedock.errors import DELETABLE_SKIP_REASONS, ErrorCode
 from voicedock.log import Logger
 from voicedock.paths import DevicePath, PartKey, QueuePath, SessionKey, StagingPath
 from voicedock.states import PART_DELETABLE, RAW_NOTE_MEMBERS, STAGING_DISPOSABLE, PartStatus
@@ -83,6 +83,21 @@ class DeleteRequest:
 # --- §14.1 の論理式 -------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class TwinPart:
+    """重複（`DUPLICATE_CONTENT`）の**双子**。同じ内容で先に正規化された Part（§14.1 根拠 B）。
+
+    **呼び手が DB から解決して渡す。**`cleaner` は DB を持たない。
+
+    `session` と `parts` は**双子の**セッションのものである（重複と双子は別の日でありうる）。
+    根拠 A を双子に対して評価するのに要る。
+    """
+
+    part: Recording
+    session: Session
+    parts: list[Recording]
+
+
 def can_delete_source(
     part: Recording,
     session: Session,
@@ -91,6 +106,7 @@ def can_delete_source(
     inventory: DeviceInventory | None,
     *,
     vault_root: Path,
+    twin: TwinPart | None = None,
 ) -> bool:
     """§14.1 の必要十分条件。**共通の同定 AND（根拠 A OR 根拠 B）である。**
 
@@ -114,7 +130,7 @@ def can_delete_source(
     """
     return _deletion_is_identified(part, session, parts, cfg, inventory) and (
         _text_is_preserved(part, session, parts, vault_root=vault_root)
-        or _nothing_to_preserve(part, cfg)
+        or _nothing_to_preserve(part, cfg, twin, vault_root=vault_root)
     )
 
 
@@ -184,22 +200,18 @@ def _text_is_preserved(
     )
 
 
-def _nothing_to_preserve(part: Recording, cfg: Config) -> bool:
+def _nothing_to_preserve(
+    part: Recording, cfg: Config, twin: TwinPart | None, *, vault_root: Path
+) -> bool:
     """**根拠 B: 保全すべき本文が無いことが確定している**（§14.1）。
 
     `SKIPPED` に根拠 A は成立しない — Raw ノートに載らず（`RAW_NOTE_MEMBERS`）、
     `PART_DELETABLE` にも入っていない。**だから「テキストが 2 か所に在る」ではなく
-    「残すべきテキストがそもそも無い」を根拠にする。**
+    「この Part が保全すべき本文がそもそも無い」を根拠にする。**
 
-    **「まだ観測していない」を根拠にしない**（§7.5）。`NO_SPEECH_DETECTED` は
-    **whisper が最後まで走って `min_chars` 未満を返した**という観測であり、
-    **その出力そのものが `/data/transcripts/parts/` に無期限で残る** —
-    `transcribe.transcribe()` は `min_chars` の判定より**前**に書くからである。
-    `part_transcript_is_valid()` はその保存物を**実ファイルで読み直す。**
-
-    **だから許可リストにする**（`DELETABLE_SKIP_REASONS`）。`SOURCE_MISSING` は
-    文字起こしに到達しておらず**内容について何も観測していない**ので入らない。
-    知らない理由が増えたときも、**既定で「消さない」側へ落ちる。**
+    **許可リストにする**（`DELETABLE_SKIP_REASONS`）。`SOURCE_MISSING` は文字起こしに
+    到達しておらず**内容について何も観測していない**ので入らない。知らない理由が
+    増えたときも、**既定で「消さない」側へ落ちる**（`_skip_reason_is_backed()`）。
 
     **専用のロックを持つ。**`delete_skipped_source` は `delete_source_audio` が真である
     ことに**加えて**要求される（前者は `_deletion_is_identified()` が見る）。
@@ -209,8 +221,43 @@ def _nothing_to_preserve(part: Recording, cfg: Config) -> bool:
         cfg.cleanup.delete_skipped_source is True
         and part.status == PartStatus.SKIPPED
         and part.error_code in DELETABLE_SKIP_REASONS
-        and part_transcript_is_valid(part)
+        and _skip_reason_is_backed(part, twin, vault_root=vault_root)
     )
+
+
+def _skip_reason_is_backed(part: Recording, twin: TwinPart | None, *, vault_root: Path) -> bool:
+    """**理由ごとに、「本文が無い」と言える根拠が実在するか**（§14.1 根拠 B）。
+
+    - `NO_SPEECH_DETECTED` — **whisper の出力そのもの**が `/data/transcripts/parts/` に残る
+    - `DUPLICATE_CONTENT` — **同じ内容の双子の本文が根拠 A を満たす**（Raw ノートと transcript）
+
+    **「まだ観測していない」を根拠にしない**（§7.5）。`NO_SPEECH_DETECTED` は whisper が
+    最後まで走って `min_chars` 未満を返したという観測で、`transcribe.transcribe()` は
+    判定より**前**に書くので保存物が在る。`part_transcript_is_valid()` がそれを読み直す。
+
+    **重複は自分の本文を持たない。**このバイト列の本文は**双子の側に**在るので、
+    双子に根拠 A を当てる。**双子には同定（`_deletion_is_identified()`）を要求しない** ——
+    双子の元音声は既に消えているのが通常で、`target_is_identical()` は偽になる。
+    消すのは**この** Part のファイルであり、その同定は `can_delete_source()` が済ませている。
+
+    **双子は `duplicate_of` 列で指名されたものだけを認める。**呼び手が別の Part を
+    渡しても通さない。`duplicate_of` が `NULL`（v5.55 以前の重複）なら消さない。
+
+    **表に無い理由は偽。**`DELETABLE_SKIP_REASONS` にだけ足して根拠を書き忘れても、
+    消える側には倒れない。
+    """
+    if part.error_code == ErrorCode.NO_SPEECH_DETECTED:
+        return part_transcript_is_valid(part)
+    if part.error_code == ErrorCode.DUPLICATE_CONTENT:
+        return (
+            part.duplicate_of is not None
+            and twin is not None
+            and twin.part.partkey == part.duplicate_of
+            and twin.part.partkey != part.partkey
+            and twin.part.session_key == twin.session.session_key
+            and _text_is_preserved(twin.part, twin.session, twin.parts, vault_root=vault_root)
+        )
+    return False
 
 
 def device_is_writable(inventory: DeviceInventory | None) -> bool:
@@ -351,13 +398,16 @@ def request_part_deletion(
     vault_root: Path,
     log: Logger,
     now: datetime,
+    twin: TwinPart | None = None,
 ) -> DeleteRequest | None:
     """§14.1 が真のときだけ要求を書く（§10.12）。書かなければ `None`。
 
     **一時名で書いて rename する。**reaper が書き込み途中の JSON を読むと、
     **壊れた要求を「検証できないもの」として扱う経路が要る**ことになる。
     """
-    if not can_delete_source(part, session, parts, cfg, inventory, vault_root=vault_root):
+    if not can_delete_source(
+        part, session, parts, cfg, inventory, vault_root=vault_root, twin=twin
+    ):
         return None
 
     if part.source_size is None or part.source_mtime is None:

@@ -187,7 +187,7 @@ def test_deletable_skip_reasons_match_spec() -> None:
     assert {str(code) for code in errors.DELETABLE_SKIP_REASONS} == set(
         spec_status_tuple("DELETABLE_SKIP_REASONS")
     )
-    assert len(errors.DELETABLE_SKIP_REASONS) == 1
+    assert len(errors.DELETABLE_SKIP_REASONS) == 2
 
 
 def test_source_missing_is_never_deletable() -> None:
